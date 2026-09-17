@@ -7,3 +7,6 @@ mod traits;
 pub use config::{SchedulerConfig, Window};
 pub use error::{ContractError, SchedulerError};
 pub use traits::{FrameWriter, ReadFile, WriteFile};
+
+mod budget;
+pub use budget::{FrameBudget, FramePermit};
