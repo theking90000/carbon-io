@@ -1,0 +1,25 @@
+[package]
+name = "io-scheduler"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Runtime-independent scheduling of ordered segmented asynchronous I/O"
+license = "MIT"
+repository = "https://github.com/theking90000/io-scheduler"
+readme = "README.md"
+keywords = ["async", "stream", "scheduler", "io", "backpressure"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+futures-core = "0.3.32"
+pin-project-lite = "0.2.17"
+
+[dev-dependencies]
+futures = "0.3.32"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
