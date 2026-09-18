@@ -330,3 +330,47 @@ fn write_is_fused_after_failure() {
     );
     assert_eq!(poll(&mut s), Poll::Ready(None));
 }
+
+#[test]
+fn shrinking_zero_retry_window_takes_effect_while_file_is_partial() {
+    use futures::StreamExt;
+    let file = Write::new(100);
+    file.writing.close();
+    let (input, drops) = frames(8);
+    let mut s = WriteScheduler::new(
+        input.chain(stream::pending()),
+        stream::iter([file.clone()]),
+        FrameBudget::new(16),
+        config(8, 100, 1, 0),
+    );
+    assert!(poll(&mut s).is_pending());
+    assert_eq!(s.retained_frames(), 8);
+    s.set_window(config(2, 100, 1, 0).window).unwrap();
+    file.writing.open();
+    assert!(poll(&mut s).is_pending());
+    assert_eq!(drops.get(), 8);
+    assert_eq!(s.granted_frames(), 2);
+}
+
+#[test]
+fn future_commit_survives_an_earlier_fatal_failure() {
+    let first = Write::new(2);
+    first.finalizing.close();
+    first.finalize_failures.set(1);
+    let second = Write::new(2);
+    let (input, drops) = frames(4);
+    let budget = FrameBudget::new(4);
+    let mut s = WriteScheduler::new(
+        input,
+        stream::iter([first.clone(), second.clone()]),
+        budget.clone(),
+        config(4, 100, 2, 0),
+    );
+    assert!(poll(&mut s).is_pending());
+    assert_eq!(second.finalized.get(), 1);
+    first.finalizing.open();
+    assert_eq!(collect(s), [Err(E::Backend("finalize"))]);
+    assert_eq!(second.finalized.get(), 1);
+    assert_eq!(drops.get(), 4);
+    assert_eq!(budget.available_capacity(), 4);
+}

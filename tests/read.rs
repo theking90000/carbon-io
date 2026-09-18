@@ -221,3 +221,34 @@ fn empty_file_stream_is_fused() {
     assert!(s.next().now_or_never().is_some());
 }
 use futures::FutureExt;
+
+#[test]
+fn changing_window_preserves_buffered_future_frames() {
+    let front = Read::new(0..4);
+    front.reading.close();
+    let future = Read::new(4..8);
+    let budget = FrameBudget::new(8);
+    let mut s = ReadScheduler::new(
+        stream::iter([front.clone(), future.clone()]),
+        budget.clone(),
+        config(2, 100, 2, 0),
+    );
+    assert!(poll(&mut s).is_pending());
+    s.set_window(config(8, 100, 2, 0).window).unwrap();
+    assert!(poll(&mut s).is_pending());
+    assert_eq!(
+        front.reading.polls(),
+        1,
+        "growing a quota must not repoll a pending reader"
+    );
+    assert_eq!(future.reading.polls(), 5);
+    s.set_window(config(1, 100, 1, 0).window).unwrap();
+    assert_eq!(
+        s.granted_frames(),
+        8,
+        "already authorized frames survive shrinking"
+    );
+    front.reading.open();
+    assert_eq!(collect(s), (0..8).map(Ok).collect::<Vec<_>>());
+    assert_eq!(budget.available_capacity(), 8);
+}
