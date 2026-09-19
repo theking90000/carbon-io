@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Open write destinations only after their first frame is assigned; drop unused descriptors unopened.
+- Add `poll_progress` to advance schedulers without consuming output.
 - Rename the crate to `carbon-io`, with Rust imports using `carbon_io`.
 - Rename the benchmark scale variable to `CARBON_IO_BENCH_SCALE`.
+- Add `tcp_to_file` streaming example.
 - Update documentation and repository links for CARBON I/O.
 
 ## 0.1.0

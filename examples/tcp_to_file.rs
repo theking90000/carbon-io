@@ -198,9 +198,7 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "bin") {
             let size = entry.metadata().await?.len();
-            if size == 0
-                || size % BLOCK as u64 != 0
-                || size > FRAMES_PER_FILE as u64 * BLOCK as u64
+            if size == 0 || size % BLOCK as u64 != 0 || size > FRAMES_PER_FILE as u64 * BLOCK as u64
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

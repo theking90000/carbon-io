@@ -61,7 +61,7 @@ With access to the Git repository:
 
 ```toml
 [dependencies]
-carbon-io = { git = "ssh://git@github.com/theking90000/carbon-io", branch = "main" }
+carbon-io = { git = "ssh://git@github.com/theking90000/carbon-io", tag = "v0.2.0" }
 futures = "0.3" # StreamExt and the executor used in the examples.
 ```
 
