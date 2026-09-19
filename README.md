@@ -1,58 +1,65 @@
 # io-scheduler
 
-Ordered asynchronous I/O over opaque segmented files. Open and poll several
-files concurrently, retain a bounded logical window, and emit frames or file
-results in their original order.
+Read and write several files concurrently, buffer a bounded amount of work, and
+receive the results in their original order.
 
-The core depends only on `futures-core` and `pin-project-lite`. It creates no
-threads, tasks, channels, or runtime. It does not require `Clone`, `Arc`, `Send`,
-or `Unpin` on frames. Opening futures, readers, writers, and input streams may
-also be `!Unpin`. The crate contains no `unsafe` code.
+A file is a logical sequence of frames. You provide the asynchronous backend and
+choose what a frame contains; the scheduler handles opening files ahead of time,
+distributing capacity, and polling the operations that can make progress.
+`ReadScheduler` emits frames. `WriteScheduler` emits one result per finalized
+file.
 
-## Status and installation
+The library runs inside your task. Use `next()` to consume output and
+`progress()` to keep I/O moving while you await a consumer. Both use the same
+scheduler state and buffers. No background task, thread, or channel is created.
 
-Version 0.1.0. The repository is private and the crate is not published on
-crates.io. With access to this repository:
+## Installation
+
+With access to the Git repository:
 
 ```toml
 [dependencies]
 io-scheduler = { git = "ssh://git@github.com/theking90000/io-scheduler", branch = "main" }
-futures = "0.3" # Only needed for the executor and StreamExt used below.
+futures = "0.3" # StreamExt and the executor used in the examples.
 ```
 
-Rust 1.85 or newer, edition 2024. `futures` and the allocation instrumentation
-library `stats_alloc` are development dependencies of this repository.
+Requires Rust 1.85 or newer, edition 2024. The library depends only on
+`futures-core` and `pin-project-lite` and works with any compatible async runtime.
+The Tokio snippets below assume your application already uses Tokio.
 
-## Read
+## Reading files
 
-Implement `ReadFile<T>` for a complete logical file. Its reader must yield
-exactly `frame_count()` successful frames and then EOF.
+Implement `ReadFile<T>` for your file descriptors. Each descriptor declares its
+frame count and opens a stream that yields exactly that many successful frames,
+followed by EOF. Pass a stream of descriptors to `ReadScheduler`:
 
 ```rust
-use std::{convert::Infallible, future::{Ready, ready}};
+use std::{convert::Infallible, future::{Ready, ready}, ops::Range};
 use futures::{executor::block_on, stream, StreamExt};
 use io_scheduler::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 
-struct File(Vec<u32>);
+struct File(Range<u32>);
 
 impl ReadFile<u32> for File {
     type Error = Infallible;
     type Reader = stream::Iter<std::vec::IntoIter<Result<u32, Infallible>>>;
     type Open = Ready<Result<Self::Reader, Self::Error>>;
 
-    fn frame_count(&self) -> u32 { self.0.len() as u32 }
+    fn frame_count(&self) -> u32 { self.0.end - self.0.start }
 
     fn open(&self) -> Self::Open {
-        // This in-memory adapter copies its data. The scheduler never clones T.
-        ready(Ok(stream::iter(self.0.iter().copied().map(Ok).collect::<Vec<_>>())))
+        // A small in-memory backend. Real backends can return pending I/O.
+        ready(Ok(stream::iter(self.0.clone().map(Ok).collect::<Vec<_>>())))
     }
 }
 
 block_on(async {
-    let files = stream::iter([File(vec![0, 1, 2]), File(vec![3, 4])]);
     let mut reader = ReadScheduler::new(
-        files, FrameBudget::new(64), SchedulerConfig::default(),
+        stream::iter([File(0..3), File(3..5)]),
+        FrameBudget::new(64),
+        SchedulerConfig::default(),
     );
+
     let mut values = Vec::new();
     while let Some(frame) = reader.next().await {
         values.push(frame.unwrap());
@@ -61,20 +68,45 @@ block_on(async {
 });
 ```
 
-Opening and buffering are separate. With files of six and five frames, a window
-of eight authorizes six frames from the first file and two from the second.
-The second reader can finish those two while the first reader is pending.
-Future files can be opened without being authorized to produce frames.
+Files may open and produce frames concurrently, but the consumer always receives
+frames in file order. A later file can fill its part of the buffer while an
+earlier file waits for I/O. Opening ahead and buffering ahead have separate
+limits, so a file can be opened before there is capacity to read its frames.
 
-Read frames live in one flat ring per scheduler. Emission advances the logical
-window. A final EOF probe detects extra frames; an early EOF or a reader error
-terminates the stream. Only opening failures can be retried.
+### Keep reading while the consumer waits
 
-## Write
+The loop above immediately asks for the next frame. A network consumer often
+awaits a send between calls to `next()`. During that wait, it no longer polls the
+scheduler, so the scheduler stops filling its buffer. Having spare capacity does
+not start work by itself. A backend wakeup wakes the task; the task still needs
+to poll the scheduler.
 
-Implement `WriteFile<T>` and `FrameWriter<T>`. The writer receives `&T` and
-returns a file result after finalization. Poll methods use `Pin<&mut Self>` so
-writers may contain pinned asynchronous state.
+Use `select!` to poll `progress()` alongside the send:
+
+```ignore
+while let Some(frame) = reader.next().await {
+    tokio::select! {
+        result = write_tcp(frame?) => result?,
+        _ = reader.progress() => unreachable!("progress never completes"),
+    }
+}
+```
+
+Now, while TCP applies backpressure, the scheduler can keep filling its existing
+window. Once the window is full and no other work is runnable, it waits for a
+wakeup. `progress()` consumes no frames and never completes, so it cannot win the
+`select!` and cancel the send. When the send finishes, dropping `progress()`
+leaves the buffered frames and pending I/O available for the next iteration.
+
+Put this `select!` in the task that awaits the consumer. A custom stream that
+is itself no longer polled cannot keep buffering. Synchronous blocking work also
+blocks progress in the same task.
+
+## Writing files
+
+Implement `WriteFile<T>` to describe a destination and `FrameWriter<T>` to write
+its frames. A destination declares its frame capacity. Its writer accepts frames
+by reference and returns a result after finalization:
 
 ```rust
 use std::{convert::Infallible, future::{Ready, ready}, pin::Pin, task::{Context, Poll}};
@@ -87,8 +119,9 @@ struct Writer(u32);
 impl WriteFile<u32> for File {
     type Error = Infallible;
     type Output = u32;
-    type Writer = Writer;
     type Open = Ready<Result<Writer, Infallible>>;
+    type Writer = Writer;
+
     fn frame_capacity(&self) -> u32 { 3 }
     fn open(&self) -> Self::Open { ready(Ok(Writer(0))) }
 }
@@ -96,12 +129,14 @@ impl WriteFile<u32> for File {
 impl FrameWriter<u32> for Writer {
     type Error = Infallible;
     type Output = u32;
+
     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &u32)
         -> Poll<Result<(), Infallible>>
     {
         self.get_mut().0 += frame;
         Poll::Ready(Ok(()))
     }
+
     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>)
         -> Poll<Result<u32, Infallible>>
     {
@@ -111,92 +146,163 @@ impl FrameWriter<u32> for Writer {
 
 block_on(async {
     let mut writer = WriteScheduler::new(
-        stream::iter([1, 2, 3, 4]), stream::iter([File, File]),
-        FrameBudget::new(64), SchedulerConfig::default(),
+        stream::iter([1, 2, 3, 4]),
+        stream::iter([File, File]),
+        FrameBudget::new(64),
+        SchedulerConfig::default(),
     );
+
     assert_eq!(writer.next().await.unwrap().unwrap(), 6);
     assert_eq!(writer.next().await.unwrap().unwrap(), 4);
     assert!(writer.next().await.is_none());
 });
 ```
 
-Frames fill destinations strictly by capacity. Writers start on the first frame
-and can progress while earlier writers are finalizing. Results remain ordered.
-The final destination may be partial. An empty input finalizes no file, and
-unused prefetched destinations are dropped.
+Input frames fill destinations in order, up to each destination's capacity.
+Writing starts as soon as the first frame arrives. Other writers can advance
+while an earlier file finalizes; results are still emitted in destination order.
+The last file may be partial. An empty input finalizes no file, and unused opened
+destinations are dropped.
 
-| Retry setting | Frame lifetime | Capacity rule |
+If processing a result involves an asynchronous wait, use the same pattern as
+for reads to keep subsequent files writing and finalizing:
+
+```ignore
+while let Some(result) = writer.next().await {
+    tokio::select! {
+        outcome = process_result(result?) => outcome?,
+        _ = writer.progress() => unreachable!("progress never completes"),
+    }
+}
+```
+
+Completed results remain limited by the discovery horizon until consumed. The
+scheduler does not keep opening destinations indefinitely while the consumer
+is blocked.
+
+## Choosing the window and budget
+
+`SchedulerConfig` holds a `Window` and a retry count. The window determines how
+far the scheduler may work ahead of the consumer:
+
+| Window field | Default | Controls |
+| --- | ---: | --- |
+| `target_frames` | 256 | Desired local frame capacity |
+| `open_ahead_frames` | 1024 | How far ahead, in frames, files may be discovered |
+| `max_active_files` | 16 | Maximum simultaneous opens and live readers or writers |
+
+The discovery horizon is at least `target_frames`. A file can be discovered if
+its beginning lies inside that horizon, even if its end extends beyond it.
+For reads, a window of eight frames over files of six and five frames authorizes
+all six frames of the first file and the first two of the second.
+
+`FrameBudget` limits capacity across schedulers. Clone it to share one budget.
+It counts scheduler-owned frames and reservations, not bytes, backend buffers,
+frames already handed to the consumer, or completed write results. Grants are
+reserved in blocks; waiting requests are served in FIFO order and are not
+preempted. A large request can therefore delay smaller requests behind it.
+
+When a writer pulls from a reader sharing the same budget, leave enough capacity
+for both to progress. If the reader holds all capacity while the writer waits
+for a reservation, the pipeline can deadlock. The budget cannot infer those
+dependencies or reclaim retained data.
+
+Use `set_window(window)` to change either scheduler's window. Shrinking preserves
+already authorized frames and opened files, then takes effect as work drains.
+Keep polling to advance under the new limits. `granted_frames()` reports the
+local capacity grant; writers also expose `retained_frames()`. The reusable
+buffers do not shrink their allocated storage when the window shrinks.
+
+Frame counts, destination capacities, the global budget, `target_frames`, and
+`max_active_files` must be nonzero. Invalid configurations and file contracts
+are reported through the scheduler's output stream.
+
+## Retries, errors, and cancellation
+
+`max_retries` defaults to zero and counts additional attempts per file. Reads
+retry opening failures only. A reader error, early EOF, or extra frame is fatal.
+Writes can retry opening, writing, or finalizing, with one shared retry count
+across those stages.
+
+Write retries change how long frames must be retained:
+
+| Retry setting | Frame lifetime | Capacity requirement |
 | --- | --- | --- |
-| `max_retries == 0`, the default | Drop each frame immediately after a successful `poll_write` | A file may exceed the entire frame budget |
-| `max_retries > 0` | Retain every frame until `poll_finalize` succeeds | Reserve a whole file before its first frame; file capacity must fit the global budget |
+| `max_retries == 0` | Drop each frame after a successful `poll_write` | A file may exceed the global frame budget |
+| `max_retries > 0` | Retain the whole file until successful finalization | Reserve the whole file before accepting its first frame; it must fit the global budget |
 
-A retry drops the current attempt, reopens the complete file, and replays from
-its first retained frame. `max_retries` counts additional attempts across
-open/write/finalize failures. Successfully finalized future files release their
-frames even while their results wait behind earlier files. There is no global
-rollback if an earlier file later fails.
+A write retry drops the failed attempt, reopens the file, and replays from the
+first retained frame. Reservations may exceed `target_frames` to fit one file.
+Successfully finalized files release their frames even if their results are
+waiting behind an earlier file. There is no global rollback if that earlier
+file subsequently fails.
 
-## Window and budget
+A fatal error releases scheduler resources immediately. `next()` emits the
+error once, then returns EOF. If `progress()` discovers the error, it saves it
+for the next `next()` and stays pending. It also stays pending at EOF; awaiting
+`progress()` alone will never finish. Both schedulers implement `FusedStream`,
+and `is_terminated()` remains false while an error is waiting to be emitted.
 
-`SchedulerConfig` contains `window: Window` and `max_retries: u32`.
+Dropping a pending `next()` or a `progress()` future preserves the scheduler's
+state. Dropping the scheduler itself abandons its operations, drops its frames
+and backends, and returns its budget permits. This does not undo writes already
+performed. Backends are responsible for cleaning up abandoned attempts,
+including destinations opened ahead of time but never used.
 
-| Window field | Default | Meaning |
-| --- | --- | --- |
-| `target_frames` | 256 | Desired local grant. Retry-enabled writes may exceed it to reserve a complete file |
-| `open_ahead_frames` | 1024 | Discovery distance from the logical front; the effective horizon is at least `target_frames` |
-| `max_active_files` | 16 | Maximum opening futures and live readers/writers |
+## Integrating a backend or custom stream
 
-A file is discovered if its beginning lies inside the horizon; its end can
-extend beyond it. Frame counts and capacities must be nonzero. A zero target,
-zero active-file limit, or zero global budget produces a contract error.
+Both schedulers implement `Stream`. Their input streams yield file descriptors
+and, for writes, frames directly. Backend errors come from opening, reading,
+writing, or finalizing.
 
-Clone a `FrameBudget` to share it. Permits reserve capacity in blocks, not once
-per frame. Waiters use FIFO minimum-size requests. Capacity is reserved before
-a waiter is woken, preventing competing schedulers from stealing its grant.
-Reads request growth in blocks up to 32 frames. Small targets and small total
-budgets remain supported. Strict FIFO can delay smaller requests behind a larger
-one. Grants are not preempted.
+| Entry point | Behavior |
+| --- | --- |
+| `next().await` / `poll_next(cx)` | Remove the next ordered output, advancing I/O if needed |
+| `progress()` | Keep advancing I/O without consuming output; never completes |
+| `poll_progress(cx)` | Advance at most 256 work items from a custom future or stream |
 
-`set_window(window)` updates either scheduler. A shrink preserves already
-engaged frames and live files, then applies as they drain. It does not reallocate
-the read ring or the reusable slot storage. Call `poll_next` again to drive a
-window change. `granted_frames()` reports the local grant; writes also expose
-`retained_frames()`.
+`poll_progress(cx)` registers the caller for wakeups and requests another poll
+if runnable work remains after its work limit. Otherwise it waits for a backend
+or budget notification. The caller must arrange to poll it again. `progress()`
+wraps that operation in a future for use with `select!`.
 
-The budget counts scheduler-owned frames and reservations, not bytes, backend
-buffers, consumer-owned frames, or completed results. Size it for all components
-that must progress together. In particular, a writer pulling from a reader that
-shares its budget needs enough capacity for both grants. Holding all capacity
-in the producer while the consumer waits for a reservation can deadlock; the
-budget cannot infer application dependencies or revoke retained data.
+Each operation exclusively borrows the scheduler. Retrieve an output first,
+then call `progress()` while processing it; `next()` and `progress()` cannot run
+concurrently on the same instance.
 
-## Polling and cancellation
+Backends must follow these rules:
 
-Each input and I/O slot has a dedicated waker. External wakes are deduplicated
-and routed to a local ready queue. Pending operations are polled again only
-when notified; ready operations continue locally. There is no scan over dormant
-slots, even with thousands of pending opens. Each poll processes at most 256
-work items before yielding if necessary.
+- Register the supplied waker before returning `Pending`.
+- Make every `open()` an independent attempt that can be abandoned by dropping it.
+- A pending `poll_write` receives the same logical frame on its next poll, but
+  its address may change. Do not retain the borrowed `&T` after returning.
+- Finalize only after all assigned writes succeed.
 
-A scheduler advances only while its consumer polls it. Buffered read output is
-drained in batches without shared-budget access. Without a background task, no
-I/O progresses while the consumer stops polling entirely.
+Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Input streams, opening
+futures, readers, and writers may also be `!Unpin`. The crate contains no unsafe
+code.
 
-Pinned I/O storage and per-slot wakers allocate when the pool grows and are
-reused across files. The read ring grows to the largest granted window. Write
-buffers are reused per slot. This is not an allocation-free constructor or a
-zero-byte-overhead abstraction; the normal frame path requires no allocation.
+## Examples and performance
 
-On `Pending`, backends must register the supplied waker. A writer must not retain
-the borrowed `&T` after returning, and cannot rely on its address staying fixed
-between polls. `open()` must create an independent attempt. Dropping an attempt
-must release backend resources, including any unused prefetched destination.
-Input streams yield files and frames directly; backend errors come from opening,
-reading, writing, and finalizing those files.
+The [memory example](examples/memory.rs) puts both schedulers together using
+`futures::select_biased!`. It simulates asynchronous reads, writes, and consumer
+waits without a network or timer:
 
-Dropping a scheduler cancels its futures and drops its frames, readers, writers,
-and permits. A fatal error releases them immediately, emits one
-`SchedulerError`, then terminates. Both schedulers implement `FusedStream`.
+```sh
+cargo run --locked --example memory
+```
+
+The schedulers route wakeups to individual slots rather than scanning dormant
+operations. Read frames occupy one ring buffer; write buffers, pinned I/O slots,
+and per-slot wakers are reused. Storage allocates as it grows. Buffered read
+output retains its fast path, and advancing I/O uses the existing ready queue
+and shared-budget synchronization.
+
+Polling `progress()` adds CPU work even though it adds no buffer or task. The
+[benchmark report](docs/benchmarks.md) records throughput, backend polls,
+allocations, and the overhead of using `select!` during simulated backpressure.
+Those in-memory measurements do not establish a throughput gain for real
+network or disk I/O.
 
 ## Development
 
@@ -205,17 +311,12 @@ cargo test --locked
 cargo test --locked --release
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo run --locked --example memory
 cargo bench --locked --bench scheduler
-cargo package --locked
 ```
 
-The tests cover the CDC invariants, pinned backends, cancellation, shared-budget
-contention, no-retry retention, and wake routing over 10,000 pending files.
-Benchmarks report throughput, backend polls, allocations per frame and file,
-and allocated bytes. See [docs/benchmarks.md](docs/benchmarks.md) for method and
-recorded measurements, and [docs/specification.md](docs/specification.md) for the
-original French CDC and its overriding V1 amendments.
+Tests cover ordering, capacity limits, retries, pinned backends, cancellation,
+progress under backpressure, and wake routing over 10,000 pending files. The
+[original specification](docs/specification.md) contains the French CDC and its
+V1 amendments.
 
-MIT licensed. Package publication is a separate manual step after the repository
-is made public and the desired crates.io name is checked.
+MIT licensed.

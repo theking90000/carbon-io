@@ -1,5 +1,5 @@
 //! Reproducible throughput, polling and allocation measurements without a harness.
-use futures::{Stream, StreamExt, stream, task::noop_waker};
+use futures::{FutureExt, Stream, StreamExt, stream, task::noop_waker};
 use io_scheduler::{
     FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteFile,
     WriteScheduler,
@@ -266,6 +266,86 @@ fn shared_case(n: usize) {
         sum
     });
 }
+// Four cooperative consumer waits per output, with no clock or I/O latency.
+async fn consumer_wait() {
+    let mut remaining = 4;
+    std::future::poll_fn(|cx| {
+        if remaining == 0 {
+            Poll::Ready(())
+        } else {
+            remaining -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+fn read_consumer_case(name: &str, count: u32, drive: bool) {
+    let polls = Rc::new(Cell::new(0));
+    measure(name, count as usize, 1, polls.clone(), || {
+        futures::executor::block_on(async {
+            let mut reader = ReadScheduler::new(
+                stream::iter([ReadSource {
+                    start: 0,
+                    count,
+                    pending: true,
+                    polls,
+                }]),
+                FrameBudget::new(64),
+                config(64, 1, 0),
+            );
+            let mut sum = 0;
+            while let Some(frame) = reader.next().await {
+                sum += black_box(frame.unwrap());
+                if drive {
+                    futures::select_biased! {
+                        _ = reader.progress().fuse() => unreachable!(),
+                        _ = consumer_wait().fuse() => {},
+                    }
+                } else {
+                    consumer_wait().await;
+                }
+            }
+            sum
+        })
+    });
+}
+
+fn write_consumer_case(name: &str, files: usize, drive: bool) {
+    let polls = Rc::new(Cell::new(0));
+    let count = files * 4;
+    measure(name, count, files, polls.clone(), || {
+        futures::executor::block_on(async {
+            let mut writer = WriteScheduler::new(
+                stream::iter(0..count as u64),
+                stream::iter((0..files).map(|_| Destination {
+                    count: 4,
+                    pending: true,
+                    retry: false,
+                    attempts: Cell::new(0),
+                    polls: polls.clone(),
+                })),
+                FrameBudget::new(64),
+                config(64, 16, 0),
+            );
+            let mut sum = 0;
+            while let Some(result) = writer.next().await {
+                sum += black_box(result.unwrap());
+                if drive {
+                    futures::select_biased! {
+                        _ = writer.progress().fuse() => unreachable!(),
+                        _ = consumer_wait().fuse() => {},
+                    }
+                } else {
+                    consumer_wait().await;
+                }
+            }
+            sum
+        })
+    });
+}
+
 fn main() {
     let scale = std::env::var("IO_SCHEDULER_BENCH_SCALE")
         .ok()
@@ -313,4 +393,10 @@ fn main() {
     write_case("write_backpressure", 50 * scale, 256, 16, true, false);
     write_case("write_finalize_retry", 100 * scale, 1024, 32, false, true);
     shared_case(25_000 * scale);
+    // Initialize the executor outside allocation measurements for both variants.
+    futures::executor::block_on(ready(()));
+    read_consumer_case("read_consumer_wait", 8192 * scale as u32, false);
+    read_consumer_case("read_consumer_drive", 8192 * scale as u32, true);
+    write_consumer_case("write_consumer_wait", 2048 * scale, false);
+    write_consumer_case("write_consumer_drive", 2048 * scale, true);
 }

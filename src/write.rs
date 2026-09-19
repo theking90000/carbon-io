@@ -514,6 +514,84 @@ where
         self.schedule_input();
         result
     }
+    /// Advance I/O without consuming any output, processing at most 256 work items.
+    ///
+    /// Registers the current task for backend and budget wakeups. If runnable work
+    /// remains after this turn, wakes the task again. A full window or pending I/O
+    /// does not cause a busy loop. The caller must keep polling to make progress.
+    /// Fatal errors release resources immediately and remain available to the next
+    /// stream poll. Calling this after completion or failure does nothing.
+    pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
+        if self.terminated {
+            return;
+        }
+        if self.error.is_some() {
+            self.finish();
+            return;
+        }
+        if let Err(error) = self.poll_work(cx) {
+            self.finish();
+            self.error = Some(error);
+            return;
+        }
+        if self.input.is_none() && self.order.is_empty() {
+            self.finish();
+            return;
+        }
+        if self.ready.has_work() {
+            cx.waker().wake_by_ref();
+        }
+    }
+
+    /// Keep I/O progressing without consuming output. This future never completes.
+    ///
+    /// Use alongside another future in `select!`. This stays pending even at EOF
+    /// or on error. Once no runnable work remains, it waits for wakeups. Errors
+    /// remain available to the next stream poll. No task or buffer is created.
+    ///
+    /// Dropping this future leaves scheduler state intact, including pending I/O,
+    /// buffered output, and errors. Dropping the scheduler itself abandons its I/O
+    /// and releases its frames and permits.
+    pub async fn progress(&mut self) {
+        std::future::poll_fn(|cx| {
+            self.poll_progress(cx);
+            Poll::<()>::Pending
+        })
+        .await
+    }
+
+    // Keep wakeups out of poll_next's ready-output path.
+    #[inline]
+    fn poll_work(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), SchedulerError<<S::Item as WriteFile<T>>::Error>> {
+        self.ready.register(cx.waker());
+        for _ in 0..MAX_POLL_OPS {
+            let Some(id) = self.ready.pop() else { break };
+            let waker = self.ready.waker(id);
+            let mut child = Context::from_waker(&waker);
+            let result = match id {
+                FILES => {
+                    self.files_ready = true;
+                    self.discover(&mut child)
+                }
+                INPUT => {
+                    self.input_ready = true;
+                    self.poll_input(&mut child)
+                }
+                BUDGET => {
+                    self.budget_waiting = false;
+                    self.schedule_input();
+                    Ok(())
+                }
+                _ => self.poll_slot(id - FIRST_SLOT, &mut child),
+            };
+            result?;
+        }
+        Ok(())
+    }
+
     fn finish(&mut self) {
         self.input = None;
         self.files = None;
@@ -537,7 +615,7 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if this.terminated {
-            return Poll::Ready(None);
+            return Poll::Ready(this.error.take().map(Err));
         }
         if let Some(error) = this.error.take() {
             this.finish();
@@ -546,31 +624,9 @@ where
         if let Some(result) = this.take_result() {
             return Poll::Ready(Some(Ok(result)));
         }
-        this.ready.register(cx.waker());
-        for _ in 0..MAX_POLL_OPS {
-            let Some(id) = this.ready.pop() else { break };
-            let waker = this.ready.waker(id);
-            let mut child = Context::from_waker(&waker);
-            let result = match id {
-                FILES => {
-                    this.files_ready = true;
-                    this.discover(&mut child)
-                }
-                INPUT => {
-                    this.input_ready = true;
-                    this.poll_input(&mut child)
-                }
-                BUDGET => {
-                    this.budget_waiting = false;
-                    this.schedule_input();
-                    Ok(())
-                }
-                _ => this.poll_slot(id - FIRST_SLOT, &mut child),
-            };
-            if let Err(error) = result {
-                this.finish();
-                return Poll::Ready(Some(Err(error)));
-            }
+        if let Err(error) = this.poll_work(cx) {
+            this.finish();
+            return Poll::Ready(Some(Err(error)));
         }
         if let Some(result) = this.take_result() {
             return Poll::Ready(Some(Ok(result)));
@@ -592,6 +648,6 @@ where
     S::Item: WriteFile<T>,
 {
     fn is_terminated(&self) -> bool {
-        self.terminated
+        self.terminated && self.error.is_none()
     }
 }

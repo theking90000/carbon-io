@@ -56,3 +56,64 @@ The wake-routing regression separately opens 10,000 gated files, wakes only slot
 42, and verifies that none of the other 9,999 opening futures are polled again.
 Its deterministic poll counts are more useful than a timing threshold for
 catching an accidental scan of dormant futures.
+
+## Explicit driving under consumer backpressure
+
+Both schedulers now expose `poll_progress(cx)` and a never-completing `progress()`
+future. The original benchmark cases still consume with `next()` only. Four new
+cases run on `futures::executor::block_on` and add four self-waking consumer waits
+per emitted frame or file result. The `*_consumer_drive` variant polls `progress()`
+through `select_biased!` while waiting; `*_consumer_wait` only polls the consumer.
+The driver is first in the select to make the polling order reproducible.
+Neither branch is heap-boxed. The executor is initialized before measurement.
+
+These waits and the backend's `Pending` responses have no real latency. The new
+cases measure CPU overhead of cooperative polling and selection, not the possible
+throughput benefit of overlapping network/disk waits. A real I/O benchmark is
+needed to measure that benefit. Do not compare the new cases directly with the
+older `read_backpressure` and `write_backpressure` cases, which use a different
+consumer and polling loop.
+
+Recorded on 2026-09-18 at scale 100. The table uses medians of five runs of the
+final implementation. The before column is one run captured before editing.
+[Raw measurements](benchmarks-drive.csv) retain every run. These sequential local
+runs are indicative and are not a statistically controlled regression estimate.
+
+| Existing case | Before, Mframes/s | After median, Mframes/s | Change |
+| --- | ---: | ---: | ---: |
+| `raw_stream_baseline` | 470.40 | 472.78 | +0.5% |
+| `read_one_large_file` | 43.30 | 42.19 | -2.6% |
+| `read_many_small_files` | 27.73 | 27.94 | +0.8% |
+| `read_multiple_active` | 40.40 | 39.27 | -2.8% |
+| `read_backpressure` | 16.64 | 16.96 | +1.9% |
+| `read_many_openings` | 6.13 | 6.23 | +1.6% |
+| `write_one_large_file` | 37.57 | 35.23 | -6.2% |
+| `write_many_small_files` | 19.98 | 19.25 | -3.7% |
+| `write_multiple_active` | 36.56 | 35.65 | -2.5% |
+| `write_backpressure` | 16.14 | 16.00 | -0.9% |
+| `write_finalize_retry` | 26.44 | 26.07 | -1.4% |
+| `shared_four_schedulers` | 40.83 | 42.18 | +3.3% |
+
+All original cases retained identical backend poll counts and allocation metrics.
+Timing differences range from about -6% to +3%; this run does not establish zero
+throughput regression. The largest observed drop is the single-file write case.
+
+| Consumer case | Median ns/frame | Allocated bytes, entire run |
+| --- | ---: | ---: |
+| `read_consumer_wait` | 102.2 | 2152 |
+| `read_consumer_drive` | 212.7 | 2152 |
+| `write_consumer_wait` | 90.2 | 12272 |
+| `write_consumer_drive` | 130.6 | 12272 |
+
+The consumer pairs have identical backend poll counts and allocation totals.
+Explicit driving adds about 111 ns per read frame and 40 ns per written frame in
+this synthetic workload. Writes emit one result per four frames, so their added
+cost is about 162 ns per consumed result. This includes select bookkeeping and
+extra driver polls. No synchronization primitive was added, but each driver poll
+still uses the existing ready queue's wake-registration locks.
+
+The deterministic tests in `tests/drive.rs` verify that the driver advances I/O
+without consuming output, stops at the read window or completed-write horizon,
+routes backend and budget wakeups, yields after bounded work, preserves pending
+operations on cancellation, and releases resources on a fatal error while saving
+that error for a single subsequent stream emission.
