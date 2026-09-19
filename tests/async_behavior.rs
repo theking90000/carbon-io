@@ -88,17 +88,39 @@ fn work_budget_yields_to_executor() {
     assert!(drops.get() < 256);
 }
 #[test]
-fn open_future_can_finish_long_before_first_io() {
-    let f = Write::new(4);
-    let mut s = WriteScheduler::new(
-        stream::pending::<Frame>(),
-        stream::iter([f.clone()]),
-        FrameBudget::new(4),
-        config(4, 10, 1, 1),
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(f.opening.polls(), 1);
-    assert_eq!(f.writing.polls(), 0);
+fn write_opens_when_pending_input_wakes_with_first_frame() {
+    for retry in [0, 2] {
+        let gate = Gate::new(false);
+        let (mut input, _) = frames(1);
+        let input_gate = gate.clone();
+        let input = stream::poll_fn(move |cx| {
+            if input_gate.ready(cx) {
+                Pin::new(&mut input).poll_next(cx)
+            } else {
+                Poll::Pending
+            }
+        });
+        let f = Write::new(4);
+        let mut s = WriteScheduler::new(
+            input,
+            stream::iter([f.clone()]),
+            FrameBudget::new(4),
+            config(4, 10, 1, retry),
+        );
+        let (wakes, waker) = context_waker();
+        let mut cx = Context::from_waker(&waker);
+        s.poll_progress(&mut cx);
+        assert_eq!(f.opens.get(), 0);
+        assert_eq!(f.opening.polls(), 0);
+        let before = wakes.0.load(Ordering::Relaxed);
+        s.poll_progress(&mut cx);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), before);
+        gate.open();
+        assert!(wakes.0.load(Ordering::Relaxed) > before);
+        s.poll_progress(&mut cx);
+        assert_eq!(f.opens.get(), 1);
+        assert_eq!(collect(s), [Ok(vec![0])]);
+    }
 }
 #[test]
 fn blocked_consumer_does_not_prevent_allowed_readers_from_filling_window() {

@@ -26,8 +26,9 @@ application-defined payload. You decide what each frame contains and provide
 the asynchronous backend that opens, reads, and writes the files. Those files
 may live on disk, on a remote service, or entirely in memory.
 
-CARBON handles the coordination. It opens files ahead of time and buffers a
+CARBON handles the coordination. It prepares reads ahead of time and buffers a
 limited number of frames so that several files can make progress together.
+Write destinations are opened only once they have a frame to write.
 While one file waits for I/O, another can continue. If later files produce
 frames or finish writing first, CARBON keeps their outputs until earlier ones
 can be delivered. The consumer receives everything in the expected order.
@@ -200,10 +201,13 @@ block_on(async {
 ```
 
 Input frames fill destinations in order, up to each destination's capacity.
-Writing starts as soon as the first frame arrives. Other writers can advance
+CARBON calls a destination's `open()` only after assigning its first frame;
+writing can start without waiting for the file to fill. Other writers can advance
 while an earlier file finalizes; results are still emitted in destination order.
-The last file may be partial. An empty input finalizes no file, and unused opened
-destinations are dropped.
+The last file may be partial. An empty input opens no file. Destination
+descriptors can be generated lazily without knowing the total input length;
+keep them lightweight and defer resource creation to `open()`. Unused
+descriptors are dropped unopened.
 
 If processing a result involves an asynchronous wait, use the same pattern as
 for reads to keep subsequent files writing and finalizing:
@@ -230,12 +234,15 @@ far the scheduler may work ahead of the consumer:
 | --- | ---: | --- |
 | `target_frames` | 256 | Desired local frame capacity |
 | `open_ahead_frames` | 1024 | How far ahead, in frames, files may be discovered |
-| `max_active_files` | 16 | Maximum simultaneous opens and live readers or writers |
+| `max_active_files` | 16 | Maximum active files, including unopened write destinations |
 
 The discovery horizon is at least `target_frames`. A file can be discovered if
 its beginning lies inside that horizon, even if its end extends beyond it.
 For reads, a window of eight frames over files of six and five frames authorizes
 all six frames of the first file and the first two of the second.
+Discovery may open readers ahead of time. For writes, it only prepares
+descriptors; `open_ahead_frames` never triggers opening a destination without
+an assigned frame.
 
 `FrameBudget` limits capacity across schedulers. Clone it to share one budget.
 It counts scheduler-owned frames and reservations, not bytes, backend buffers,
@@ -288,7 +295,7 @@ Dropping a pending `next()` or a `progress()` future preserves the scheduler's
 state. Dropping the scheduler itself abandons its operations, drops its frames
 and backends, and returns its budget permits. This does not undo writes already
 performed. Backends are responsible for cleaning up abandoned attempts,
-including destinations opened ahead of time but never used.
+including writes interrupted before finalization.
 
 ## Integrating a backend or custom stream
 

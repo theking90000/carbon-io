@@ -101,9 +101,9 @@ Les fichiers destinations sont également fournis dans leur ordre logique.
 
 Le scheduler :
 
-1. découvre les fichiers d'écriture ;
-2. peut les ouvrir en avance ;
-3. affecte les trames aux fichiers selon leur capacité ;
+1. découvre les descripteurs des fichiers d'écriture ;
+2. affecte les trames aux fichiers selon leur capacité ;
+3. appelle `open()` uniquement après l'affectation de la première trame ;
 4. bufferise les trames dans le scheduler ;
 5. fait progresser plusieurs writers concurremment ;
 6. conserve les trames d'un fichier jusqu'à sa finalisation ;
@@ -696,7 +696,7 @@ F2 = I J
 F0 : finalizing
 F1 : writing
 F2 : writing
-F3 : opening
+F3 : connu, sans trame, non ouvert
 ```
 
 Le writer de F1 peut commencer dès que E est affecté à F1.
@@ -717,28 +717,15 @@ committé
 
 ---
 
-# 21. Ouverture anticipée en écriture
+# 21. Ouverture à la première trame en écriture
 
-Comme pour la lecture :
+Les descripteurs peuvent être découverts en avance et produits à la volée, sans connaître la longueur totale de l'entrée. Leur création ne doit pas ouvrir de ressource.
 
-```text
-open()
-```
+Le scheduler appelle `open()` uniquement après avoir affecté au moins une trame au fichier. Il n'attend pas que le fichier soit plein pour l'ouvrir ou l'écrire.
 
-est indépendant du début réel de l'I/O de trames.
+Une entrée vide n'ouvre aucun fichier. Les descripteurs inutilisés sont abandonnés sans appel à `open()`. Les fichiers ayant reçu des trames peuvent s'ouvrir, s'écrire et se finaliser concurremment.
 
-Un fichier futur peut avoir son writer entièrement prêt avant sa première trame.
-
-Exemple :
-
-```text
-F0 Writing
-F1 Writer Ready
-F2 Opening
-F3 Known
-```
-
-Quand la première trame de F1 arrive, l'écriture peut commencer immédiatement.
+La lecture conserve son ouverture anticipée, car chaque descripteur déclare déjà un nombre non nul de trames à lire.
 
 ---
 
@@ -1224,15 +1211,17 @@ Cette capacité :
 ne compte pas des T
 ```
 
-Elle sert uniquement à anticiper les `open()`.
+L'horizon effectif est `max(target_frames, open_ahead_frames)`. En lecture, il permet d'anticiper les `open()`. En écriture, il permet de découvrir les descripteurs, mais l'ouverture attend toujours leur première trame.
 
 ---
 
 # 42. `max_active_files`
 
-Cette limite borne le nombre de fichiers simultanément dans un état actif :
+Cette limite borne le nombre de fichiers simultanément actifs, y compris les destinations d'écriture découvertes mais pas encore ouvertes :
 
 ```text
+Write descriptor awaiting its first frame
+ou
 Opening
 ou
 Reader/Writer Ready
@@ -1420,7 +1409,7 @@ Les slots suivants peuvent progresser, écrire et même finaliser avant lui.
 
 # 52. Cursor de remplissage write
 
-Comme plusieurs fichiers futurs peuvent déjà être ouverts, il faut connaître quel fichier reçoit actuellement les nouvelles trames.
+Comme plusieurs destinations peuvent déjà être découvertes, il faut connaître quel fichier reçoit actuellement les nouvelles trames.
 
 Un simple curseur suffit :
 
@@ -1560,9 +1549,9 @@ Trois cas.
 
 ## Aucun T n'a été produit
 
-Aucun fichier n'est finalisé.
+Aucun fichier n'est ouvert ni finalisé.
 
-Les fichiers ouverts en avance sont simplement abandonnés.
+Les descripteurs découverts en avance sont abandonnés sans appel à `open()`.
 
 ## Fichier courant partiel
 
@@ -1828,11 +1817,11 @@ loop {
     progressed = false;
 
     progressed |= poll_file_stream();
-    progressed |= poll_open_ahead();
 
     progressed |= adjust_frame_budget();
 
     progressed |= poll_input();
+    progressed |= poll_opens_for_assigned_files();
 
     progressed |= poll_active_writers();
 
@@ -1840,7 +1829,7 @@ loop {
         return Ready(Some(Ok(take_front_result())));
     }
 
-    discard_unused_open_files_after_eof();
+    discard_unused_descriptors_after_eof();
 
     if everything_finished() {
         return Ready(None);
@@ -1885,7 +1874,7 @@ Les invariants suivants doivent toujours être vrais.
 1. Les `T` sont affectés aux fichiers dans l'ordre.
 2. Un fichier reçoit au maximum `frame_capacity()` trames.
 3. La première trame d'un fichier N+1 n'est affectée qu'après remplissage de N.
-4. Un writer peut commencer dès la première trame.
+4. `open()` n'est appelé qu'après affectation de la première trame. Le writer peut alors commencer sans attendre le remplissage du fichier.
 5. Plusieurs writers peuvent progresser simultanément.
 6. Toutes les trames restent détenues jusqu'au succès du `finalize`.
 7. Un retry rejoue toujours le fichier depuis sa première trame.
@@ -1934,7 +1923,9 @@ read_drops_prefetched_unused_files
 ```text
 write_starts_writer_on_first_frame
 
-write_opens_future_files_before_they_receive_frames
+write_does_not_open_destinations_without_frames
+
+write_opens_only_used_lazy_destinations
 
 write_assigns_frames_strictly_by_capacity
 
@@ -1996,7 +1987,7 @@ ready_source_does_not_starve_other_sources
 
 work_budget_yields_to_executor
 
-open_future_can_finish_long_before_first_io
+write_opens_when_pending_input_wakes_with_first_frame
 
 blocked_consumer_does_not_prevent_allowed_readers_from_filling_window
 
@@ -2171,7 +2162,7 @@ ordered Stream<T>
 +
 ordered Stream<File>
         │
-        │ open ahead
+        │ assign frames, then open used destinations
         ▼
 scheduler retained buffers
         │

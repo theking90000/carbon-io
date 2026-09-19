@@ -80,8 +80,8 @@ struct Slot<T, F: WriteFile<T>> {
 ///
 /// With `max_retries == 0`, accepted frames are dropped immediately. Otherwise a
 /// whole destination is reserved before accepting its first frame, and all its
-/// frames survive until successful finalization. Opening unused destinations may
-/// have backend side effects; the backend must clean up abandoned attempts.
+/// frames survive until successful finalization. A destination is opened only
+/// after receiving its first frame; unused descriptors are dropped unopened.
 pub struct WriteScheduler<T, I, S>
 where
     I: Stream<Item = T>,
@@ -242,13 +242,10 @@ where
         if self.replay() && capacity as usize > self.permit.total_capacity() {
             return Err(ContractError::FrameCapacityExceedsBudget.into());
         }
-        let opening = WriteIo::Opening {
-            future: file.open(),
-        };
         let id = if let Some(id) = self.free.pop() {
             let slot = &mut self.slots[id];
             slot.file = Some(file);
-            slot.io.set(opening);
+            slot.io.set(WriteIo::Idle);
             slot.frames.clear();
             slot.capacity = capacity;
             slot.assigned = 0;
@@ -260,7 +257,7 @@ where
             let id = self.slots.len();
             self.slots.push(Slot {
                 file: Some(file),
-                io: Box::pin(opening),
+                io: Box::pin(WriteIo::Idle),
                 frames: Frames::new(self.replay()),
                 capacity,
                 assigned: 0,
@@ -275,7 +272,6 @@ where
         self.horizon = self.horizon.saturating_add(capacity as usize);
         self.active += 1;
         self.order.push_back(id);
-        self.ready.schedule(id + FIRST_SLOT);
         self.schedule_files();
         self.schedule_input();
         Ok(())
@@ -360,6 +356,12 @@ where
                 slot.frames.push(frame);
                 slot.assigned += 1;
                 self.retained += 1;
+                // ponytail: reuse Idle until a first frame makes opening necessary.
+                if slot.assigned == 1 {
+                    slot.io.set(WriteIo::Opening {
+                        future: slot.file.as_ref().unwrap().open(),
+                    });
+                }
                 if slot.assigned == slot.capacity {
                     self.fill_index += 1;
                     self.fill_reserved = false;

@@ -20,6 +20,7 @@ pub trait ReadFile<T> {
 }
 
 /// An opaque destination. Reopening must start an independent complete attempt.
+/// Descriptors may be discovered ahead of time; defer resource creation to `open`.
 pub trait WriteFile<T> {
     /// Backend failure.
     type Error;
@@ -32,6 +33,7 @@ pub trait WriteFile<T> {
     /// Nonzero maximum number of frames in this destination.
     fn frame_capacity(&self) -> u32;
     /// Open a new attempt. Dropping an old attempt must cancel its work.
+    /// Called only after the scheduler has assigned at least one frame to this file.
     fn open(&self) -> Self::Open;
 }
 

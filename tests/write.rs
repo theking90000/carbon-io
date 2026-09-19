@@ -39,18 +39,57 @@ fn write_starts_writer_on_first_frame() {
     assert_eq!(f.finalized.get(), 0);
 }
 #[test]
-fn write_opens_future_files_before_they_receive_frames() {
-    let a = Write::new(4);
-    let b = Write::new(4);
-    let mut s = WriteScheduler::new(
-        stream::pending::<Frame>(),
-        stream::iter([a, b.clone()]),
-        FrameBudget::new(4),
-        config(4, 10, 2, 1),
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(b.opening.polls(), 1);
-    assert_eq!(*b.attempts.borrow(), [Vec::<usize>::new()]);
+fn write_does_not_open_destinations_without_frames() {
+    for retry in [0, 2] {
+        let files: Vec<_> = (0..10).map(|_| Write::new(100)).collect();
+        let mut s = WriteScheduler::new(
+            stream::pending::<Frame>(),
+            stream::iter(files.clone()),
+            FrameBudget::new(1000),
+            config(100, 1000, 10, retry),
+        );
+        for _ in 0..3 {
+            assert!(poll(&mut s).is_pending());
+        }
+        assert!(files.iter().all(|f| f.opens.get() == 0));
+        assert!(files.iter().all(|f| f.opening.polls() == 0));
+    }
+}
+#[test]
+fn write_opens_only_used_lazy_destinations() {
+    for retry in [0, 2] {
+        for n in [0, 3, 100, 101] {
+            let mut files = Vec::new();
+            let destinations = stream::iter((0..).map(|_| {
+                let file = Write::new(100);
+                files.push(file.clone());
+                file
+            }));
+            let (input, drops) = frames(n);
+            let budget = FrameBudget::new(1000);
+            let results = collect(WriteScheduler::new(
+                input,
+                destinations,
+                budget.clone(),
+                config(100, 1000, 10, retry),
+            ));
+            let values: Vec<_> = (0..n).collect();
+            assert_eq!(
+                results,
+                values
+                    .chunks(100)
+                    .map(|c| Ok(c.to_vec()))
+                    .collect::<Vec<_>>()
+            );
+            let used = n.div_ceil(100);
+            for (i, file) in files.iter().enumerate() {
+                assert_eq!(file.opens.get(), usize::from(i < used));
+                assert_eq!(file.finalized.get(), usize::from(i < used));
+            }
+            assert_eq!(drops.get(), n);
+            assert_eq!(budget.available_capacity(), 1000);
+        }
+    }
 }
 #[test]
 fn write_starts_next_writer_when_previous_file_capacity_is_reached() {

@@ -1,14 +1,15 @@
 use crate::ContractError;
 
-/// Independently controls buffering and anticipatory file opening.
+/// Independently controls buffering and file discovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
     /// Desired local frame capacity. Writes with retries may require more.
     pub target_frames: usize,
-    /// Distance from the logical front at which files may be opened.
+    /// Distance from the logical front at which files may be discovered.
     /// The effective discovery horizon is at least `target_frames`.
+    /// Reads may open ahead; writes open only after receiving their first frame.
     pub open_ahead_frames: usize,
-    /// Maximum simultaneous open operations and live readers or writers.
+    /// Maximum active files, including unopened write destinations.
     pub max_active_files: usize,
 }
 
@@ -38,7 +39,7 @@ impl Window {
 /// Fixed retry policy and dynamically replaceable window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SchedulerConfig {
-    /// Buffer and opening horizons.
+    /// Buffer and discovery horizons.
     pub window: Window,
     /// Number of retries after the initial attempt, shared across its stages.
     /// Zero releases write frames as soon as their individual write succeeds.

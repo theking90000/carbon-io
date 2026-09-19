@@ -195,6 +195,7 @@ pub fn frames(n: usize) -> (impl Stream<Item = Frame> + Unpin, Rc<Cell<usize>>) 
 #[derive(Clone)]
 pub struct Write {
     pub capacity: u32,
+    pub opens: Rc<Cell<usize>>,
     pub opening: Gate,
     pub writing: Gate,
     pub finalizing: Gate,
@@ -209,6 +210,7 @@ impl Write {
     pub fn new(capacity: u32) -> Self {
         Self {
             capacity,
+            opens: Rc::default(),
             opening: Gate::new(true),
             writing: Gate::new(true),
             finalizing: Gate::new(true),
@@ -297,6 +299,7 @@ impl WriteFile<Frame> for Write {
         self.capacity
     }
     fn open(&self) -> Self::Open {
+        self.opens.set(self.opens.get() + 1);
         WriteOpen {
             file: Some(self.clone()),
             _pin: PhantomPinned,
