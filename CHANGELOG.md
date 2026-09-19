@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- Move examples into dedicated standalone crates (`examples/memory`, `examples/tcp_to_file`) with independent dependencies.
+- Add `http_upload` standalone example demonstrating streaming HTTP PUT uploads with Reqwest.
+- Add `pingora_upload` standalone example showcasing streaming HTTP uploads with Pingora connection pooling.
+- Add comprehensive architecture, scheduling, and backend integration guide in `docs/guide.md`.
+- Streamline README with a focused quickstart guide and documentation for standalone example workflows.
+- Update installation instructions to reference `carbon-io = "0.3.1"`.
+- Replace crate package `exclude` filter with an explicit `include` list in `Cargo.toml`.
+
 ## 0.3.0
 
 - Comply with Rust API Guidelines (RFC 430 checklist).
