@@ -254,11 +254,15 @@ code.
 
 ## Examples and performance
 
-The [memory example](https://github.com/theking90000/carbon-io/blob/main/examples/memory.rs) puts both schedulers together using
+Each example is an independent crate with its own dependencies and lockfile.
+See the [examples guide](examples/README.md) for the memory, TCP/file, Reqwest,
+and Pingora uploads and their launch commands.
+
+The [memory example](https://github.com/theking90000/carbon-io/blob/main/examples/memory/src/main.rs) puts both schedulers together using
 `futures::select_biased!`:
 
 ```sh
-cargo run --locked --example memory
+cargo run --locked --manifest-path examples/memory/Cargo.toml
 ```
 
 See the [benchmark report](https://github.com/theking90000/carbon-io/blob/main/docs/benchmarks.md)
