@@ -1,18 +1,23 @@
 # CARBON I/O
 
+[![Crates.io](https://img.shields.io/crates/v/carbon-io.svg)](https://crates.io/crates/carbon-io)
+[![Documentation](https://docs.rs/carbon-io/badge.svg)](https://docs.rs/carbon-io)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust: 1.85+](https://img.shields.io/badge/Rust-1.85+-orange.svg)](Cargo.toml)
+
 **Concurrent Async Reordering Buffered Ordered Nonblocking I/O**
 
-* **Concurrent:** multiple files can have operations in flight at once. While one operation is pending, other ready operations can continue.
+* ⚡ **Concurrent:** multiple files can have operations in flight at once. While one operation is pending, other ready operations can continue.
 
-* **Async:** CARBON coordinates asynchronous I/O within your application's execution flow. It creates no background task, thread, or channel.
+* 🪶 **Async:** CARBON coordinates asynchronous I/O within your application's execution flow. It creates no background task, thread, or channel.
 
-* **Reordering:** operations may progress and complete out of order. CARBON retains early results until their logical predecessors can be emitted.
+* 🔀 **Reordering:** operations may progress and complete out of order. CARBON retains early results until their logical predecessors can be emitted.
 
-* **Buffered:** bounded buffering lets work run ahead of the consumer, creating a controlled pipeline while limiting how far execution may advance.
+* 🛡️ **Buffered:** bounded buffering lets work run ahead of the consumer, creating a controlled pipeline while limiting how far execution may advance.
 
-* **Ordered:** consumers observe outputs in their required logical order regardless of internal completion order.
+* 🎯 **Ordered:** consumers observe outputs in their required logical order regardless of internal completion order.
 
-* **Nonblocking:** waiting for I/O does not block the calling task. Other ready operations can continue while a file is waiting.
+* ⏱️ **Nonblocking:** waiting for I/O does not block the calling task. Other ready operations can continue while a file is waiting.
 
 ---
 
@@ -55,7 +60,7 @@ the available buffers, preparing upcoming outputs while the consumer is busy.
 You choose whether and how to poll this future; CARBON imposes no execution
 strategy and starts no background task.
 
-## Installation
+## 📦 Installation
 
 With access to the Git repository:
 
@@ -69,7 +74,23 @@ Requires Rust 1.85 or newer, edition 2024. The library depends only on
 `futures-core` and `pin-project-lite` and works with any compatible async runtime.
 The Tokio snippets below assume your application already uses Tokio.
 
-## Reading files
+## 📖 Reading files
+
+```text
+Input Files (Stream)
+   │
+   ▼
+┌────────────────────────────────────────────────────────┐
+│                   ReadScheduler<T>                     │
+│                                                        │
+│  [File 1 (slow)] ───► I/O pending...                   │
+│  [File 2 (fast)] ───► Read complete ──► [Buffered]     │
+│  [File 3 (ready)] ──► Opened ahead                     │
+└────────────────────────────────────────────────────────┘
+   │
+   ▼
+Output Stream<T> (Emitted in strict File 1 ➔ 2 ➔ 3 order)
+```
 
 Implement `ReadFile<T>` for your file descriptors. Each descriptor declares its
 frame count and opens a stream that yields exactly that many successful frames,
@@ -115,13 +136,18 @@ frames in file order. A later file can fill its part of the buffer while an
 earlier file waits for I/O. Opening ahead and buffering ahead have separate
 limits, so a file can be opened before there is capacity to read its frames.
 
-### Keep reading while the consumer waits
+### ⚡ Keep reading while the consumer waits
 
 The loop above immediately asks for the next frame. A network consumer often
 awaits a send between calls to `next()`. During that wait, it no longer polls the
 scheduler, so the scheduler stops filling its buffer. Having spare capacity does
 not start work by itself. A backend wakeup wakes the task; the task still needs
 to poll the scheduler.
+
+```text
+Without progress():  [Next Frame] ──► [Await TCP (I/O paused)] ──► [Next Frame (waits on disk)]
+With progress():     [Next Frame] ──► [Await TCP + progress()] ──► [Next Frame (already buffered!)]
+```
 
 Use `select!` to poll `progress()` alongside the send:
 
@@ -144,7 +170,22 @@ Put this `select!` in the task that awaits the consumer. A custom stream that
 is itself no longer polled cannot keep buffering. Synchronous blocking work also
 blocks progress in the same task.
 
-## Writing files
+## ✍️ Writing files
+
+```text
+Input Frames (Stream) ─┐
+                       ▼
+┌────────────────────────────────────────────────────────┐
+│                   WriteScheduler<T>                    │
+│                                                        │
+│  [File 1] ──► Finalizing...                            │
+│  [File 2] ──► Writing concurrent chunks...             │
+│  [File 3] ──► Lazy standby (unopened until needed)     │
+└────────────────────────────────────────────────────────┘
+   │
+   ▼
+Output Stream<Result> (File completion reports in original order)
+```
 
 Implement `WriteFile<T>` to describe a destination and `FrameWriter<T>` to write
 its frames. A destination declares its frame capacity. Its writer accepts frames
@@ -225,7 +266,7 @@ Completed results remain limited by the discovery horizon until consumed. The
 scheduler does not keep opening destinations indefinitely while the consumer
 is blocked.
 
-## Choosing the window and budget
+## ⚙️ Choosing the window and budget
 
 `SchedulerConfig` holds a `Window` and a retry count. The window determines how
 far the scheduler may work ahead of the consumer:
@@ -265,7 +306,7 @@ Frame counts, destination capacities, the global budget, `target_frames`, and
 `max_active_files` must be nonzero. Invalid configurations and file contracts
 are reported through the scheduler's output stream.
 
-## Retries, errors, and cancellation
+## 🔁 Retries, errors, and cancellation
 
 `max_retries` defaults to zero and counts additional attempts per file. Reads
 retry opening failures only. A reader error, early EOF, or extra frame is fatal.
@@ -297,7 +338,7 @@ and backends, and returns its budget permits. This does not undo writes already
 performed. Backends are responsible for cleaning up abandoned attempts,
 including writes interrupted before finalization.
 
-## Integrating a backend or custom stream
+## 🔌 Integrating a backend or custom stream
 
 Both schedulers implement `Stream`. Their input streams yield file descriptors
 and, for writes, frames directly. Backend errors come from opening, reading,
@@ -330,7 +371,7 @@ Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Input streams, opening
 futures, readers, and writers may also be `!Unpin`. The crate contains no unsafe
 code.
 
-## Examples and performance
+## 📊 Examples and performance
 
 The [memory example](examples/memory.rs) puts both schedulers together using
 `futures::select_biased!`. It simulates asynchronous reads, writes, and consumer
@@ -352,7 +393,7 @@ allocations, and the overhead of using `select!` during simulated backpressure.
 Those in-memory measurements do not establish a throughput gain for real
 network or disk I/O.
 
-## Development
+## 🛠️ Development
 
 ```sh
 cargo test --locked
