@@ -52,14 +52,11 @@ pub fn collect<S: Stream + Unpin>(mut s: S) -> Vec<S::Item> {
     panic!("scheduler failed to terminate");
 }
 pub fn config(target: usize, ahead: usize, active: usize, retries: u32) -> SchedulerConfig {
-    SchedulerConfig {
-        window: Window {
-            target_frames: target,
-            open_ahead_frames: ahead,
-            max_active_files: active,
-        },
-        max_retries: retries,
-    }
+    let mut window = Window::default();
+    window.target_frames = target;
+    window.open_ahead_frames = ahead;
+    window.max_active_files = active;
+    SchedulerConfig::new(window, retries)
 }
 #[derive(Clone)]
 pub struct Gate(Rc<GateState>);

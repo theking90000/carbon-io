@@ -146,14 +146,11 @@ impl FrameWriter<u64> for Writer {
     }
 }
 fn config(target: usize, active: usize, retries: u32) -> SchedulerConfig {
-    SchedulerConfig {
-        window: Window {
-            target_frames: target,
-            open_ahead_frames: target * 2,
-            max_active_files: active,
-        },
-        max_retries: retries,
-    }
+    let mut window = Window::default();
+    window.target_frames = target;
+    window.open_ahead_frames = target * 2;
+    window.max_active_files = active;
+    SchedulerConfig::new(window, retries)
 }
 fn consume<S: Stream<Item = Result<u64, E>> + Unpin, E: std::fmt::Debug>(mut stream: S) -> u64 {
     let waker = noop_waker();

@@ -6,6 +6,7 @@ use futures_core::{Stream, stream::FusedStream};
 use pin_project_lite::pin_project;
 use std::{
     collections::VecDeque,
+    fmt,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -39,6 +40,36 @@ struct Slot<T, F: ReadFile<T>> {
 /// Polling drives all work. No background task is created. The input yields files
 /// directly; errors come from each file's opening future and reader.
 /// Input streams and backend futures may be `!Unpin`.
+///
+/// # Examples
+///
+/// ```
+/// use std::{convert::Infallible, future::ready, ops::Range};
+/// use futures::{executor::block_on, stream, StreamExt};
+/// use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
+///
+/// struct MemFile(Range<u32>);
+/// impl ReadFile<u32> for MemFile {
+///     type Error = Infallible;
+///     type Reader = stream::Iter<std::vec::IntoIter<Result<u32, Infallible>>>;
+///     type Open = std::future::Ready<Result<Self::Reader, Self::Error>>;
+///     fn frame_count(&self) -> u32 { self.0.end - self.0.start }
+///     fn open(&self) -> Self::Open {
+///         ready(Ok(stream::iter(self.0.clone().map(Ok).collect::<Vec<_>>())))
+///     }
+/// }
+///
+/// block_on(async {
+///     let mut scheduler = ReadScheduler::new(
+///         stream::iter([MemFile(0..2)]),
+///         FrameBudget::new(16),
+///         SchedulerConfig::default(),
+///     );
+///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 0);
+///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 1);
+///     assert!(scheduler.next().await.is_none());
+/// });
+/// ```
 pub struct ReadScheduler<T, S>
 where
     S: Stream,
@@ -63,6 +94,24 @@ where
     terminated: bool,
 }
 
+impl<T, S> fmt::Debug for ReadScheduler<T, S>
+where
+    S: Stream,
+    S::Item: ReadFile<T>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadScheduler")
+            .field("window", &self.config.window)
+            .field("granted_frames", &self.granted_frames())
+            .field("active_files", &self.active)
+            .field("emitted", &self.emitted)
+            .field("discovered", &self.discovered)
+            .field("authorized", &self.authorized)
+            .field("terminated", &self.terminated)
+            .finish()
+    }
+}
+
 // Only boxed I/O is structurally pinned; frames and file descriptors are not.
 impl<T, S> Unpin for ReadScheduler<T, S>
 where
@@ -77,6 +126,29 @@ where
     S::Item: ReadFile<T>,
 {
     /// Build a scheduler. Invalid initial configuration is returned by its stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use futures::stream;
+    /// use carbon_io::{FrameBudget, ReadScheduler, SchedulerConfig};
+    /// # use std::{convert::Infallible, future::{ready, Ready}};
+    /// # use carbon_io::ReadFile;
+    /// # struct Dummy;
+    /// # impl ReadFile<u32> for Dummy {
+    /// #     type Error = Infallible;
+    /// #     type Reader = stream::Empty<Result<u32, Infallible>>;
+    /// #     type Open = Ready<Result<Self::Reader, Self::Error>>;
+    /// #     fn frame_count(&self) -> u32 { 1 }
+    /// #     fn open(&self) -> Self::Open { ready(Ok(stream::empty())) }
+    /// # }
+    ///
+    /// let scheduler = ReadScheduler::new(
+    ///     stream::empty::<Dummy>(),
+    ///     FrameBudget::new(64),
+    ///     SchedulerConfig::default(),
+    /// );
+    /// ```
     pub fn new(files: S, budget: FrameBudget, config: SchedulerConfig) -> Self {
         let mut ready = ReadyQueue::new();
         ready.add();
@@ -111,6 +183,36 @@ where
     }
     /// Change the window. Already authorized frames and opened files are retained.
     /// The caller must poll again to drive the updated configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError::InvalidWindow`] if `window.target_frames == 0` or
+    /// `window.max_active_files == 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use futures::stream;
+    /// use carbon_io::{FrameBudget, ReadScheduler, SchedulerConfig, Window};
+    /// # use std::{convert::Infallible, future::{ready, Ready}};
+    /// # use carbon_io::ReadFile;
+    /// # struct Dummy;
+    /// # impl ReadFile<u32> for Dummy {
+    /// #     type Error = Infallible;
+    /// #     type Reader = stream::Empty<Result<u32, Infallible>>;
+    /// #     type Open = Ready<Result<Self::Reader, Self::Error>>;
+    /// #     fn frame_count(&self) -> u32 { 1 }
+    /// #     fn open(&self) -> Self::Open { ready(Ok(stream::empty())) }
+    /// # }
+    ///
+    /// let mut scheduler = ReadScheduler::new(
+    ///     stream::empty::<Dummy>(),
+    ///     FrameBudget::new(16),
+    ///     SchedulerConfig::default(),
+    /// );
+    /// let new_window = Window::new(64, 256, 8).unwrap();
+    /// assert!(scheduler.set_window(new_window).is_ok());
+    /// ```
     pub fn set_window(&mut self, window: Window) -> Result<(), ContractError> {
         window.validate()?;
         self.config.window = window;

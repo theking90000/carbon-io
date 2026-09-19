@@ -125,14 +125,13 @@ impl ReadFile<Frame> for Segment {
 }
 
 fn config() -> SchedulerConfig {
-    SchedulerConfig {
-        window: Window {
-            target_frames: PIPELINE_FRAMES,
-            open_ahead_frames: PIPELINE_FILES * FRAMES_PER_FILE as usize,
-            max_active_files: PIPELINE_FILES,
-        },
-        ..SchedulerConfig::default()
-    }
+    let window = Window::new(
+        PIPELINE_FRAMES,
+        PIPELINE_FILES * FRAMES_PER_FILE as usize,
+        PIPELINE_FILES,
+    )
+    .expect("valid window");
+    SchedulerConfig::new(window, 0)
 }
 
 async fn upload(socket: TcpStream, directory: &Path) -> io::Result<u64> {

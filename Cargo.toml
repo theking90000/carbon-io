@@ -1,14 +1,21 @@
 [package]
 name = "carbon-io"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Concurrent, nonblocking async I/O in Rust with bounded buffering, out-of-order execution, and ordered output"
+authors = ["theking90000 <martin.cogh@gmail.com>"]
+description = "Concurrent Async Reordering Buffered Ordered Nonblocking I/O: reading and writing files with bounded buffering and ordered output"
 license = "MIT"
 repository = "https://github.com/theking90000/carbon-io"
+homepage = "https://github.com/theking90000/carbon-io"
+documentation = "https://docs.rs/carbon-io"
 readme = "README.md"
 keywords = ["async", "stream", "scheduler", "io", "backpressure"]
 categories = ["asynchronous", "concurrency"]
+exclude = [
+    "/docs",
+    "/.github",
+]
 
 [dependencies]
 futures-core = "0.3.32"

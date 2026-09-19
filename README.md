@@ -2,8 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/carbon-io.svg)](https://crates.io/crates/carbon-io)
 [![Documentation](https://docs.rs/carbon-io/badge.svg)](https://docs.rs/carbon-io)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust: 1.85+](https://img.shields.io/badge/Rust-1.85+-orange.svg)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/theking90000/carbon-io/blob/main/LICENSE)
+[![Rust: 1.85+](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://github.com/theking90000/carbon-io/blob/main/Cargo.toml)
 
 **Concurrent Async Reordering Buffered Ordered Nonblocking I/O**
 
@@ -66,7 +66,7 @@ With access to the Git repository:
 
 ```toml
 [dependencies]
-carbon-io = { git = "ssh://git@github.com/theking90000/carbon-io", tag = "v0.2.0" }
+carbon-io = { git = "ssh://git@github.com/theking90000/carbon-io", tag = "v0.3.0" }
 futures = "0.3" # StreamExt and the executor used in the examples.
 ```
 
@@ -97,7 +97,7 @@ frame count and opens a stream that yields exactly that many successful frames,
 followed by EOF. Pass a stream of descriptors to `ReadScheduler`:
 
 ```rust
-use std::{convert::Infallible, future::{Ready, ready}, ops::Range};
+use std::{convert::Infallible, error::Error, future::{Ready, ready}, ops::Range};
 use futures::{executor::block_on, stream, StreamExt};
 use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 
@@ -116,19 +116,22 @@ impl ReadFile<u32> for File {
     }
 }
 
-block_on(async {
-    let mut reader = ReadScheduler::new(
-        stream::iter([File(0..3), File(3..5)]),
-        FrameBudget::new(64),
-        SchedulerConfig::default(),
-    );
+fn main() -> Result<(), Box<dyn Error>> {
+    block_on(async {
+        let mut reader = ReadScheduler::new(
+            stream::iter([File(0..3), File(3..5)]),
+            FrameBudget::new(64),
+            SchedulerConfig::default(),
+        );
 
-    let mut values = Vec::new();
-    while let Some(frame) = reader.next().await {
-        values.push(frame.unwrap());
-    }
-    assert_eq!(values, [0, 1, 2, 3, 4]);
-});
+        let mut values = Vec::new();
+        while let Some(frame) = reader.next().await {
+            values.push(frame?);
+        }
+        assert_eq!(values, [0, 1, 2, 3, 4]);
+        Ok(())
+    })
+}
 ```
 
 Files may open and produce frames concurrently, but the consumer always receives
@@ -192,7 +195,13 @@ its frames. A destination declares its frame capacity. Its writer accepts frames
 by reference and returns a result after finalization:
 
 ```rust
-use std::{convert::Infallible, future::{Ready, ready}, pin::Pin, task::{Context, Poll}};
+use std::{
+    convert::Infallible,
+    error::Error,
+    future::{Ready, ready},
+    pin::Pin,
+    task::{Context, Poll},
+};
 use futures::{executor::block_on, stream, StreamExt};
 use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
 
@@ -227,18 +236,23 @@ impl FrameWriter<u32> for Writer {
     }
 }
 
-block_on(async {
-    let mut writer = WriteScheduler::new(
-        stream::iter([1, 2, 3, 4]),
-        stream::iter([File, File]),
-        FrameBudget::new(64),
-        SchedulerConfig::default(),
-    );
+fn main() -> Result<(), Box<dyn Error>> {
+    block_on(async {
+        let mut writer = WriteScheduler::new(
+            stream::iter([1, 2, 3, 4]),
+            stream::iter([File, File]),
+            FrameBudget::new(64),
+            SchedulerConfig::default(),
+        );
 
-    assert_eq!(writer.next().await.unwrap().unwrap(), 6);
-    assert_eq!(writer.next().await.unwrap().unwrap(), 4);
-    assert!(writer.next().await.is_none());
-});
+        let mut results = Vec::new();
+        while let Some(result) = writer.next().await {
+            results.push(result?);
+        }
+        assert_eq!(results, [6, 4]);
+        Ok(())
+    })
+}
 ```
 
 Input frames fill destinations in order, up to each destination's capacity.
@@ -373,7 +387,7 @@ code.
 
 ## 📊 Examples and performance
 
-The [memory example](examples/memory.rs) puts both schedulers together using
+The [memory example](https://github.com/theking90000/carbon-io/blob/main/examples/memory.rs) puts both schedulers together using
 `futures::select_biased!`. It simulates asynchronous reads, writes, and consumer
 waits without a network or timer:
 
@@ -388,7 +402,7 @@ output retains its fast path, and advancing I/O uses the existing ready queue
 and shared-budget synchronization.
 
 Polling `progress()` adds CPU work even though it adds no buffer or task. The
-[benchmark report](docs/benchmarks.md) records throughput, backend polls,
+[benchmark report](https://github.com/theking90000/carbon-io/blob/main/docs/benchmarks.md) records throughput, backend polls,
 allocations, and the overhead of using `select!` during simulated backpressure.
 Those in-memory measurements do not establish a throughput gain for real
 network or disk I/O.
@@ -405,7 +419,7 @@ cargo bench --locked --bench scheduler
 
 Tests cover ordering, capacity limits, retries, pinned backends, cancellation,
 progress under backpressure, and wake routing over 10,000 pending files. The
-[original specification](docs/specification.md) contains the French CDC and its
+[original specification](https://github.com/theking90000/carbon-io/blob/main/docs/specification.md) contains the French CDC and its
 V1 amendments.
 
 MIT licensed.

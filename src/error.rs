@@ -1,7 +1,17 @@
 use std::{error::Error, fmt};
 
 /// Violations of the scheduler's structural contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// # Examples
+///
+/// ```
+/// use carbon_io::ContractError;
+///
+/// let err = ContractError::ZeroBudget;
+/// assert_eq!(err.to_string(), "frame budget must be nonzero");
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ContractError {
     /// A read file declares no frames.
     ZeroFrameCount,
@@ -38,7 +48,16 @@ impl fmt::Display for ContractError {
 impl Error for ContractError {}
 
 /// A terminal backend failure or contract violation. Emitted once, then EOF.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// # Examples
+///
+/// ```
+/// use carbon_io::{ContractError, SchedulerError};
+///
+/// let err: SchedulerError<std::io::Error> = SchedulerError::Contract(ContractError::ZeroBudget);
+/// assert!(matches!(err, SchedulerError::Contract(_)));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SchedulerError<E> {
     /// Original backend error, without type erasure.
     Backend(E),

@@ -6,6 +6,7 @@ use futures_core::{Stream, stream::FusedStream};
 use pin_project_lite::pin_project;
 use std::{
     collections::VecDeque,
+    fmt,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -82,6 +83,47 @@ struct Slot<T, F: WriteFile<T>> {
 /// whole destination is reserved before accepting its first frame, and all its
 /// frames survive until successful finalization. A destination is opened only
 /// after receiving its first frame; unused descriptors are dropped unopened.
+///
+/// # Examples
+///
+/// ```
+/// use std::{convert::Infallible, future::ready, pin::Pin, task::{Context, Poll}};
+/// use futures::{executor::block_on, stream, StreamExt};
+/// use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
+///
+/// struct MemFile;
+/// struct MemWriter(u32);
+/// impl WriteFile<u32> for MemFile {
+///     type Error = Infallible;
+///     type Output = u32;
+///     type Open = std::future::Ready<Result<MemWriter, Infallible>>;
+///     type Writer = MemWriter;
+///     fn frame_capacity(&self) -> u32 { 2 }
+///     fn open(&self) -> Self::Open { ready(Ok(MemWriter(0))) }
+/// }
+/// impl FrameWriter<u32> for MemWriter {
+///     type Error = Infallible;
+///     type Output = u32;
+///     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &u32) -> Poll<Result<(), Infallible>> {
+///         self.get_mut().0 += *frame;
+///         Poll::Ready(Ok(()))
+///     }
+///     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Infallible>> {
+///         Poll::Ready(Ok(self.0))
+///     }
+/// }
+///
+/// block_on(async {
+///     let mut scheduler = WriteScheduler::new(
+///         stream::iter([10, 20]),
+///         stream::iter([MemFile]),
+///         FrameBudget::new(16),
+///         SchedulerConfig::default(),
+///     );
+///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 30);
+///     assert!(scheduler.next().await.is_none());
+/// });
+/// ```
 pub struct WriteScheduler<T, I, S>
 where
     I: Stream<Item = T>,
@@ -109,6 +151,26 @@ where
     error: Option<SchedulerError<<S::Item as WriteFile<T>>::Error>>,
     terminated: bool,
 }
+
+impl<T, I, S> fmt::Debug for WriteScheduler<T, I, S>
+where
+    I: Stream<Item = T>,
+    S: Stream,
+    S::Item: WriteFile<T>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteScheduler")
+            .field("window", &self.config.window)
+            .field("max_retries", &self.config.max_retries)
+            .field("granted_frames", &self.granted_frames())
+            .field("retained_frames", &self.retained_frames())
+            .field("active_files", &self.active)
+            .field("horizon", &self.horizon)
+            .field("terminated", &self.terminated)
+            .finish()
+    }
+}
+
 impl<T, I, S> Unpin for WriteScheduler<T, I, S>
 where
     I: Stream<Item = T>,
@@ -124,6 +186,38 @@ where
     S::Item: WriteFile<T>,
 {
     /// Build a scheduler. Initial contract errors are emitted by the stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use futures::stream;
+    /// use carbon_io::{FrameBudget, SchedulerConfig, WriteScheduler};
+    /// # use std::{convert::Infallible, future::{ready, Ready}, pin::Pin, task::{Context, Poll}};
+    /// # use carbon_io::{FrameWriter, WriteFile};
+    /// # struct Dummy;
+    /// # struct DummyWriter;
+    /// # impl WriteFile<u32> for Dummy {
+    /// #     type Error = Infallible;
+    /// #     type Output = ();
+    /// #     type Open = Ready<Result<DummyWriter, Infallible>>;
+    /// #     type Writer = DummyWriter;
+    /// #     fn frame_capacity(&self) -> u32 { 1 }
+    /// #     fn open(&self) -> Self::Open { ready(Ok(DummyWriter)) }
+    /// # }
+    /// # impl FrameWriter<u32> for DummyWriter {
+    /// #     type Error = Infallible;
+    /// #     type Output = ();
+    /// #     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &u32) -> Poll<Result<(), Infallible>> { Poll::Ready(Ok(())) }
+    /// #     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> { Poll::Ready(Ok(())) }
+    /// # }
+    ///
+    /// let scheduler = WriteScheduler::new(
+    ///     stream::empty::<u32>(),
+    ///     stream::empty::<Dummy>(),
+    ///     FrameBudget::new(64),
+    ///     SchedulerConfig::default(),
+    /// );
+    /// ```
     pub fn new(input: I, files: S, budget: FrameBudget, config: SchedulerConfig) -> Self {
         let mut ready = ReadyQueue::new();
         for _ in 0..FIRST_SLOT {
@@ -160,6 +254,45 @@ where
         }
     }
     /// Replace the window without discarding accepted frames or existing files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError::InvalidWindow`] if `window.target_frames == 0` or
+    /// `window.max_active_files == 0`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use futures::stream;
+    /// use carbon_io::{FrameBudget, SchedulerConfig, Window, WriteScheduler};
+    /// # use std::{convert::Infallible, future::{ready, Ready}, pin::Pin, task::{Context, Poll}};
+    /// # use carbon_io::{FrameWriter, WriteFile};
+    /// # struct Dummy;
+    /// # struct DummyWriter;
+    /// # impl WriteFile<u32> for Dummy {
+    /// #     type Error = Infallible;
+    /// #     type Output = ();
+    /// #     type Open = Ready<Result<DummyWriter, Infallible>>;
+    /// #     type Writer = DummyWriter;
+    /// #     fn frame_capacity(&self) -> u32 { 1 }
+    /// #     fn open(&self) -> Self::Open { ready(Ok(DummyWriter)) }
+    /// # }
+    /// # impl FrameWriter<u32> for DummyWriter {
+    /// #     type Error = Infallible;
+    /// #     type Output = ();
+    /// #     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &u32) -> Poll<Result<(), Infallible>> { Poll::Ready(Ok(())) }
+    /// #     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> { Poll::Ready(Ok(())) }
+    /// # }
+    ///
+    /// let mut scheduler = WriteScheduler::new(
+    ///     stream::empty::<u32>(),
+    ///     stream::empty::<Dummy>(),
+    ///     FrameBudget::new(16),
+    ///     SchedulerConfig::default(),
+    /// );
+    /// let new_window = Window::new(64, 256, 8).unwrap();
+    /// assert!(scheduler.set_window(new_window).is_ok());
+    /// ```
     pub fn set_window(&mut self, window: Window) -> Result<(), ContractError> {
         window.validate()?;
         self.config.window = window;

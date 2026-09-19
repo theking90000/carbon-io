@@ -46,10 +46,7 @@ fn neither_clone_nor_unpin_is_required_on_frames() {
             input,
             stream::iter([File]),
             FrameBudget::new(4),
-            SchedulerConfig {
-                max_retries,
-                ..SchedulerConfig::default()
-            },
+            SchedulerConfig::default().with_max_retries(max_retries),
         );
         block_on(async {
             assert_eq!(s.next().await.unwrap().unwrap(), 5);

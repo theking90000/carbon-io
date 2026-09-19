@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+- Comply with Rust API Guidelines (RFC 430 checklist).
+- Implement `Debug` for all public types (`FrameBudget`, `FramePermit`, `ReadScheduler`, `WriteScheduler`).
+- Derive `Hash` for `Window`, `SchedulerConfig`, `ContractError`, and `SchedulerError`.
+- Derive `Copy` for `SchedulerError<E>` when `E: Copy`.
+- Mark `Window`, `SchedulerConfig`, and `ContractError` with `#[non_exhaustive]` for future-proof API evolution.
+- Add `Window::new` constructor and fluent builder methods (`with_target_frames`, `with_open_ahead_frames`, `with_max_active_files`, `with_window`, `with_max_retries`).
+- Add comprehensive rustdoc examples for all public types and primary methods.
+- Document error conditions with `# Errors` sections.
+- Exclude documentation and CI workflow directories from crate package.
+- Add crate metadata (`authors`, `documentation`, `homepage`).
+
 ## 0.2.0
 
 - Open write destinations only after their first frame is assigned; drop unused descriptors unopened.

@@ -123,10 +123,7 @@ fn main() {
             stream::iter(frames),
             stream::iter([Destination(2), Destination(4)]),
             budget,
-            SchedulerConfig {
-                max_retries: 2,
-                ..SchedulerConfig::default()
-            },
+            SchedulerConfig::default().with_max_retries(2),
         );
         let mut sums = Vec::new();
         while let Some(result) = writer.next().await {

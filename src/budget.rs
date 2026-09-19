@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    fmt,
     sync::{Arc, Mutex, MutexGuard, Weak},
     task::{Context, Poll, Waker},
 };
@@ -59,14 +60,42 @@ impl State {
 }
 
 /// Cloneable global capacity, measured in frames rather than bytes.
+///
+/// # Examples
+///
+/// ```
+/// use carbon_io::FrameBudget;
+///
+/// let budget = FrameBudget::new(64);
+/// assert_eq!(budget.total_capacity(), 64);
+/// assert_eq!(budget.available_capacity(), 64);
+/// ```
 #[derive(Clone)]
 pub struct FrameBudget {
     total: usize,
     state: Arc<Mutex<State>>,
 }
 
+impl fmt::Debug for FrameBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameBudget")
+            .field("total", &self.total)
+            .field("available", &self.available_capacity())
+            .finish()
+    }
+}
+
 impl FrameBudget {
     /// Create a shared budget. Schedulers report `ZeroBudget` for zero capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use carbon_io::FrameBudget;
+    ///
+    /// let budget = FrameBudget::new(128);
+    /// assert_eq!(budget.total_capacity(), 128);
+    /// ```
     pub fn new(total_capacity: usize) -> Self {
         Self {
             total: total_capacity,
@@ -95,10 +124,30 @@ impl FrameBudget {
 }
 
 /// A scheduler-local capacity grant. Drop returns all capacity and cancels waits.
+///
+/// # Examples
+///
+/// ```
+/// use carbon_io::FrameBudget;
+///
+/// let budget = FrameBudget::new(64);
+/// let permit = budget.permit();
+/// assert_eq!(permit.capacity(), 0);
+/// assert_eq!(permit.total_capacity(), 64);
+/// ```
 pub struct FramePermit {
     budget: FrameBudget,
     capacity: usize,
     request: Arc<Mutex<Request>>,
+}
+
+impl fmt::Debug for FramePermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FramePermit")
+            .field("capacity", &self.capacity)
+            .field("total_capacity", &self.total_capacity())
+            .finish()
+    }
 }
 
 impl FramePermit {
