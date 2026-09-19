@@ -1,17 +1,59 @@
-# io-scheduler
+# CARBON I/O
 
-Read and write several files concurrently, buffer a bounded amount of work, and
-receive the results in their original order.
+**Concurrent Async Reordering Buffered Ordered Nonblocking I/O**
 
-A file is a logical sequence of frames. You provide the asynchronous backend and
-choose what a frame contains; the scheduler handles opening files ahead of time,
-distributing capacity, and polling the operations that can make progress.
-`ReadScheduler` emits frames. `WriteScheduler` emits one result per finalized
-file.
+* **Concurrent:** multiple files can have operations in flight at once. While one operation is pending, other ready operations can continue.
 
-The library runs inside your task. Use `next()` to consume output and
-`progress()` to keep I/O moving while you await a consumer. Both use the same
-scheduler state and buffers. No background task, thread, or channel is created.
+* **Async:** CARBON coordinates asynchronous I/O within your application's execution flow. It creates no background task, thread, or channel.
+
+* **Reordering:** operations may progress and complete out of order. CARBON retains early results until their logical predecessors can be emitted.
+
+* **Buffered:** bounded buffering lets work run ahead of the consumer, creating a controlled pipeline while limiting how far execution may advance.
+
+* **Ordered:** consumers observe outputs in their required logical order regardless of internal completion order.
+
+* **Nonblocking:** waiting for I/O does not block the calling task. Other ready operations can continue while a file is waiting.
+
+---
+
+CARBON I/O is a Rust library for reading and writing several files concurrently
+with bounded buffering and ordered output. Its new crate name is `carbon-io`;
+the package and import rename will follow. Installation instructions and code
+examples below still use `io-scheduler` and `io_scheduler`.
+
+CARBON treats each file as an ordered sequence of frames. A frame is simply
+one value of your chosen Rust type: a chunk of bytes, a record, or another
+application-defined payload. You decide what each frame contains and provide
+the asynchronous backend that opens, reads, and writes the files. Those files
+may live on disk, on a remote service, or entirely in memory.
+
+CARBON handles the coordination. It opens files ahead of time and buffers a
+limited number of frames so that several files can make progress together.
+While one file waits for I/O, another can continue. If later files produce
+frames or finish writing first, CARBON keeps their outputs until earlier ones
+can be delivered. The consumer receives everything in the expected order.
+
+Data flows through CARBON in two directions:
+
+- **Input writes a stream to files.** Give `WriteScheduler` a stream of frames
+  and a stream of destinations. It fills destinations in order, up to their
+  declared frame capacities, using bounded buffering and concurrent,
+  nonblocking I/O. Files may finish out of order; their finalization results
+  are delivered in destination order. The last file may be partially filled.
+- **Output reads files into a stream.** Give `ReadScheduler` a stream of files,
+  each declaring how many frames it contains. It opens and reads them
+  concurrently using bounded buffering and nonblocking I/O. Frames from later
+  files can arrive early; CARBON holds them until it can deliver a single
+  stream in file order, preserving the order of frames within each file.
+
+CARBON returns an asynchronous Rust `Stream` with guaranteed output order:
+frames when reading, or one result per finalized file when writing. Consuming
+this stream drives I/O. When the consumer pauses to await other work, your
+application can poll the optional `progress()` future to keep I/O advancing
+without consuming another item. This lets later files make progress and fills
+the available buffers, preparing upcoming outputs while the consumer is busy.
+You choose whether and how to poll this future; CARBON imposes no execution
+strategy and starts no background task.
 
 ## Installation
 
