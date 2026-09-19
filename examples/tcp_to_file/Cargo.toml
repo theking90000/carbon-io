@@ -1,0 +1,16 @@
+[package]
+name = "carbon-example-tcp-to-file"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+
+[dependencies]
+carbon-io = { path = "../.." }
+futures = "0.3.32"
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"

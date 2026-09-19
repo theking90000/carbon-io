@@ -17,7 +17,7 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo test --locked
       - run: cargo test --locked --release
-      - run: cargo run --locked --example memory
+      - run: cargo run --locked --manifest-path examples/memory/Cargo.toml
   quality:
     runs-on: ubuntu-latest
     steps:

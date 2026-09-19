@@ -235,7 +235,7 @@ and the overhead of using `select!` during simulated backpressure. These
 in-memory measurements do not establish a throughput gain for real network or
 disk I/O.
 
-The [memory example](../examples/memory.rs) puts both schedulers together using
+The [memory example](../examples/memory/src/main.rs) puts both schedulers together using
 `futures::select_biased!`. It simulates async reads, writes, and consumer waits
 without a network or timer.
 

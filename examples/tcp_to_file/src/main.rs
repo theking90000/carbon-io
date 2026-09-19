@@ -1,5 +1,5 @@
 //! TCP upload -> CARBON -> real files -> CARBON -> TCP download.
-//! Run with `cargo run --example tcp_to_file`; instructions are printed on startup.
+//! Run with `cargo run --manifest-path examples/tcp_to_file/Cargo.toml`; instructions are printed on startup.
 use carbon_io::{
     FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteFile,
     WriteScheduler,
