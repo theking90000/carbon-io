@@ -1,0 +1,20 @@
+[package]
+name = "carbon-example-pingora-upload"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+
+[dependencies]
+carbon-io = { path = "../.." }
+bytes = "1"
+futures = "0.3.32"
+http = "1"
+pingora-core = { version = "0.9", default-features = false, features = ["rustls"] }
+pingora-http = "0.9"
+tokio = { version = "1", features = ["net", "rt", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
