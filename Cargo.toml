@@ -1,11 +1,11 @@
 [package]
-name = "io-scheduler"
+name = "carbon-io"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Runtime-independent scheduling of ordered segmented asynchronous I/O"
+description = "Concurrent, nonblocking async I/O in Rust with bounded buffering, out-of-order execution, and ordered output"
 license = "MIT"
-repository = "https://github.com/theking90000/io-scheduler"
+repository = "https://github.com/theking90000/carbon-io"
 readme = "README.md"
 keywords = ["async", "stream", "scheduler", "io", "backpressure"]
 categories = ["asynchronous", "concurrency"]

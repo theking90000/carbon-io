@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "carbon-io"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "futures-core",
+ "pin-project-lite",
+ "stats_alloc",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -88,16 +98,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "io-scheduler"
-version = "0.1.0"
-dependencies = [
- "futures",
- "futures-core",
- "pin-project-lite",
- "stats_alloc",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 //! Frames are movable values even if their type does not implement Unpin or Clone.
+use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
 use futures::{StreamExt, executor::block_on, stream};
-use io_scheduler::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
 use std::{
     convert::Infallible,
     future::{Ready, ready},

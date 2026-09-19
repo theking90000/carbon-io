@@ -1,9 +1,9 @@
 //! Reproducible throughput, polling and allocation measurements without a harness.
-use futures::{FutureExt, Stream, StreamExt, stream, task::noop_waker};
-use io_scheduler::{
+use carbon_io::{
     FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteFile,
     WriteScheduler,
 };
+use futures::{FutureExt, Stream, StreamExt, stream, task::noop_waker};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use std::{
     alloc::System,
@@ -347,7 +347,7 @@ fn write_consumer_case(name: &str, files: usize, drive: bool) {
 }
 
 fn main() {
-    let scale = std::env::var("IO_SCHEDULER_BENCH_SCALE")
+    let scale = std::env::var("CARBON_IO_BENCH_SCALE")
         .ok()
         .map(|s| s.parse::<usize>().expect("positive integer scale"))
         .unwrap_or(1)

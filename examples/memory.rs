@@ -1,8 +1,8 @@
 //! Keep buffering during consumer backpressure, without a background task.
-use futures::{FutureExt, Stream, StreamExt, executor::block_on, stream};
-use io_scheduler::{
+use carbon_io::{
     FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, WriteFile, WriteScheduler,
 };
+use futures::{FutureExt, Stream, StreamExt, executor::block_on, stream};
 use std::{
     convert::Infallible,
     future::{Ready, poll_fn, ready},

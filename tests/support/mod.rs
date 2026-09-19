@@ -1,6 +1,6 @@
 #![allow(dead_code)]
+use carbon_io::{FrameWriter, ReadFile, SchedulerConfig, Window, WriteFile};
 use futures::{Stream, stream};
-use io_scheduler::{FrameWriter, ReadFile, SchedulerConfig, Window, WriteFile};
 use pin_project_lite::pin_project;
 use std::{
     cell::{Cell, RefCell},

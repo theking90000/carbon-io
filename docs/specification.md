@@ -1,8 +1,8 @@
-# Cahier des charges — `io-scheduler`
+# Cahier des charges — CARBON I/O
 
 ## 1. Objectif
 
-`io-scheduler` est une bibliothèque Rust de scheduling asynchrone de flux segmentés.
+`carbon-io` est une bibliothèque Rust de scheduling asynchrone de flux segmentés.
 
 Elle manipule :
 
@@ -55,7 +55,7 @@ Toute abstraction qui augmente significativement la complexité ou le coût du h
 
 # 2. Modèle mental général
 
-`io-scheduler` est constitué de deux schedulers symétriques.
+`carbon-io` est constitué de deux schedulers symétriques.
 
 ## Lecture
 
@@ -151,7 +151,7 @@ Elle ne représente aucune quantité d'octets.
 
 # 4. Principe fondamental : les fichiers sont opaques
 
-`io-scheduler` ne connaît jamais la structure interne d'un fichier.
+`carbon-io` ne connaît jamais la structure interne d'un fichier.
 
 Il ne doit exister aucune API :
 
@@ -172,7 +172,7 @@ open()
 
 Un fichier fourni au scheduler représente déjà exactement le contenu logique qui doit être lu ou écrit.
 
-Si une couche supérieure souhaite représenter une vue partielle ou transformée d'un fichier, cette vue doit être encapsulée dans l'implémentation du fichier avant d'être donnée à `io-scheduler`.
+Si une couche supérieure souhaite représenter une vue partielle ou transformée d'un fichier, cette vue doit être encapsulée dans l'implémentation du fichier avant d'être donnée à `carbon-io`.
 
 Pour le scheduler :
 
@@ -1049,7 +1049,7 @@ Si une implémentation souhaite offrir une lecture tolérante aux erreurs intern
 Cela maintient la frontière d'abstraction propre :
 
 ```text
-io-scheduler
+carbon-io
 ne connaît jamais
 comment reprendre un File
 ```
@@ -1289,7 +1289,7 @@ max_active_files
 
 selon ses propres critères.
 
-`io-scheduler` reçoit uniquement le résultat.
+`carbon-io` reçoit uniquement le résultat.
 
 API possible :
 
@@ -1522,7 +1522,7 @@ pub enum SchedulerError<E> {
 
 `Backend(E)` représente les erreurs des fichiers, readers, writers ou streams fournis.
 
-`ContractError` représente uniquement les violations du contrat de `io-scheduler`.
+`ContractError` représente uniquement les violations du contrat de `carbon-io`.
 
 ---
 
@@ -1689,7 +1689,7 @@ drop buffers
 drop permits
 ```
 
-Aucune activité propre à `io-scheduler` ne doit survivre.
+Aucune activité propre à `carbon-io` ne doit survivre.
 
 ---
 
@@ -1707,7 +1707,7 @@ F2 : Done(R2)
 
 Le scheduler échoue globalement.
 
-`io-scheduler` ne tente pas d'annuler ou de défaire les finalisations déjà réussies.
+`carbon-io` ne tente pas d'annuler ou de défaire les finalisations déjà réussies.
 
 La notion de rollback global ne fait pas partie de son contrat.
 
@@ -2187,7 +2187,7 @@ ordered Stream<R>
 
 # 82. Frontière finale de responsabilité
 
-`io-scheduler` sait uniquement :
+`carbon-io` sait uniquement :
 
 ```text
 combien de trames existent

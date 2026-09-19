@@ -4,7 +4,7 @@ Run the standalone benchmark with:
 
 ```sh
 cargo bench --locked --bench scheduler
-IO_SCHEDULER_BENCH_SCALE=10 cargo bench --locked --bench scheduler
+CARBON_IO_BENCH_SCALE=10 cargo bench --locked --bench scheduler
 ```
 
 `benches/scheduler.rs` uses numeric frames and in-memory, statically dispatched

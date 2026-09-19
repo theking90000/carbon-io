@@ -17,9 +17,8 @@
 ---
 
 CARBON I/O is a Rust library for reading and writing several files concurrently
-with bounded buffering and ordered output. Its new crate name is `carbon-io`;
-the package and import rename will follow. Installation instructions and code
-examples below still use `io-scheduler` and `io_scheduler`.
+with bounded buffering and ordered output. Use the `carbon-io` crate to integrate
+it into your application.
 
 CARBON treats each file as an ordered sequence of frames. A frame is simply
 one value of your chosen Rust type: a chunk of bytes, a record, or another
@@ -61,7 +60,7 @@ With access to the Git repository:
 
 ```toml
 [dependencies]
-io-scheduler = { git = "ssh://git@github.com/theking90000/io-scheduler", branch = "main" }
+carbon-io = { git = "ssh://git@github.com/theking90000/carbon-io", branch = "main" }
 futures = "0.3" # StreamExt and the executor used in the examples.
 ```
 
@@ -78,7 +77,7 @@ followed by EOF. Pass a stream of descriptors to `ReadScheduler`:
 ```rust
 use std::{convert::Infallible, future::{Ready, ready}, ops::Range};
 use futures::{executor::block_on, stream, StreamExt};
-use io_scheduler::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
+use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 
 struct File(Range<u32>);
 
@@ -153,7 +152,7 @@ by reference and returns a result after finalization:
 ```rust
 use std::{convert::Infallible, future::{Ready, ready}, pin::Pin, task::{Context, Poll}};
 use futures::{executor::block_on, stream, StreamExt};
-use io_scheduler::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
+use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
 
 struct File;
 struct Writer(u32);

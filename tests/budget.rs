@@ -1,8 +1,8 @@
 //! Shared capacity, reservation, wakeup, and cancellation regressions.
 mod support;
+use carbon_io::{FrameBudget, ReadScheduler, WriteScheduler};
 use futures::Stream;
 use futures::stream;
-use io_scheduler::{FrameBudget, ReadScheduler, WriteScheduler};
 use std::{
     pin::Pin,
     sync::{Arc, atomic::Ordering},

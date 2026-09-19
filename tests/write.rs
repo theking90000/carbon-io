@@ -1,7 +1,7 @@
 //! Scheduler contract regression tests.
 mod support;
+use carbon_io::{ContractError as C, FrameBudget, SchedulerError as E, WriteScheduler};
 use futures::stream;
-use io_scheduler::{ContractError as C, FrameBudget, SchedulerError as E, WriteScheduler};
 use std::task::Poll;
 use support::*;
 

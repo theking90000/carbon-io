@@ -1,8 +1,8 @@
 //! Driving under consumer backpressure, cancellation, and deferred errors.
 mod support;
 
+use carbon_io::{ContractError, FrameBudget, ReadScheduler, SchedulerError, WriteScheduler};
 use futures::{FutureExt, StreamExt, stream, stream::FusedStream};
-use io_scheduler::{ContractError, FrameBudget, ReadScheduler, SchedulerError, WriteScheduler};
 use std::{
     future::{Future, poll_fn},
     pin::Pin,

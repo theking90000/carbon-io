@@ -1,7 +1,7 @@
 //! Waker routing, bounded work, backpressure, and non-starvation tests.
 mod support;
+use carbon_io::{FrameBudget, ReadScheduler, WriteScheduler};
 use futures::{Stream, StreamExt, stream};
-use io_scheduler::{FrameBudget, ReadScheduler, WriteScheduler};
 use std::{
     pin::Pin,
     sync::atomic::Ordering,
@@ -154,7 +154,7 @@ fn eof_probe_waits_for_its_own_waker() {
             }
         }
     }
-    impl io_scheduler::ReadFile<usize> for File {
+    impl carbon_io::ReadFile<usize> for File {
         type Error = ();
         type Open = std::future::Ready<Result<Reader, ()>>;
         type Reader = Reader;
