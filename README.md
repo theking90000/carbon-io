@@ -62,11 +62,11 @@ strategy and starts no background task.
 
 ## 📦 Installation
 
-With access to the Git repository:
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-carbon-io = { git = "ssh://git@github.com/theking90000/carbon-io", tag = "v0.3.0" }
+carbon-io = "0.3.1"
 futures = "0.3" # StreamExt and the executor used in the examples.
 ```
 
