@@ -22,6 +22,20 @@ Consuming the stream drives I/O. CARBON starts no background tasks.
 See the [detailed guide](docs/guide.md) for more on scheduling, buffering,
 backpressure, and backend integration.
 
+## Hiding I/O latency
+
+**25× the sequential throughput in this test:** 485.2 MiB/s with CARBON I/O,
+versus 19.2 MiB/s sequentially. The smaller pipeline reached 178.1 MiB/s.
+
+Test conditions: a 588 MB source file, split into 10 MiB segments of 160 frames
+at 64 KiB each, with an artificial 500 ms delay per file open. The two runs
+allowed 10 or 50 active files, covering 100 or 500 MiB of data ahead, with the
+same 4,000-frame buffering budget, equivalent to 250 MiB. The charts' “buffer”
+labels refer to that file window, not measured memory usage.
+
+![Measured throughput compared with sequential I/O](.github/throughput-summary.png)
+![A larger file window hides the simulated opening latency](.github/latency-hiding.png)
+
 ## Installation
 
 Add to your `Cargo.toml`:
