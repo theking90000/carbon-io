@@ -1,0 +1,18 @@
+[package]
+name = "carbon-example-http-upload"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+
+[dependencies]
+carbon-io = { path = "../.." }
+bytes = "1"
+futures = "0.3.32"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"
