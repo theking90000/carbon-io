@@ -19,6 +19,16 @@ writes across files, limits buffering, and delivers results in order.
 
 Consuming the stream drives I/O. CARBON starts no background tasks.
 
+Schedulers borrow `Unpin` streams via `&mut`, a shared `&FrameBudget`, and a mutable
+`&mut SchedulerConfig`. Streams stay with the caller at EOF and on failure. Pinning for polling stays
+inside Carbon. Borrow a pinned wrapper to use a `!Unpin` stream.
+Dropping a scheduler cancels its operations and makes the borrowed values
+available again. `set_window()` updates the caller's configuration.
+
+`WriteScheduler::input_mut()` temporarily exposes `&mut I` and wakes the
+scheduler so the input can be filled before polling resumes. EOF is final.
+The borrowing API is an unreleased breaking change from 0.3.1.
+
 See the [detailed guide](docs/guide.md) for more on scheduling, buffering,
 backpressure, and backend integration.
 
@@ -76,10 +86,13 @@ impl ReadFile<u32> for File {
 
 fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
+        let mut scheduler_files_1 = stream::iter([File(0..3), File(3..5)]);
+        let scheduler_budget_1 = FrameBudget::new(64);
+        let mut scheduler_config_1 = SchedulerConfig::default();
         let mut reader = ReadScheduler::new(
-            stream::iter([File(0..3), File(3..5)]),
-            FrameBudget::new(64),
-            SchedulerConfig::default(),
+            &mut scheduler_files_1,
+            &scheduler_budget_1,
+            &mut scheduler_config_1,
         );
 
         let mut values = Vec::new();
@@ -159,11 +172,15 @@ impl FrameWriter<u32> for Writer {
 
 fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
+        let mut scheduler_input_1 = stream::iter([1, 2, 3, 4]);
+        let mut scheduler_files_1 = stream::iter([File, File]);
+        let scheduler_budget_1 = FrameBudget::new(64);
+        let mut scheduler_config_1 = SchedulerConfig::default();
         let mut writer = WriteScheduler::new(
-            stream::iter([1, 2, 3, 4]),
-            stream::iter([File, File]),
-            FrameBudget::new(64),
-            SchedulerConfig::default(),
+            &mut scheduler_input_1,
+            &mut scheduler_files_1,
+            &scheduler_budget_1,
+            &mut scheduler_config_1,
         );
 
         let mut results = Vec::new();

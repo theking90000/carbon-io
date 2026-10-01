@@ -42,11 +42,15 @@ impl FrameWriter<Frame> for Writer {
 fn neither_clone_nor_unpin_is_required_on_frames() {
     for max_retries in [0, 1] {
         let input = stream::iter([Frame(2, PhantomPinned), Frame(3, PhantomPinned)]);
+        let mut scheduler_input_1 = input;
+        let mut scheduler_files_1 = stream::iter([File]);
+        let scheduler_budget_1 = FrameBudget::new(4);
+        let mut scheduler_config_1 = SchedulerConfig::default().with_max_retries(max_retries);
         let mut s = WriteScheduler::new(
-            input,
-            stream::iter([File]),
-            FrameBudget::new(4),
-            SchedulerConfig::default().with_max_retries(max_retries),
+            &mut scheduler_input_1,
+            &mut scheduler_files_1,
+            &scheduler_budget_1,
+            &mut scheduler_config_1,
         );
         block_on(async {
             assert_eq!(s.next().await.unwrap().unwrap(), 5);

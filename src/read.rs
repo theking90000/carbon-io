@@ -39,7 +39,8 @@ struct Slot<T, F: ReadFile<T>> {
 ///
 /// Polling drives all work. No background task is created. The input yields files
 /// directly; errors come from each file's opening future and reader.
-/// Input streams and backend futures may be `!Unpin`.
+/// Borrowed streams must be `Unpin`; a pinned wrapper supports `!Unpin` streams.
+/// Backend futures and readers may be `!Unpin`.
 ///
 /// # Examples
 ///
@@ -60,28 +61,31 @@ struct Slot<T, F: ReadFile<T>> {
 /// }
 ///
 /// block_on(async {
+///     let mut scheduler_files_1 = stream::iter([MemFile(0..2)]);
+///     let scheduler_budget_1 = FrameBudget::new(16);
+///     let mut scheduler_config_1 = SchedulerConfig::default();
 ///     let mut scheduler = ReadScheduler::new(
-///         stream::iter([MemFile(0..2)]),
-///         FrameBudget::new(16),
-///         SchedulerConfig::default(),
+///         &mut scheduler_files_1,
+///         &scheduler_budget_1,
+///         &mut scheduler_config_1,
 ///     );
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 0);
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 1);
 ///     assert!(scheduler.next().await.is_none());
 /// });
 /// ```
-pub struct ReadScheduler<T, S>
+pub struct ReadScheduler<'a, T, S>
 where
-    S: Stream,
+    S: Stream + Unpin,
     S::Item: ReadFile<T>,
 {
-    files: Option<Pin<Box<S>>>,
+    files: &'a mut S,
     slots: Vec<Slot<T, S::Item>>,
     order: VecDeque<usize>,
     free: Vec<usize>,
     ready: ReadyQueue,
-    permit: FramePermit,
-    config: SchedulerConfig,
+    permit: FramePermit<'a>,
+    config: &'a mut SchedulerConfig,
     ring: Vec<Option<T>>,
     head: usize,
     emitted: usize,
@@ -90,13 +94,14 @@ where
     allow_cursor: usize,
     active: usize,
     error: Option<SchedulerError<<S::Item as ReadFile<T>>::Error>>,
+    files_done: bool,
     files_ready: bool,
     terminated: bool,
 }
 
-impl<T, S> fmt::Debug for ReadScheduler<T, S>
+impl<T, S> fmt::Debug for ReadScheduler<'_, T, S>
 where
-    S: Stream,
+    S: Stream + Unpin,
     S::Item: ReadFile<T>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,19 +117,27 @@ where
     }
 }
 
-// Only boxed I/O is structurally pinned; frames and file descriptors are not.
-impl<T, S> Unpin for ReadScheduler<T, S>
+// Borrowed streams are Unpin; backend I/O stays boxed and pinned.
+impl<T, S> Unpin for ReadScheduler<'_, T, S>
 where
-    S: Stream,
+    S: Stream + Unpin,
     S::Item: ReadFile<T>,
 {
 }
 
-impl<T, S> ReadScheduler<T, S>
+impl<'a, T, S> ReadScheduler<'a, T, S>
 where
-    S: Stream,
+    S: Stream + Unpin,
     S::Item: ReadFile<T>,
 {
+    /// Borrow streams, shared budget, and mutable configuration.
+    ///
+    /// Streams must be `Unpin`. For a `!Unpin` stream, borrow a wrapper produced
+    /// by `std::pin::pin!` or `Box::pin`. Pinning for polling stays internal.
+    /// Dropping the scheduler cancels its operations and releases the
+    /// borrows; EOF and errors never destroy the caller's streams. `set_window`
+    /// updates the borrowed configuration.
+    ///
     /// Build a scheduler. Invalid initial configuration is returned by its stream.
     ///
     /// # Examples
@@ -143,13 +156,16 @@ where
     /// #     fn open(&self) -> Self::Open { ready(Ok(stream::empty())) }
     /// # }
     ///
+    /// let mut scheduler_files_1 = stream::empty::<Dummy>();
+    /// let scheduler_budget_1 = FrameBudget::new(64);
+    /// let mut scheduler_config_1 = SchedulerConfig::default();
     /// let scheduler = ReadScheduler::new(
-    ///     stream::empty::<Dummy>(),
-    ///     FrameBudget::new(64),
-    ///     SchedulerConfig::default(),
+    ///     &mut scheduler_files_1,
+    ///     &scheduler_budget_1,
+    ///     &mut scheduler_config_1,
     /// );
     /// ```
-    pub fn new(files: S, budget: FrameBudget, config: SchedulerConfig) -> Self {
+    pub fn new(files: &'a mut S, budget: &'a FrameBudget, config: &'a mut SchedulerConfig) -> Self {
         let mut ready = ReadyQueue::new();
         ready.add();
         ready.add();
@@ -162,7 +178,7 @@ where
             .or_else(|| (budget.total_capacity() == 0).then_some(ContractError::ZeroBudget))
             .map(Into::into);
         Self {
-            files: Some(Box::pin(files)),
+            files,
             slots: Vec::new(),
             order: VecDeque::new(),
             free: Vec::new(),
@@ -177,6 +193,7 @@ where
             allow_cursor: 0,
             active: 0,
             error,
+            files_done: false,
             files_ready: true,
             terminated: false,
         }
@@ -205,10 +222,13 @@ where
     /// #     fn open(&self) -> Self::Open { ready(Ok(stream::empty())) }
     /// # }
     ///
+    /// let mut scheduler_files_1 = stream::empty::<Dummy>();
+    /// let scheduler_budget_1 = FrameBudget::new(16);
+    /// let mut scheduler_config_1 = SchedulerConfig::default();
     /// let mut scheduler = ReadScheduler::new(
-    ///     stream::empty::<Dummy>(),
-    ///     FrameBudget::new(16),
-    ///     SchedulerConfig::default(),
+    ///     &mut scheduler_files_1,
+    ///     &scheduler_budget_1,
+    ///     &mut scheduler_config_1,
     /// );
     /// let new_window = Window::new(64, 256, 8).unwrap();
     /// assert!(scheduler.set_window(new_window).is_ok());
@@ -237,7 +257,7 @@ where
     }
 
     fn schedule_files(&mut self) {
-        if self.files_ready {
+        if self.files_ready && !self.files_done {
             self.ready.schedule(FILES);
         }
     }
@@ -307,16 +327,16 @@ where
         {
             return Ok(());
         }
-        let Some(files) = self.files.as_mut() else {
+        if self.files_done {
             return Ok(());
-        };
-        let file = match files.as_mut().poll_next(cx) {
+        }
+        let file = match Pin::new(&mut *self.files).poll_next(cx) {
             Poll::Pending => {
                 self.files_ready = false;
                 return Ok(());
             }
             Poll::Ready(None) => {
-                self.files = None;
+                self.files_done = true;
                 return Ok(());
             }
             Poll::Ready(Some(file)) => file,
@@ -478,7 +498,7 @@ where
             self.error = Some(error);
             return;
         }
-        if self.files.is_none() && self.order.is_empty() {
+        if self.files_done && self.order.is_empty() {
             self.finish();
             return;
         }
@@ -533,7 +553,7 @@ where
     }
 
     fn finish(&mut self) {
-        self.files = None;
+        self.files_done = true;
         self.slots.clear();
         self.order.clear();
         self.ring.clear();
@@ -542,9 +562,9 @@ where
     }
 }
 
-impl<T, S> Stream for ReadScheduler<T, S>
+impl<T, S> Stream for ReadScheduler<'_, T, S>
 where
-    S: Stream,
+    S: Stream + Unpin,
     S::Item: ReadFile<T>,
 {
     type Item = Result<T, SchedulerError<<S::Item as ReadFile<T>>::Error>>;
@@ -568,7 +588,7 @@ where
         if let Some(frame) = this.take_frame() {
             return Poll::Ready(Some(Ok(frame)));
         }
-        if this.files.is_none() && this.order.is_empty() {
+        if this.files_done && this.order.is_empty() {
             this.finish();
             return Poll::Ready(None);
         }
@@ -578,9 +598,9 @@ where
         Poll::Pending
     }
 }
-impl<T, S> FusedStream for ReadScheduler<T, S>
+impl<T, S> FusedStream for ReadScheduler<'_, T, S>
 where
-    S: Stream,
+    S: Stream + Unpin,
     S::Item: ReadFile<T>,
 {
     fn is_terminated(&self) -> bool {

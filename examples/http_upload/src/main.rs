@@ -17,7 +17,10 @@ use std::{
     future::{Future, Ready, ready},
     io,
     pin::Pin,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, ready as poll_ready},
     time::Duration,
 };
@@ -49,16 +52,19 @@ impl WriteFile<Bytes> for HttpFile {
         let (sender, mut receiver) = mpsc::channel::<Bytes>(0);
         let eof = Arc::new(AtomicBool::new(false));
         let body_eof = eof.clone();
-        let body = stream::poll_fn(move |cx| {
-            match poll_ready!(Pin::new(&mut receiver).poll_next(cx)) {
-                Some(frame) => Poll::Ready(Some(Ok::<_, io::Error>(frame))),
-                None => {
-                    body_eof.store(true, Ordering::Release);
-                    Poll::Ready(None)
-                }
-            }
-        });
-        let request = self.client.put(&self.url)
+        let body =
+            stream::poll_fn(
+                move |cx| match poll_ready!(Pin::new(&mut receiver).poll_next(cx)) {
+                    Some(frame) => Poll::Ready(Some(Ok::<_, io::Error>(frame))),
+                    None => {
+                        body_eof.store(true, Ordering::Release);
+                        Poll::Ready(None)
+                    }
+                },
+            );
+        let request = self
+            .client
+            .put(&self.url)
             .header("content-type", "application/octet-stream")
             .body(Body::wrap_stream(body));
 
@@ -89,7 +95,6 @@ impl FrameWriter<Bytes> for HttpWriter {
         cx: &mut Context<'_>,
         frame: &Bytes,
     ) -> Poll<io::Result<()>> {
-        
         let this = self.get_mut();
         // Start/advance the SAME request, and detect HTTP failures while writing.
         if let Poll::Ready(result) = this.request.as_mut().poll(cx) {
@@ -108,10 +113,7 @@ impl FrameWriter<Bytes> for HttpWriter {
         Poll::Ready(sender.start_send(frame.clone()).map_err(io::Error::other))
     }
 
-    fn poll_finalize(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<StatusCode>> {
+    fn poll_finalize(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<StatusCode>> {
         let this = self.get_mut();
         // Closing the only sender drains the queued frame, then yields body EOF.
         // take() makes this safe across repeated Pending polls.
@@ -138,13 +140,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frames: 3,
     }));
     // Replace this lazy input with any Stream<Item = Bytes>.
-    let input = stream::iter((0..count).flat_map(|_| [
-        Bytes::from_static(b"hello"),
-        Bytes::from_static(b" "),
-        Bytes::from_static(b"world\n"),
-    ]));
+    let input = stream::iter((0..count).flat_map(|_| {
+        [
+            Bytes::from_static(b"hello"),
+            Bytes::from_static(b" "),
+            Bytes::from_static(b"world\n"),
+        ]
+    }));
     let config = SchedulerConfig::default().with_max_retries(0);
-    let mut uploads = WriteScheduler::new(input, files, FrameBudget::new(16), config);
+    let mut scheduler_input_1 = input;
+    let mut scheduler_files_1 = files;
+    let scheduler_budget_1 = FrameBudget::new(16);
+    let mut scheduler_config_1 = config;
+    let mut uploads = WriteScheduler::new(
+        &mut scheduler_input_1,
+        &mut scheduler_files_1,
+        &scheduler_budget_1,
+        &mut scheduler_config_1,
+    );
     while let Some(result) = uploads.next().await {
         println!("upload completed: {}", result?);
     }

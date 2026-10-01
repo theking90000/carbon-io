@@ -199,10 +199,13 @@ fn read_case(name: &str, n: usize, size: u32, active: usize, pending: bool) {
             pending,
             polls: polls.clone(),
         }));
+        let mut scheduler_files_1 = files;
+        let scheduler_budget_1 = FrameBudget::new(target);
+        let mut scheduler_config_1 = config(target, active, 0);
         consume(ReadScheduler::new(
-            files,
-            FrameBudget::new(target),
-            config(target, active, 0),
+            &mut scheduler_files_1,
+            &scheduler_budget_1,
+            &mut scheduler_config_1,
         ))
     })
 }
@@ -219,11 +222,15 @@ fn write_case(name: &str, n: usize, size: u32, active: usize, pending: bool, ret
             attempts: Cell::new(0),
             polls: polls.clone(),
         }));
+        let mut scheduler_input_2 = stream::iter(0..count as u64);
+        let mut scheduler_files_2 = files;
+        let scheduler_budget_2 = FrameBudget::new(budget);
+        let mut scheduler_config_2 = config(target, active, u32::from(retry));
         consume(WriteScheduler::new(
-            stream::iter(0..count as u64),
-            files,
-            FrameBudget::new(budget),
-            config(target, active, u32::from(retry)),
+            &mut scheduler_input_2,
+            &mut scheduler_files_2,
+            &scheduler_budget_2,
+            &mut scheduler_config_2,
         ))
     })
 }
@@ -231,19 +238,21 @@ fn shared_case(n: usize) {
     let polls = Rc::new(Cell::new(0));
     measure("shared_four_schedulers", n * 4, 4, polls.clone(), || {
         let budget = FrameBudget::new(4096);
-        let mut schedulers: Vec<_> = (0..4)
+        let mut files: Vec<_> = (0..4)
             .map(|i| {
-                ReadScheduler::new(
-                    stream::iter([ReadSource {
-                        start: (i * n) as u64,
-                        count: n as u32,
-                        pending: false,
-                        polls: polls.clone(),
-                    }]),
-                    budget.clone(),
-                    config(1024, 1, 0),
-                )
+                stream::iter([ReadSource {
+                    start: (i * n) as u64,
+                    count: n as u32,
+                    pending: false,
+                    polls: polls.clone(),
+                }])
             })
+            .collect();
+        let mut configs = [config(1024, 1, 0); 4];
+        let mut schedulers: Vec<_> = files
+            .iter_mut()
+            .zip(&mut configs)
+            .map(|(files, config)| ReadScheduler::new(files, &budget, config))
             .collect();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -282,15 +291,18 @@ fn read_consumer_case(name: &str, count: u32, drive: bool) {
     let polls = Rc::new(Cell::new(0));
     measure(name, count as usize, 1, polls.clone(), || {
         futures::executor::block_on(async {
+            let mut scheduler_files_3 = stream::iter([ReadSource {
+                start: 0,
+                count,
+                pending: true,
+                polls,
+            }]);
+            let scheduler_budget_3 = FrameBudget::new(64);
+            let mut scheduler_config_3 = config(64, 1, 0);
             let mut reader = ReadScheduler::new(
-                stream::iter([ReadSource {
-                    start: 0,
-                    count,
-                    pending: true,
-                    polls,
-                }]),
-                FrameBudget::new(64),
-                config(64, 1, 0),
+                &mut scheduler_files_3,
+                &scheduler_budget_3,
+                &mut scheduler_config_3,
             );
             let mut sum = 0;
             while let Some(frame) = reader.next().await {
@@ -314,17 +326,22 @@ fn write_consumer_case(name: &str, files: usize, drive: bool) {
     let count = files * 4;
     measure(name, count, files, polls.clone(), || {
         futures::executor::block_on(async {
-            let mut writer = WriteScheduler::new(
-                stream::iter(0..count as u64),
-                stream::iter((0..files).map(|_| Destination {
+            let mut scheduler_input_4 = stream::iter(0..count as u64);
+            let mut scheduler_files_4 =
+                std::pin::pin!(stream::iter((0..files).map(|_| Destination {
                     count: 4,
                     pending: true,
                     retry: false,
                     attempts: Cell::new(0),
                     polls: polls.clone(),
-                })),
-                FrameBudget::new(64),
-                config(64, 16, 0),
+                })));
+            let scheduler_budget_4 = FrameBudget::new(64);
+            let mut scheduler_config_4 = config(64, 16, 0);
+            let mut writer = WriteScheduler::new(
+                &mut scheduler_input_4,
+                &mut scheduler_files_4,
+                &scheduler_budget_4,
+                &mut scheduler_config_4,
             );
             let mut sum = 0;
             while let Some(result) = writer.next().await {

@@ -166,17 +166,21 @@ async fn upload(socket: TcpStream, directory: &Path) -> io::Result<u64> {
         path: directory.join(format!("{index:020}.bin")),
         frames: FRAMES_PER_FILE,
     }));
+    let mut scheduler_input_1 = std::pin::pin!(input);
+    let mut scheduler_files_1 = destinations;
+    let scheduler_budget_1 = FrameBudget::new(PIPELINE_FRAMES);
+    let mut scheduler_config_1 = config();
     let mut writer = WriteScheduler::new(
-        input,
-        destinations,
-        FrameBudget::new(PIPELINE_FRAMES),
-        config(),
+        &mut scheduler_input_1,
+        &mut scheduler_files_1,
+        &scheduler_budget_1,
+        &mut scheduler_config_1,
     );
     while let Some(result) = writer.next().await {
         println!("Written {}", result.map_err(io::Error::other)?.display());
     }
     drop(writer);
-    if let Some(error) = failure.into_inner() {
+    if let Some(error) = failure.borrow_mut().take() {
         return Err(error);
     }
     // Published only after every segment has been flushed and TCP reached EOF.
@@ -218,10 +222,13 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
         ));
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut scheduler_files_2 = stream::iter(files);
+    let scheduler_budget_2 = FrameBudget::new(PIPELINE_FRAMES);
+    let mut scheduler_config_2 = config();
     let mut reader = ReadScheduler::new(
-        stream::iter(files),
-        FrameBudget::new(PIPELINE_FRAMES),
-        config(),
+        &mut scheduler_files_2,
+        &scheduler_budget_2,
+        &mut scheduler_config_2,
     );
     let mut remaining = total;
     while let Some(frame) = reader.next().await {

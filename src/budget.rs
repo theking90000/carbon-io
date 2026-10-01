@@ -114,16 +114,17 @@ impl FrameBudget {
         lock(&self.state).available
     }
     /// Create an empty local permit.
-    pub fn permit(&self) -> FramePermit {
+    pub fn permit(&self) -> FramePermit<'_> {
         FramePermit {
-            budget: self.clone(),
+            budget: self,
             capacity: 0,
             request: Arc::new(Mutex::new(Request::default())),
         }
     }
 }
 
-/// A scheduler-local capacity grant. Drop returns all capacity and cancels waits.
+/// A scheduler-local capacity grant borrowing its shared budget.
+/// Drop returns all capacity and cancels waits.
 ///
 /// # Examples
 ///
@@ -135,13 +136,13 @@ impl FrameBudget {
 /// assert_eq!(permit.capacity(), 0);
 /// assert_eq!(permit.total_capacity(), 64);
 /// ```
-pub struct FramePermit {
-    budget: FrameBudget,
+pub struct FramePermit<'a> {
+    budget: &'a FrameBudget,
     capacity: usize,
     request: Arc<Mutex<Request>>,
 }
 
-impl fmt::Debug for FramePermit {
+impl fmt::Debug for FramePermit<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FramePermit")
             .field("capacity", &self.capacity)
@@ -150,7 +151,7 @@ impl fmt::Debug for FramePermit {
     }
 }
 
-impl FramePermit {
+impl FramePermit<'_> {
     /// Current local grant. Reading this does not access shared state.
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -226,7 +227,7 @@ impl FramePermit {
     }
 }
 
-impl Drop for FramePermit {
+impl Drop for FramePermit<'_> {
     fn drop(&mut self) {
         self.shrink_to(0);
     }

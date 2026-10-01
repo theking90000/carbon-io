@@ -110,7 +110,9 @@ fn scheduler_can_grow_when_capacity_is_released() {
     );
     let file = Read::new(0..256);
     file.reading.close();
-    let mut reader = ReadScheduler::new(stream::iter([file]), b.clone(), config(128, 256, 1, 0));
+    let mut scheduler_files_1 = stream::iter([file]);
+    let mut scheduler_config_1 = config(128, 256, 1, 0);
+    let mut reader = ReadScheduler::new(&mut scheduler_files_1, &b, &mut scheduler_config_1);
     assert!(poll(&mut reader).is_pending());
     assert_eq!(reader.granted_frames(), 32);
     drop(owner);
@@ -121,7 +123,9 @@ fn scheduler_can_grow_when_capacity_is_released() {
 fn scheduler_can_shrink() {
     let b = FrameBudget::new(64);
     let file = Read::new(0..128);
-    let mut r = ReadScheduler::new(stream::iter([file]), b.clone(), config(64, 128, 1, 0));
+    let mut scheduler_files_2 = stream::iter([file]);
+    let mut scheduler_config_2 = config(64, 128, 1, 0);
+    let mut r = ReadScheduler::new(&mut scheduler_files_2, &b, &mut scheduler_config_2);
     assert!(poll(&mut r).is_ready());
     r.set_window(config(4, 128, 1, 0).window).unwrap();
     for _ in 0..63 {
@@ -138,8 +142,18 @@ fn multiple_read_and_write_schedulers_share_budget() {
     let wfile = Write::new(4);
     wfile.writing.close();
     let (input, _) = frames(4);
-    let mut r = ReadScheduler::new(stream::iter([rfile]), b.clone(), config(4, 4, 1, 0));
-    let mut w = WriteScheduler::new(input, stream::iter([wfile]), b.clone(), config(4, 4, 1, 1));
+    let mut scheduler_files_3 = stream::iter([rfile]);
+    let mut scheduler_config_3 = config(4, 4, 1, 0);
+    let mut r = ReadScheduler::new(&mut scheduler_files_3, &b, &mut scheduler_config_3);
+    let mut scheduler_input_4 = input;
+    let mut scheduler_files_4 = stream::iter([wfile]);
+    let mut scheduler_config_4 = config(4, 4, 1, 1);
+    let mut w = WriteScheduler::new(
+        &mut scheduler_input_4,
+        &mut scheduler_files_4,
+        &b,
+        &mut scheduler_config_4,
+    );
     assert!(poll(&mut r).is_pending());
     assert!(poll(&mut w).is_pending());
     assert_eq!(r.granted_frames() + w.granted_frames(), 8);
@@ -155,13 +169,24 @@ fn two_replay_writers_do_not_deadlock_with_partial_local_grants() {
     let c = Write::new(6);
     let (i1, _) = frames(6);
     let (i2, _) = frames(6);
+    let mut scheduler_input_5 = i1;
+    let mut scheduler_files_5 = stream::iter([a.clone()]);
+    let mut scheduler_config_5 = config(8, 10, 1, 1);
     let mut s1 = WriteScheduler::new(
-        i1,
-        stream::iter([a.clone()]),
-        b.clone(),
-        config(8, 10, 1, 1),
+        &mut scheduler_input_5,
+        &mut scheduler_files_5,
+        &b,
+        &mut scheduler_config_5,
     );
-    let mut s2 = WriteScheduler::new(i2, stream::iter([c]), b.clone(), config(8, 10, 1, 1));
+    let mut scheduler_input_6 = i2;
+    let mut scheduler_files_6 = stream::iter([c]);
+    let mut scheduler_config_6 = config(8, 10, 1, 1);
+    let mut s2 = WriteScheduler::new(
+        &mut scheduler_input_6,
+        &mut scheduler_files_6,
+        &b,
+        &mut scheduler_config_6,
+    );
     assert!(poll(&mut s1).is_pending());
     assert!(poll(&mut s2).is_pending());
     assert_eq!(s2.retained_frames(), 0);
@@ -182,7 +207,9 @@ fn small_releases_do_not_cause_unit_grants() {
     );
     let f = Read::new(0..128);
     f.reading.close();
-    let mut s = ReadScheduler::new(stream::iter([f]), b.clone(), config(128, 128, 1, 0));
+    let mut scheduler_files_7 = stream::iter([f]);
+    let mut scheduler_config_7 = config(128, 128, 1, 0);
+    let mut s = ReadScheduler::new(&mut scheduler_files_7, &b, &mut scheduler_config_7);
     let (c, w) = context_waker();
     let mut cx = Context::from_waker(&w);
     assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());

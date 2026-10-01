@@ -1667,6 +1667,18 @@ Une frame cesse d'occuper le scheduler uniquement lorsque le fichier auquel elle
 
 `drop(scheduler)` doit suffire à annuler tout le travail.
 
+Les schedulers empruntent les streams via `&mut I` et `&mut S`, avec `Unpin`,
+le budget via `&FrameBudget` et la configuration via `&mut SchedulerConfig`.
+Le permis emprunte également le budget. Les streams restent chez l'appelant,
+même après EOF ou une erreur. Leur état de fin est suivi séparément.
+La destruction du scheduler libère les emprunts et conserve les éléments que
+les streams n'ont pas encore produits. Les frames acceptées et les descripteurs
+déjà produits restent la propriété du scheduler.
+
+`WriteScheduler::input_mut()` permet un accès temporaire à l'entrée et
+réveille le scheduler pour un nouveau polling. EOF reste définitif. La méthode
+`set_window()` modifie la configuration empruntée.
+
 Comme aucune tâche détachée n'est créée :
 
 ```text
@@ -2094,10 +2106,12 @@ Pas davantage en V1.
 Exemple conceptuel :
 
 ```rust
+let mut scheduler_files_1 = files;
+let mut scheduler_config_1 = config;
 let scheduler = ReadScheduler::new(
-    files,
-    budget,
-    config,
+    &mut scheduler_files_1,
+    &budget,
+    &mut scheduler_config_1,
 );
 
 while let Some(frame) = scheduler.next().await {
@@ -2117,11 +2131,14 @@ Le scheduler ne nécessite pas de connaître tous les fichiers à l'avance.
 Exemple conceptuel :
 
 ```rust
+let mut scheduler_input_1 = frames;
+let mut scheduler_files_1 = files;
+let mut scheduler_config_1 = config;
 let scheduler = WriteScheduler::new(
-    frames,
-    files,
-    budget,
-    config,
+    &mut scheduler_input_1,
+    &mut scheduler_files_1,
+    &budget,
+    &mut scheduler_config_1,
 );
 
 while let Some(result) = scheduler.next().await {

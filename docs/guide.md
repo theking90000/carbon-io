@@ -26,7 +26,7 @@ in-memory backends return ready results; a backend may also return pending I/O.
 
 ## Reading files
 
-`ReadScheduler` takes a stream of file descriptors. Each descriptor declares
+`ReadScheduler` borrows an `Unpin` stream of file descriptors. Each descriptor declares
 its frame count and opens a stream that yields exactly that many successful
 frames, followed by EOF.
 
@@ -52,7 +52,7 @@ before there is capacity to read its frames.
 
 ## Writing files
 
-`WriteScheduler` takes a stream of frames and a stream of destinations. It fills
+`WriteScheduler` borrows an `Unpin` stream of frames and an `Unpin` stream of destinations. It fills
 destinations in order, up to their declared frame capacities, and emits one
 finalization result per file in destination order.
 
@@ -183,7 +183,24 @@ Both schedulers implement `FusedStream`. `is_terminated()` remains false while
 an error is waiting to be emitted.
 
 Dropping a pending `next()` or `progress()` future preserves the scheduler's
-state. Dropping the scheduler itself abandons its operations, drops its frames
+state. Both schedulers borrow `Unpin` streams via `&mut`, a shared
+`&FrameBudget`, and a mutable `&mut SchedulerConfig`. Carbon uses `Pin::new`
+only while polling streams. For a `!Unpin` stream, create a wrapper with
+`std::pin::pin!` or `Box::pin` and borrow that wrapper. `set_window()` updates the borrowed
+configuration. Retry policy stays fixed while the configuration is borrowed.
+
+The streams remain alive at EOF and on error. Dropping the scheduler releases
+its borrows and preserves unconsumed input frames and descriptors. Descriptors
+already yielded to the scheduler, its buffered frames, and its backend attempts
+are still owned by the scheduler.
+
+During writing, `input_mut()` returns `&mut I` and wakes the scheduler for
+another input poll. Finish this temporary borrow before polling again. An input
+that can receive more frames must return `Pending` and register a waker while
+waiting; `None` ends the input permanently. Access remains possible after EOF
+or failure, but changing the input cannot restart a completed scheduler.
+
+Dropping the scheduler itself abandons its operations, drops its frames
 and backends, and returns its budget permits. This does not undo writes already
 performed. Backends must clean up abandoned attempts, including writes
 interrupted before finalization.

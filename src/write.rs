@@ -114,48 +114,54 @@ struct Slot<T, F: WriteFile<T>> {
 /// }
 ///
 /// block_on(async {
+///     let mut scheduler_input_1 = stream::iter([10, 20]);
+///     let mut scheduler_files_1 = stream::iter([MemFile]);
+///     let scheduler_budget_1 = FrameBudget::new(16);
+///     let mut scheduler_config_1 = SchedulerConfig::default();
 ///     let mut scheduler = WriteScheduler::new(
-///         stream::iter([10, 20]),
-///         stream::iter([MemFile]),
-///         FrameBudget::new(16),
-///         SchedulerConfig::default(),
+///         &mut scheduler_input_1,
+///         &mut scheduler_files_1,
+///         &scheduler_budget_1,
+///         &mut scheduler_config_1,
 ///     );
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 30);
 ///     assert!(scheduler.next().await.is_none());
 /// });
 /// ```
-pub struct WriteScheduler<T, I, S>
+pub struct WriteScheduler<'a, T, I, S>
 where
-    I: Stream<Item = T>,
-    S: Stream,
+    I: Stream<Item = T> + Unpin,
+    S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
-    input: Option<Pin<Box<I>>>,
-    files: Option<Pin<Box<S>>>,
+    input: &'a mut I,
+    files: &'a mut S,
     slots: Vec<Slot<T, S::Item>>,
     order: VecDeque<usize>,
     free: Vec<usize>,
     fill_index: usize,
     ready: ReadyQueue,
-    permit: FramePermit,
-    config: SchedulerConfig,
+    permit: FramePermit<'a>,
+    config: &'a mut SchedulerConfig,
     active: usize,
     horizon: usize,
     reserved: usize,
     retained: usize,
     // A reservation for the current file exists before its first input poll.
     fill_reserved: bool,
+    input_done: bool,
     input_ready: bool,
+    files_done: bool,
     files_ready: bool,
     budget_waiting: bool,
     error: Option<SchedulerError<<S::Item as WriteFile<T>>::Error>>,
     terminated: bool,
 }
 
-impl<T, I, S> fmt::Debug for WriteScheduler<T, I, S>
+impl<T, I, S> fmt::Debug for WriteScheduler<'_, T, I, S>
 where
-    I: Stream<Item = T>,
-    S: Stream,
+    I: Stream<Item = T> + Unpin,
+    S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -171,20 +177,28 @@ where
     }
 }
 
-impl<T, I, S> Unpin for WriteScheduler<T, I, S>
+impl<T, I, S> Unpin for WriteScheduler<'_, T, I, S>
 where
-    I: Stream<Item = T>,
-    S: Stream,
+    I: Stream<Item = T> + Unpin,
+    S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
 }
 
-impl<T, I, S> WriteScheduler<T, I, S>
+impl<'a, T, I, S> WriteScheduler<'a, T, I, S>
 where
-    I: Stream<Item = T>,
-    S: Stream,
+    I: Stream<Item = T> + Unpin,
+    S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
+    /// Borrow streams, shared budget, and mutable configuration.
+    ///
+    /// Streams must be `Unpin`. For a `!Unpin` stream, borrow a wrapper produced
+    /// by `std::pin::pin!` or `Box::pin`. Pinning for polling stays internal.
+    /// Dropping the scheduler cancels its operations and releases the
+    /// borrows; EOF and errors never destroy the caller's streams. `set_window`
+    /// updates the borrowed configuration.
+    ///
     /// Build a scheduler. Initial contract errors are emitted by the stream.
     ///
     /// # Examples
@@ -211,14 +225,23 @@ where
     /// #     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> { Poll::Ready(Ok(())) }
     /// # }
     ///
+    /// let mut scheduler_input_1 = stream::empty::<u32>();
+    /// let mut scheduler_files_1 = stream::empty::<Dummy>();
+    /// let scheduler_budget_1 = FrameBudget::new(64);
+    /// let mut scheduler_config_1 = SchedulerConfig::default();
     /// let scheduler = WriteScheduler::new(
-    ///     stream::empty::<u32>(),
-    ///     stream::empty::<Dummy>(),
-    ///     FrameBudget::new(64),
-    ///     SchedulerConfig::default(),
+    ///     &mut scheduler_input_1,
+    ///     &mut scheduler_files_1,
+    ///     &scheduler_budget_1,
+    ///     &mut scheduler_config_1,
     /// );
     /// ```
-    pub fn new(input: I, files: S, budget: FrameBudget, config: SchedulerConfig) -> Self {
+    pub fn new(
+        input: &'a mut I,
+        files: &'a mut S,
+        budget: &'a FrameBudget,
+        config: &'a mut SchedulerConfig,
+    ) -> Self {
         let mut ready = ReadyQueue::new();
         for _ in 0..FIRST_SLOT {
             ready.add();
@@ -232,8 +255,8 @@ where
             .or_else(|| (budget.total_capacity() == 0).then_some(ContractError::ZeroBudget))
             .map(Into::into);
         Self {
-            input: Some(Box::pin(input)),
-            files: Some(Box::pin(files)),
+            input,
+            files,
             slots: Vec::new(),
             order: VecDeque::new(),
             free: Vec::new(),
@@ -246,13 +269,28 @@ where
             reserved: 0,
             retained: 0,
             fill_reserved: false,
+            input_done: false,
             input_ready: true,
+            files_done: false,
             files_ready: true,
             budget_waiting: false,
             error,
             terminated: false,
         }
     }
+    /// Temporarily borrow the input, including wrappers around `!Unpin` streams.
+    ///
+    /// Access schedules another input poll and wakes the registered task. End the
+    /// borrow before driving the scheduler again. The input must still register a
+    /// waker when it returns `Pending`. EOF remains final even if the input changes.
+    /// This method remains available after completion or failure.
+    pub fn input_mut(&mut self) -> &mut I {
+        if !self.input_done && !self.terminated && self.error.is_none() {
+            self.ready.waker(INPUT).wake();
+        }
+        self.input
+    }
+
     /// Replace the window without discarding accepted frames or existing files.
     ///
     /// # Errors
@@ -284,11 +322,15 @@ where
     /// #     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> { Poll::Ready(Ok(())) }
     /// # }
     ///
+    /// let mut scheduler_input_1 = stream::empty::<u32>();
+    /// let mut scheduler_files_1 = stream::empty::<Dummy>();
+    /// let scheduler_budget_1 = FrameBudget::new(16);
+    /// let mut scheduler_config_1 = SchedulerConfig::default();
     /// let mut scheduler = WriteScheduler::new(
-    ///     stream::empty::<u32>(),
-    ///     stream::empty::<Dummy>(),
-    ///     FrameBudget::new(16),
-    ///     SchedulerConfig::default(),
+    ///     &mut scheduler_input_1,
+    ///     &mut scheduler_files_1,
+    ///     &scheduler_budget_1,
+    ///     &mut scheduler_config_1,
     /// );
     /// let new_window = Window::new(64, 256, 8).unwrap();
     /// assert!(scheduler.set_window(new_window).is_ok());
@@ -329,12 +371,12 @@ where
         }
     }
     fn schedule_input(&mut self) {
-        if self.input_ready && !self.budget_waiting {
+        if self.input_ready && !self.input_done && !self.budget_waiting {
             self.ready.schedule(INPUT);
         }
     }
     fn schedule_files(&mut self) {
-        if self.files_ready {
+        if self.files_ready && !self.files_done {
             self.ready.schedule(FILES);
         }
     }
@@ -347,22 +389,22 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Result<(), SchedulerError<<S::Item as WriteFile<T>>::Error>> {
-        if self.input.is_none()
+        if self.input_done
             || self.active >= self.config.window.max_active_files
             || self.horizon >= self.config.window.horizon()
         {
             return Ok(());
         }
-        let Some(files) = self.files.as_mut() else {
+        if self.files_done {
             return Ok(());
-        };
-        let file = match files.as_mut().poll_next(cx) {
+        }
+        let file = match Pin::new(&mut *self.files).poll_next(cx) {
             Poll::Pending => {
                 self.files_ready = false;
                 return Ok(());
             }
             Poll::Ready(None) => {
-                self.files = None;
+                self.files_done = true;
                 self.schedule_input();
                 return Ok(());
             }
@@ -448,14 +490,14 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Result<(), SchedulerError<<S::Item as WriteFile<T>>::Error>> {
-        if self.input.is_none() {
+        if self.input_done {
             return Ok(());
         }
         if !self.replay() && self.retained >= self.config.window.target_frames {
             return Ok(());
         }
         let destination = self.order.get(self.fill_index).copied();
-        if destination.is_none() && self.files.is_some() {
+        if destination.is_none() && !self.files_done {
             return Ok(());
         }
         if let Some(id) = destination {
@@ -477,7 +519,7 @@ where
         } else if !self.ensure_capacity(self.engaged() + 1, cx) {
             return Ok(());
         }
-        match self.input.as_mut().unwrap().as_mut().poll_next(cx) {
+        match Pin::new(&mut *self.input).poll_next(cx) {
             Poll::Pending => {
                 self.input_ready = false;
             }
@@ -507,8 +549,8 @@ where
         Ok(())
     }
     fn input_eof(&mut self) {
-        self.input = None;
-        self.files = None;
+        self.input_done = true;
+        self.files_done = true;
         // Only the current partial file can need an EOF-induced finalization.
         if let Some(&id) = self.order.get(self.fill_index) {
             if self.slots[id].assigned > 0 {
@@ -583,9 +625,7 @@ where
                             None
                         }
                     }
-                } else if slot.assigned == slot.capacity
-                    || (self.input.is_none() && slot.assigned > 0)
-                {
+                } else if slot.assigned == slot.capacity || (self.input_done && slot.assigned > 0) {
                     match writer.poll_finalize(cx) {
                         Poll::Pending => {
                             slot.pending = true;
@@ -669,7 +709,7 @@ where
             self.error = Some(error);
             return;
         }
-        if self.input.is_none() && self.order.is_empty() {
+        if self.input_done && self.order.is_empty() {
             self.finish();
             return;
         }
@@ -728,8 +768,8 @@ where
     }
 
     fn finish(&mut self) {
-        self.input = None;
-        self.files = None;
+        self.input_done = true;
+        self.files_done = true;
         self.slots.clear();
         self.order.clear();
         self.permit.shrink_to(0);
@@ -739,10 +779,10 @@ where
     }
 }
 
-impl<T, I, S> Stream for WriteScheduler<T, I, S>
+impl<T, I, S> Stream for WriteScheduler<'_, T, I, S>
 where
-    I: Stream<Item = T>,
-    S: Stream,
+    I: Stream<Item = T> + Unpin,
+    S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
     type Item =
@@ -766,7 +806,7 @@ where
         if let Some(result) = this.take_result() {
             return Poll::Ready(Some(Ok(result)));
         }
-        if this.input.is_none() && this.order.is_empty() {
+        if this.input_done && this.order.is_empty() {
             this.finish();
             return Poll::Ready(None);
         }
@@ -776,10 +816,10 @@ where
         Poll::Pending
     }
 }
-impl<T, I, S> FusedStream for WriteScheduler<T, I, S>
+impl<T, I, S> FusedStream for WriteScheduler<'_, T, I, S>
 where
-    I: Stream<Item = T>,
-    S: Stream,
+    I: Stream<Item = T> + Unpin,
+    S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
     fn is_terminated(&self) -> bool {

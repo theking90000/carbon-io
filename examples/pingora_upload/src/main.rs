@@ -8,9 +8,7 @@ use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, Window, WriteFile, Wr
 use futures::{StreamExt, stream};
 use http::Uri;
 use pingora_core::{
-    connectors::http::Connector,
-    protocols::http::client::HttpSession,
-    upstreams::peer::HttpPeer,
+    connectors::http::Connector, protocols::http::client::HttpSession, upstreams::peer::HttpPeer,
 };
 use pingora_http::RequestHeader;
 use std::{
@@ -73,7 +71,9 @@ impl WriteFile<Bytes> for HttpFile {
             let host = uri.host().ok_or_else(|| io::Error::other("missing host"))?;
             let host = host.trim_start_matches('[').trim_end_matches(']');
             let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-            let authority = uri.authority().ok_or_else(|| io::Error::other("missing authority"))?;
+            let authority = uri
+                .authority()
+                .ok_or_else(|| io::Error::other("missing authority"))?;
             if authority.as_str().contains('@') {
                 return Err(io::Error::other("credentials in URLs are not supported"));
             }
@@ -93,16 +93,27 @@ impl WriteFile<Bytes> for HttpFile {
             println!("PUT {uri} (reused connection: {reused})");
 
             let path = uri.path_and_query().map_or("/", |path| path.as_str());
-            let mut request = RequestHeader::build("PUT", path.as_bytes(), Some(3))
+            let mut request =
+                RequestHeader::build("PUT", path.as_bytes(), Some(3)).map_err(io::Error::other)?;
+            request
+                .insert_header("Host", authority.as_str())
                 .map_err(io::Error::other)?;
-            request.insert_header("Host", authority.as_str()).map_err(io::Error::other)?;
-            request.insert_header("Content-Type", "application/octet-stream")
+            request
+                .insert_header("Content-Type", "application/octet-stream")
                 .map_err(io::Error::other)?;
-            request.insert_header("Transfer-Encoding", "chunked")
+            request
+                .insert_header("Transfer-Encoding", "chunked")
                 .map_err(io::Error::other)?;
-            session.write_request_header(Box::new(request)).await.map_err(io::Error::other)?;
+            session
+                .write_request_header(Box::new(request))
+                .await
+                .map_err(io::Error::other)?;
 
-            Ok(HttpWriter { connector, peer, state: State::Idle(session) })
+            Ok(HttpWriter {
+                connector,
+                peer,
+                state: State::Idle(session),
+            })
         })
     }
 }
@@ -124,7 +135,10 @@ impl FrameWriter<Bytes> for HttpWriter {
             // One shared Bytes handle per frame. Never capture the borrowed &Bytes.
             let bytes = frame.clone();
             this.state = State::Writing(operation(async move {
-                session.write_request_body(bytes, false).await.map_err(io::Error::other)?;
+                session
+                    .write_request_body(bytes, false)
+                    .await
+                    .map_err(io::Error::other)?;
                 Ok(session)
             }));
         }
@@ -155,12 +169,20 @@ impl FrameWriter<Bytes> for HttpWriter {
             let connector = this.connector.clone();
             let peer = this.peer.clone();
             this.state = State::Finalizing(operation(async move {
-                session.finish_request_body().await.map_err(io::Error::other)?;
+                session
+                    .finish_request_body()
+                    .await
+                    .map_err(io::Error::other)?;
                 let status = loop {
-                    session.read_response_header().await.map_err(io::Error::other)?;
-                    let status = session.response_header()
+                    session
+                        .read_response_header()
+                        .await
+                        .map_err(io::Error::other)?;
+                    let status = session
+                        .response_header()
                         .ok_or_else(|| io::Error::other("missing response headers"))?
-                        .status.as_u16();
+                        .status
+                        .as_u16();
                     if status == 101 {
                         return Err(io::Error::other("unexpected protocol upgrade"));
                     }
@@ -169,9 +191,16 @@ impl FrameWriter<Bytes> for HttpWriter {
                     }
                 };
                 // Drain the response before returning the connection to the pool.
-                while session.read_response_body().await.map_err(io::Error::other)?.is_some() {}
+                while session
+                    .read_response_body()
+                    .await
+                    .map_err(io::Error::other)?
+                    .is_some()
+                {}
                 // Pingora checks framing and keep-alive eligibility before reuse.
-                connector.release_http_session(session, &peer, Some(TIMEOUT)).await;
+                connector
+                    .release_http_session(session, &peer, Some(TIMEOUT))
+                    .await;
                 if !(200..300).contains(&status) {
                     return Err(io::Error::other(format!("upload returned HTTP {status}")));
                 }
@@ -193,26 +222,42 @@ impl FrameWriter<Bytes> for HttpWriter {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let urls = std::env::args().skip(1)
+    let urls = std::env::args()
+        .skip(1)
         .map(|url| url.parse::<Uri>())
         .collect::<Result<Vec<_>, _>>()?;
     if urls.is_empty() {
         return Err(io::Error::other("usage: pingora_upload <PUT URL> [PUT URL ...]").into());
     }
     let connector = Arc::new(Connector::new(None));
-    let files = stream::iter((0..2).flat_map(|_| urls.iter().cloned()).map(|uri| HttpFile {
-        connector: connector.clone(),
-        uri,
+    let files = stream::iter(
+        (0..2)
+            .flat_map(|_| urls.iter().cloned())
+            .map(|uri| HttpFile {
+                connector: connector.clone(),
+                uri,
+            }),
+    );
+    let input = stream::iter((0..2 * urls.len()).flat_map(|_| {
+        [
+            Bytes::from_static(b"hello"),
+            Bytes::from_static(b" "),
+            Bytes::from_static(b"world\n"),
+        ]
     }));
-    let input = stream::iter((0..2 * urls.len()).flat_map(|_| [
-        Bytes::from_static(b"hello"),
-        Bytes::from_static(b" "),
-        Bytes::from_static(b"world\n"),
-    ]));
     // One active upload makes sequential connection reuse visible. Increase this
     // limit to upload concurrently; all writers still share the same pool.
     let config = SchedulerConfig::new(Window::new(16, 16, 1)?, 0);
-    let mut uploads = WriteScheduler::new(input, files, FrameBudget::new(16), config);
+    let mut scheduler_input_1 = input;
+    let mut scheduler_files_1 = files;
+    let scheduler_budget_1 = FrameBudget::new(16);
+    let mut scheduler_config_1 = config;
+    let mut uploads = WriteScheduler::new(
+        &mut scheduler_input_1,
+        &mut scheduler_files_1,
+        &scheduler_budget_1,
+        &mut scheduler_config_1,
+    );
     while let Some(result) = uploads.next().await {
         println!("upload completed: HTTP {}", result?);
     }

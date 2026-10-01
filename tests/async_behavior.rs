@@ -15,10 +15,13 @@ fn no_busy_loop_when_all_sources_pending() {
     a.opening.close();
     let b = Read::new(2..4);
     b.opening.close();
+    let mut scheduler_files_1 = stream::iter([a.clone(), b.clone()]);
+    let scheduler_budget_1 = FrameBudget::new(4);
+    let mut scheduler_config_1 = config(4, 100, 10, 0);
     let mut s = ReadScheduler::new(
-        stream::iter([a.clone(), b.clone()]),
-        FrameBudget::new(4),
-        config(4, 100, 10, 0),
+        &mut scheduler_files_1,
+        &scheduler_budget_1,
+        &mut scheduler_config_1,
     );
     let (counter, w) = context_waker();
     let mut cx = Context::from_waker(&w);
@@ -40,10 +43,13 @@ fn only_woken_slot_is_polled_among_ten_thousand_pending_opens() {
             f
         })
         .collect();
+    let mut scheduler_files_2 = stream::iter(files.clone());
+    let scheduler_budget_2 = FrameBudget::new(32);
+    let mut scheduler_config_2 = config(32, 20_000, 10_000, 0);
     let mut s = ReadScheduler::new(
-        stream::iter(files.clone()),
-        FrameBudget::new(32),
-        config(32, 20_000, 10_000, 0),
+        &mut scheduler_files_2,
+        &scheduler_budget_2,
+        &mut scheduler_config_2,
     );
     for _ in 0..200 {
         assert!(poll(&mut s).is_pending());
@@ -59,10 +65,13 @@ fn only_woken_slot_is_polled_among_ten_thousand_pending_opens() {
 fn ready_source_does_not_starve_other_sources() {
     let a = Read::new(0..10_000);
     let b = Read::new(10_000..10_002);
+    let mut scheduler_files_3 = stream::iter([a, b.clone()]);
+    let scheduler_budget_3 = FrameBudget::new(10_002);
+    let mut scheduler_config_3 = config(10_002, 20_000, 2, 0);
     let mut s = ReadScheduler::new(
-        stream::iter([a, b.clone()]),
-        FrameBudget::new(10_002),
-        config(10_002, 20_000, 2, 0),
+        &mut scheduler_files_3,
+        &scheduler_budget_3,
+        &mut scheduler_config_3,
     );
     assert!(poll(&mut s).is_ready());
     assert_eq!(b.reading.polls(), 3);
@@ -72,11 +81,15 @@ fn work_budget_yields_to_executor() {
     let f = Write::new(10_000);
     f.finalizing.close();
     let (input, drops) = frames(10_000);
+    let mut scheduler_input_4 = input;
+    let mut scheduler_files_4 = stream::iter([f]);
+    let scheduler_budget_4 = FrameBudget::new(32);
+    let mut scheduler_config_4 = config(32, 10_000, 1, 0);
     let mut s = WriteScheduler::new(
-        input,
-        stream::iter([f]),
-        FrameBudget::new(32),
-        config(32, 10_000, 1, 0),
+        &mut scheduler_input_4,
+        &mut scheduler_files_4,
+        &scheduler_budget_4,
+        &mut scheduler_config_4,
     );
     let (count, w) = context_waker();
     assert!(
@@ -101,11 +114,15 @@ fn write_opens_when_pending_input_wakes_with_first_frame() {
             }
         });
         let f = Write::new(4);
+        let mut scheduler_input_5 = input;
+        let mut scheduler_files_5 = stream::iter([f.clone()]);
+        let scheduler_budget_5 = FrameBudget::new(4);
+        let mut scheduler_config_5 = config(4, 10, 1, retry);
         let mut s = WriteScheduler::new(
-            input,
-            stream::iter([f.clone()]),
-            FrameBudget::new(4),
-            config(4, 10, 1, retry),
+            &mut scheduler_input_5,
+            &mut scheduler_files_5,
+            &scheduler_budget_5,
+            &mut scheduler_config_5,
         );
         let (wakes, waker) = context_waker();
         let mut cx = Context::from_waker(&waker);
@@ -127,10 +144,13 @@ fn blocked_consumer_does_not_prevent_allowed_readers_from_filling_window() {
     let a = Read::new(0..4);
     a.reading.close();
     let b = Read::new(4..8);
+    let mut scheduler_files_6 = stream::iter([a, b.clone()]);
+    let scheduler_budget_6 = FrameBudget::new(8);
+    let mut scheduler_config_6 = config(8, 100, 2, 0);
     let mut s = ReadScheduler::new(
-        stream::iter([a, b.clone()]),
-        FrameBudget::new(8),
-        config(8, 100, 2, 0),
+        &mut scheduler_files_6,
+        &scheduler_budget_6,
+        &mut scheduler_config_6,
     );
     assert!(poll(&mut s).is_pending());
     assert_eq!(b.reading.polls(), 5);
@@ -140,11 +160,15 @@ fn blocked_writer_does_not_prevent_input_buffering_until_capacity() {
     let f = Write::new(100);
     f.writing.close();
     let (input, _) = frames(100);
+    let mut scheduler_input_7 = input;
+    let mut scheduler_files_7 = stream::iter([f.clone()]);
+    let scheduler_budget_7 = FrameBudget::new(100);
+    let mut scheduler_config_7 = config(4, 100, 1, 0);
     let mut s = WriteScheduler::new(
-        input,
-        stream::iter([f.clone()]),
-        FrameBudget::new(100),
-        config(4, 100, 1, 0),
+        &mut scheduler_input_7,
+        &mut scheduler_files_7,
+        &scheduler_budget_7,
+        &mut scheduler_config_7,
     );
     assert!(poll(&mut s).is_pending());
     assert_eq!(s.retained_frames(), 4);
@@ -191,10 +215,14 @@ fn eof_probe_waits_for_its_own_waker() {
         }
     }
     let gate = Gate::new(false);
+    let mut scheduler_files_8 =
+        std::pin::pin!(stream::iter([File(gate.clone()), File(Gate::new(true))]));
+    let scheduler_budget_8 = FrameBudget::new(2);
+    let mut scheduler_config_8 = config(2, 10, 2, 0);
     let mut s = ReadScheduler::new(
-        stream::iter([File(gate.clone()), File(Gate::new(true))]),
-        FrameBudget::new(2),
-        config(2, 10, 2, 0),
+        &mut scheduler_files_8,
+        &scheduler_budget_8,
+        &mut scheduler_config_8,
     );
     assert_eq!(poll(&mut s), Poll::Ready(Some(Ok(0))));
     assert!(poll(&mut s).is_pending());
@@ -212,11 +240,15 @@ fn pending_input_is_not_repolled_when_writers_progress() {
         Poll::<Option<Frame>>::Pending
     });
     let f = Write::new(4);
+    let mut scheduler_input_9 = input.chain(pending);
+    let mut scheduler_files_9 = stream::iter([f]);
+    let scheduler_budget_9 = FrameBudget::new(4);
+    let mut scheduler_config_9 = config(4, 10, 1, 1);
     let mut s = WriteScheduler::new(
-        input.chain(pending),
-        stream::iter([f]),
-        FrameBudget::new(4),
-        config(4, 10, 1, 1),
+        &mut scheduler_input_9,
+        &mut scheduler_files_9,
+        &scheduler_budget_9,
+        &mut scheduler_config_9,
     );
     assert!(poll(&mut s).is_pending());
     for _ in 0..5 {

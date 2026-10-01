@@ -104,11 +104,10 @@ async fn consume<T>(value: T) -> T {
 fn main() {
     block_on(async {
         let budget = FrameBudget::new(512);
-        let mut reader = ReadScheduler::new(
-            stream::iter([Source(0..3), Source(3..6)]),
-            budget.clone(),
-            SchedulerConfig::default(),
-        );
+        let mut scheduler_files_1 = stream::iter([Source(0..3), Source(3..6)]);
+        let mut scheduler_config_1 = SchedulerConfig::default();
+        let mut reader =
+            ReadScheduler::new(&mut scheduler_files_1, &budget, &mut scheduler_config_1);
         let mut frames = Vec::new();
         while let Some(frame) = reader.next().await {
             // Awaiting consume() alone would suspend prefetching.
@@ -119,11 +118,14 @@ fn main() {
             frames.push(value);
         }
         assert_eq!(frames, [0, 1, 2, 3, 4, 5]);
+        let mut scheduler_input_2 = stream::iter(frames);
+        let mut scheduler_files_2 = stream::iter([Destination(2), Destination(4)]);
+        let mut scheduler_config_2 = SchedulerConfig::default().with_max_retries(2);
         let mut writer = WriteScheduler::new(
-            stream::iter(frames),
-            stream::iter([Destination(2), Destination(4)]),
-            budget,
-            SchedulerConfig::default().with_max_retries(2),
+            &mut scheduler_input_2,
+            &mut scheduler_files_2,
+            &budget,
+            &mut scheduler_config_2,
         );
         let mut sums = Vec::new();
         while let Some(result) = writer.next().await {
