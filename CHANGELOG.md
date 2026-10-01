@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
-- Borrow `Unpin` input and file streams via mutable references, the shared frame budget, and mutable scheduler configuration. Constructors and `FramePermit` now carry a borrow lifetime.
+- Breaking API change: borrow `Unpin` input and file streams via mutable references, the shared frame budget, and mutable scheduler configuration. Constructors and `FramePermit` now carry a borrow lifetime.
 - Preserve caller-owned streams at EOF, on failure, and when schedulers are dropped; retain explicit EOF state to avoid repolling exhausted streams.
 - Add `WriteScheduler::input_mut() -> &mut I` to fill a borrowed input between polls and wake the scheduler without shared input state.
 - Make `set_window()` update the borrowed configuration and migrate examples, benchmarks, and tests to the borrowing API.

@@ -27,7 +27,7 @@ available again. `set_window()` updates the caller's configuration.
 
 `WriteScheduler::input_mut()` temporarily exposes `&mut I` and wakes the
 scheduler so the input can be filled before polling resumes. EOF is final.
-The borrowing API is an unreleased breaking change from 0.3.1.
+Version 0.3.2 introduces a borrowing API incompatible with 0.3.1.
 
 See the [detailed guide](docs/guide.md) for more on scheduling, buffering,
 backpressure, and backend integration.
@@ -52,7 +52,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-carbon-io = "0.3.1"
+carbon-io = "0.3.2"
 futures = "0.3" # StreamExt and the executor used in the examples.
 ```
 

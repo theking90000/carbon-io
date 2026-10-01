@@ -1,8 +1,9 @@
 # Examples
 
 Each directory is an independent Cargo crate in this repository. It depends on
-CARBON through `path = "../.."`, and has its own workspace and lockfile. HTTP and
-runtime dependencies therefore stay out of CARBON's development dependencies.
+CARBON 0.3.2 through `version = "0.3.2", path = "../.."`, and has its own
+workspace and lockfile. HTTP and runtime dependencies therefore stay out of
+CARBON's development dependencies.
 Commands below run from the repository root.
 
 | Crate | Demonstrates |
