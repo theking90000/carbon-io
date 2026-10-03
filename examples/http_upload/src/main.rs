@@ -10,8 +10,8 @@
 //! Retries are disabled here. Remote writes cannot be undone by dropping a writer.
 
 use bytes::Bytes;
-use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
-use futures::{Stream, StreamExt, channel::mpsc, stream};
+use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteEvent, WriteFile, WriteScheduler};
+use futures::{Stream, channel::mpsc, stream};
 use reqwest::{Body, Client, StatusCode};
 use std::{
     future::{Future, Ready, ready},
@@ -134,32 +134,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     println!("Client initialized. {} upload(s) to perform.", urls.len());
     let count = urls.len();
-    let files = stream::iter(urls.into_iter().map(|url| HttpFile {
-        client: client.clone(),
-        url,
-        frames: 3,
-    }));
-    // Replace this lazy input with any Stream<Item = Bytes>.
-    let input = stream::iter((0..count).flat_map(|_| {
-        [
-            Bytes::from_static(b"hello"),
-            Bytes::from_static(b" "),
-            Bytes::from_static(b"world\n"),
-        ]
-    }));
+    let mut files = urls
+        .into_iter()
+        .map(|url| HttpFile {
+            client: client.clone(),
+            url,
+            frames: 3,
+        })
+        .peekable();
+    // Frames are produced lazily and stay caller-owned until admission.
+    let mut input = (0..count)
+        .flat_map(|_| {
+            [
+                Bytes::from_static(b"hello"),
+                Bytes::from_static(b" "),
+                Bytes::from_static(b"world\n"),
+            ]
+        })
+        .peekable();
     let config = SchedulerConfig::default().with_max_retries(0);
-    let mut scheduler_input_1 = input;
-    let mut scheduler_files_1 = files;
     let scheduler_budget_1 = FrameBudget::new(16);
     let mut scheduler_config_1 = config;
-    let mut uploads = WriteScheduler::new(
-        &mut scheduler_input_1,
-        &mut scheduler_files_1,
-        &scheduler_budget_1,
-        &mut scheduler_config_1,
-    );
-    while let Some(result) = uploads.next().await {
-        println!("upload completed: {}", result?);
+    let mut uploads = WriteScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
+    while let Some(event) = uploads.next_event().await? {
+        match event {
+            WriteEvent::FileReady => {
+                while files.peek().is_some() && uploads.accept_file() {
+                    uploads.enqueue_file(files.next().unwrap())?;
+                }
+                if files.peek().is_none() {
+                    uploads.close_files()?;
+                }
+            }
+            WriteEvent::FrameReady => {
+                while input.peek().is_some() && uploads.accept_frame() {
+                    uploads.enqueue_frame(input.next().unwrap())?;
+                }
+                if input.peek().is_none() {
+                    uploads.close_frames()?;
+                    uploads.close_files()?;
+                }
+            }
+            WriteEvent::File(result) => println!("upload completed: {result}"),
+        }
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 //! TCP upload -> CARBON -> real files -> CARBON -> TCP download.
 //! Run with `cargo run --manifest-path examples/tcp_to_file/Cargo.toml`; instructions are printed on startup.
 use carbon_io::{
-    FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteFile,
-    WriteScheduler,
+    FrameBudget, FrameWriter, Interest, ReadEvent, ReadFile, ReadScheduler, SchedulerConfig,
+    Window, WriteEvent, WriteFile, WriteScheduler,
 };
 use futures::{Stream, StreamExt, stream};
 use std::{
@@ -162,22 +162,50 @@ async fn upload(socket: TcpStream, directory: &Path) -> io::Result<u64> {
             Some((frame, socket))
         }
     });
-    let destinations = stream::iter((0u64..).map(|index| Segment {
-        path: directory.join(format!("{index:020}.bin")),
-        frames: FRAMES_PER_FILE,
-    }));
-    let mut scheduler_input_1 = std::pin::pin!(input);
-    let mut scheduler_files_1 = destinations;
+    let mut input = std::pin::pin!(input);
     let scheduler_budget_1 = FrameBudget::new(PIPELINE_FRAMES);
     let mut scheduler_config_1 = config();
-    let mut writer = WriteScheduler::new(
-        &mut scheduler_input_1,
-        &mut scheduler_files_1,
-        &scheduler_budget_1,
-        &mut scheduler_config_1,
-    );
-    while let Some(result) = writer.next().await {
-        println!("Written {}", result.map_err(io::Error::other)?.display());
+    let mut writer = WriteScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
+    let mut next_file = 0u64;
+    let mut next_frame = None;
+    let mut input_closed = false;
+    loop {
+        // Keep driving file I/O while TCP has no frame ready to inject.
+        let interest = if next_frame.is_some() {
+            Interest::ALL
+        } else {
+            Interest::FILES | Interest::RESULTS
+        };
+        tokio::select! {
+            frame = input.next(), if next_frame.is_none() && !input_closed => {
+                next_frame = frame;
+                if next_frame.is_none() {
+                    input_closed = true;
+                    writer.close_frames().map_err(io::Error::other)?;
+                    writer.close_files().map_err(io::Error::other)?;
+                }
+            }
+            event = writer.next_event_with_interest(interest) => {
+                match event.map_err(io::Error::other)? {
+                    Some(WriteEvent::FileReady) => {
+                        while writer.accept_file() {
+                            writer.enqueue_file(Segment {
+                                path: directory.join(format!("{next_file:020}.bin")),
+                                frames: FRAMES_PER_FILE,
+                            }).map_err(io::Error::other)?;
+                            next_file += 1;
+                        }
+                    }
+                    Some(WriteEvent::FrameReady) => {
+                        if let Some(frame) = next_frame.take() {
+                            writer.enqueue_frame(frame).map_err(io::Error::other)?;
+                        }
+                    }
+                    Some(WriteEvent::File(path)) => println!("Written {}", path.display()),
+                    None => break,
+                }
+            }
+        }
     }
     drop(writer);
     if let Some(error) = failure.borrow_mut().take() {
@@ -222,41 +250,32 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
         ));
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut files = files.into_iter();
+    let mut files = files.into_iter().peekable();
     let scheduler_budget_2 = FrameBudget::new(PIPELINE_FRAMES);
     let mut scheduler_config_2 = config();
     let mut reader = ReadScheduler::new(&scheduler_budget_2, &mut scheduler_config_2);
-    let mut closed = false;
     let mut remaining = total;
-    while let Some(frame) = std::future::poll_fn(|cx| {
-        while !closed {
-            match Pin::new(&mut reader).poll_file_ready(cx) {
-                Poll::Pending => break,
-                Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
-                Poll::Ready(Ok(())) => match files.next() {
-                    Some(file) => {
-                        if let Err(error) = Pin::new(&mut reader).enqueue_file(file) {
-                            return Poll::Ready(Some(Err(error)));
-                        }
-                    }
-                    None => {
-                        closed = true;
-                        if let Err(error) = Pin::new(&mut reader).close_files() {
-                            return Poll::Ready(Some(Err(error)));
-                        }
-                    }
-                },
+    while let Some(event) = reader.next_event().await.map_err(io::Error::other)? {
+        match event {
+            ReadEvent::FileReady => {
+                while files.peek().is_some() && reader.accept_file() {
+                    reader
+                        .enqueue_file(files.next().unwrap())
+                        .map_err(io::Error::other)?;
+                }
+                if files.peek().is_none() {
+                    reader.close_files().map_err(io::Error::other)?;
+                }
+            }
+            ReadEvent::Frame(frame) => {
+                let length = remaining.min(BLOCK as u64) as usize;
+                tokio::select! {
+                    result = socket.write_all(&frame[..length]) => result?,
+                    _ = reader.progress() => unreachable!("progress never completes"),
+                }
+                remaining -= length as u64;
             }
         }
-        Pin::new(&mut reader).poll_next(cx)
-    }).await {
-        let frame = frame.map_err(io::Error::other)?;
-        let length = remaining.min(BLOCK as u64) as usize;
-        tokio::select! {
-            result = socket.write_all(&frame[..length]) => result?,
-            _ = reader.progress() => unreachable!("progress never completes"),
-        }
-        remaining -= length as u64;
     }
     socket.shutdown().await?;
     Ok(total)

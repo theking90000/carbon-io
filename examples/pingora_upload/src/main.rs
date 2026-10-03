@@ -4,8 +4,9 @@
 //! The endpoint must accept chunked uploads and read the body before responding.
 
 use bytes::Bytes;
-use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, Window, WriteFile, WriteScheduler};
-use futures::{StreamExt, stream};
+use carbon_io::{
+    FrameBudget, FrameWriter, SchedulerConfig, Window, WriteEvent, WriteFile, WriteScheduler,
+};
 use http::Uri;
 use pingora_core::{
     connectors::http::Connector, protocols::http::client::HttpSession, upstreams::peer::HttpPeer,
@@ -230,36 +231,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::other("usage: pingora_upload <PUT URL> [PUT URL ...]").into());
     }
     let connector = Arc::new(Connector::new(None));
-    let files = stream::iter(
-        (0..2)
-            .flat_map(|_| urls.iter().cloned())
-            .map(|uri| HttpFile {
-                connector: connector.clone(),
-                uri,
-            }),
-    );
-    let input = stream::iter((0..2 * urls.len()).flat_map(|_| {
-        [
-            Bytes::from_static(b"hello"),
-            Bytes::from_static(b" "),
-            Bytes::from_static(b"world\n"),
-        ]
-    }));
+    let mut files = (0..2)
+        .flat_map(|_| urls.iter().cloned())
+        .map(|uri| HttpFile {
+            connector: connector.clone(),
+            uri,
+        })
+        .peekable();
+    let mut input = (0..2 * urls.len())
+        .flat_map(|_| {
+            [
+                Bytes::from_static(b"hello"),
+                Bytes::from_static(b" "),
+                Bytes::from_static(b"world\n"),
+            ]
+        })
+        .peekable();
     // One active upload makes sequential connection reuse visible. Increase this
     // limit to upload concurrently; all writers still share the same pool.
     let config = SchedulerConfig::new(Window::new(16, 16, 1)?, 0);
-    let mut scheduler_input_1 = input;
-    let mut scheduler_files_1 = files;
     let scheduler_budget_1 = FrameBudget::new(16);
     let mut scheduler_config_1 = config;
-    let mut uploads = WriteScheduler::new(
-        &mut scheduler_input_1,
-        &mut scheduler_files_1,
-        &scheduler_budget_1,
-        &mut scheduler_config_1,
-    );
-    while let Some(result) = uploads.next().await {
-        println!("upload completed: HTTP {}", result?);
+    let mut uploads = WriteScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
+    while let Some(event) = uploads.next_event().await? {
+        match event {
+            WriteEvent::FileReady => {
+                while files.peek().is_some() && uploads.accept_file() {
+                    uploads.enqueue_file(files.next().unwrap())?;
+                }
+                if files.peek().is_none() {
+                    uploads.close_files()?;
+                }
+            }
+            WriteEvent::FrameReady => {
+                while input.peek().is_some() && uploads.accept_frame() {
+                    uploads.enqueue_frame(input.next().unwrap())?;
+                }
+                if input.peek().is_none() {
+                    uploads.close_frames()?;
+                    uploads.close_files()?;
+                }
+            }
+            WriteEvent::File(result) => println!("upload completed: HTTP {result}"),
+        }
     }
     Ok(())
 }
