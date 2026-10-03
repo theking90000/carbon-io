@@ -1,6 +1,6 @@
 //! Shared capacity, reservation, wakeup, and cancellation regressions.
 mod support;
-use carbon_io::{FrameBudget};
+use carbon_io::FrameBudget;
 use futures::Stream;
 use futures::stream;
 use std::{

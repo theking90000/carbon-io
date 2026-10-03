@@ -592,11 +592,22 @@ where
     error: Option<carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>>,
 }
 impl<T, S> Unpin for ReadDriver<'_, T, S>
-where S: Stream + Unpin, S::Item: ReadFile<T> {}
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
+}
 
 impl<'a, T, S> ReadDriver<'a, T, S>
-where S: Stream + Unpin, S::Item: ReadFile<T> {
-    pub fn new(files: &'a mut S, budget: &'a carbon_io::FrameBudget, config: &'a mut SchedulerConfig) -> Self {
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
+    pub fn new(
+        files: &'a mut S,
+        budget: &'a carbon_io::FrameBudget,
+        config: &'a mut SchedulerConfig,
+    ) -> Self {
         Self {
             scheduler: carbon_io::ReadScheduler::new(budget, config),
             files,
@@ -606,13 +617,19 @@ where S: Stream + Unpin, S::Item: ReadFile<T> {
             error: None,
         }
     }
-    fn feed(&mut self, cx: &mut Context<'_>) -> Result<(), carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>> {
+    fn feed(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>> {
         self.source_wake.register(cx);
         for turn in 0..64 {
             if self.closed || !self.source_wake.ready.load(Ordering::Acquire) {
                 break;
             }
-            if Pin::new(&mut self.scheduler).poll_file_ready(cx)?.is_pending() {
+            if Pin::new(&mut self.scheduler)
+                .poll_file_ready(cx)?
+                .is_pending()
+            {
                 break;
             }
             self.source_wake.ready.store(false, Ordering::Release);
@@ -649,20 +666,34 @@ where S: Stream + Unpin, S::Item: ReadFile<T> {
         std::future::poll_fn(|cx| {
             self.poll_progress(cx);
             Poll::<()>::Pending
-        }).await
+        })
+        .await
     }
 }
 impl<'a, T, S> std::ops::Deref for ReadDriver<'a, T, S>
-where S: Stream + Unpin, S::Item: ReadFile<T> {
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
     type Target = carbon_io::ReadScheduler<'a, T, S::Item>;
-    fn deref(&self) -> &Self::Target { &self.scheduler }
+    fn deref(&self) -> &Self::Target {
+        &self.scheduler
+    }
 }
 impl<T, S> std::ops::DerefMut for ReadDriver<'_, T, S>
-where S: Stream + Unpin, S::Item: ReadFile<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.scheduler }
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scheduler
+    }
 }
 impl<T, S> Stream for ReadDriver<'_, T, S>
-where S: Stream + Unpin, S::Item: ReadFile<T> {
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
     type Item = Result<T, carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -674,7 +705,10 @@ where S: Stream + Unpin, S::Item: ReadFile<T> {
     }
 }
 impl<T, S> futures::stream::FusedStream for ReadDriver<'_, T, S>
-where S: Stream + Unpin, S::Item: ReadFile<T> {
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
     fn is_terminated(&self) -> bool {
         self.error.is_none() && self.scheduler.is_terminated()
     }
@@ -683,9 +717,14 @@ where S: Stream + Unpin, S::Item: ReadFile<T> {
 pub fn admit_read_file<T, F: ReadFile<T>>(
     scheduler: &mut carbon_io::ReadScheduler<'_, T, F>,
     file: F,
-) where F::Error: std::fmt::Debug {
+) where
+    F::Error: std::fmt::Debug,
+{
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(Pin::new(&mut *scheduler).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+    assert!(matches!(
+        Pin::new(&mut *scheduler).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
     Pin::new(scheduler).start_file(file).unwrap();
 }

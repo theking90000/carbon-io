@@ -244,11 +244,8 @@ fn progress_handles_initial_errors_and_empty_streams() {
         let budget = FrameBudget::new(capacity);
         let mut scheduler_files_7 = stream::empty::<Read>();
         let mut scheduler_config_7 = config(1, 1, 1, 0);
-        let mut reader = ReadDriver::<usize, _>::new(
-            &mut scheduler_files_7,
-            &budget,
-            &mut scheduler_config_7,
-        );
+        let mut reader =
+            ReadDriver::<usize, _>::new(&mut scheduler_files_7, &budget, &mut scheduler_config_7);
         let mut scheduler_input_8 = stream::empty::<Frame>();
         let mut scheduler_files_8 = stream::empty::<Write>();
         let mut scheduler_config_8 = config(1, 1, 1, 0);

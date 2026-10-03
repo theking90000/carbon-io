@@ -3,7 +3,13 @@ mod support;
 
 use carbon_io::{ContractError as C, FrameBudget, ReadFile, ReadScheduler, SchedulerError as E};
 use futures::{stream, stream::FusedStream};
-use std::{convert::Infallible, future::{Ready, ready}, marker::PhantomPinned, pin::Pin, task::{Context, Poll}};
+use std::{
+    convert::Infallible,
+    future::{Ready, ready},
+    marker::PhantomPinned,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use support::*;
 
 #[test]
@@ -30,10 +36,16 @@ fn granted_file_survives_progress_and_window_shrink() {
     admit_read_file(&mut reader, first.clone());
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert_eq!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(
+        Pin::new(&mut reader).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    );
     reader.set_window(config(1, 1, 1, 0).window).unwrap();
     reader.poll_progress(&mut cx);
-    assert_eq!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(
+        Pin::new(&mut reader).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    );
     let second = Read::new(4..6);
     Pin::new(&mut reader).start_file(second.clone()).unwrap();
     assert_eq!(second.opens.get(), 1);
@@ -84,7 +96,10 @@ fn rejected_admissions_return_errors_without_opening_the_file() {
     let mut cfg = config(2, 4, 2, 0);
     let mut reader = ReadScheduler::new(&budget, &mut cfg);
     let file = Read::new([0]);
-    assert_eq!(Pin::new(&mut reader).start_file(file.clone()), Err(E::Contract(C::AdmissionNotReady)));
+    assert_eq!(
+        Pin::new(&mut reader).start_file(file.clone()),
+        Err(E::Contract(C::AdmissionNotReady))
+    );
     assert_eq!(file.opens.get(), 0);
     assert_eq!(poll(&mut reader), Poll::Ready(None));
     assert_eq!(budget.available_capacity(), 2);
@@ -93,11 +108,20 @@ fn rejected_admissions_return_errors_without_opening_the_file() {
     let mut reader = ReadScheduler::new(&budget, &mut cfg);
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert_eq!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(
+        Pin::new(&mut reader).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    );
     Pin::new(&mut reader).close_files().unwrap();
-    assert_eq!(Pin::new(&mut reader).start_file(file.clone()), Err(E::Contract(C::InputClosed)));
+    assert_eq!(
+        Pin::new(&mut reader).start_file(file.clone()),
+        Err(E::Contract(C::InputClosed))
+    );
     assert_eq!(file.opens.get(), 0);
-    assert_eq!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Err(E::Contract(C::InputClosed))));
+    assert_eq!(
+        Pin::new(&mut reader).poll_file_ready(&mut cx),
+        Poll::Ready(Err(E::Contract(C::InputClosed)))
+    );
 }
 
 #[test]
@@ -111,11 +135,17 @@ fn backend_error_invalidates_grant_and_is_delivered_once() {
     admit_read_file(&mut reader, first.clone());
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert_eq!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Ok(())));
+    assert_eq!(
+        Pin::new(&mut reader).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    );
     first.reading.open();
     reader.poll_progress(&mut cx);
     let second = Read::new([1]);
-    assert_eq!(Pin::new(&mut reader).start_file(second.clone()), Err(E::Backend("read")));
+    assert_eq!(
+        Pin::new(&mut reader).start_file(second.clone()),
+        Err(E::Backend("read"))
+    );
     assert_eq!(second.opens.get(), 0);
     assert_eq!(first.drops.get(), 1);
     assert_eq!(budget.available_capacity(), 2);
@@ -129,8 +159,12 @@ impl ReadFile<usize> for OwnedFile {
     type Open = <Read as ReadFile<usize>>::Open;
     type Reader = <Read as ReadFile<usize>>::Reader;
 
-    fn frame_count(&self) -> u32 { self.0.frame_count() }
-    fn open(&self) -> Self::Open { self.0.open() }
+    fn frame_count(&self) -> u32 {
+        self.0.frame_count()
+    }
+    fn open(&self) -> Self::Open {
+        self.0.open()
+    }
 }
 
 #[test]
@@ -160,9 +194,14 @@ impl ReadFile<OwnedFrame> for FrameSource {
     type Reader = stream::Iter<std::vec::IntoIter<Result<OwnedFrame, Infallible>>>;
     type Open = Ready<Result<Self::Reader, Infallible>>;
 
-    fn frame_count(&self) -> u32 { 2 }
+    fn frame_count(&self) -> u32 {
+        2
+    }
     fn open(&self) -> Self::Open {
-        ready(Ok(stream::iter(vec![Ok(OwnedFrame(0, PhantomPinned)), Ok(OwnedFrame(1, PhantomPinned))])))
+        ready(Ok(stream::iter(vec![
+            Ok(OwnedFrame(0, PhantomPinned)),
+            Ok(OwnedFrame(1, PhantomPinned)),
+        ])))
     }
 }
 
@@ -173,6 +212,9 @@ fn output_frames_need_neither_clone_nor_unpin() {
     let mut reader = ReadScheduler::new(&budget, &mut cfg);
     admit_read_file(&mut reader, FrameSource);
     Pin::new(&mut reader).close_files().unwrap();
-    let values: Vec<_> = collect(reader).into_iter().map(|frame| frame.unwrap().0).collect();
+    let values: Vec<_> = collect(reader)
+        .into_iter()
+        .map(|frame| frame.unwrap().0)
+        .collect();
     assert_eq!(values, [0, 1]);
 }

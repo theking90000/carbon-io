@@ -269,7 +269,10 @@ fn shared_case(n: usize) {
             .zip(&mut configs)
             .map(|(file, config)| {
                 let mut reader = ReadScheduler::new(&budget, config);
-                assert!(matches!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+                assert!(matches!(
+                    Pin::new(&mut reader).poll_file_ready(&mut cx),
+                    Poll::Ready(Ok(()))
+                ));
                 Pin::new(&mut reader).start_file(file).unwrap();
                 Pin::new(&mut reader).close_files().unwrap();
                 reader
@@ -319,7 +322,9 @@ fn read_consumer_case(name: &str, count: u32, drive: bool) {
             let scheduler_budget_3 = FrameBudget::new(64);
             let mut scheduler_config_3 = config(64, 1, 0);
             let mut reader = ReadScheduler::new(&scheduler_budget_3, &mut scheduler_config_3);
-            std::future::poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx)).await.unwrap();
+            std::future::poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx))
+                .await
+                .unwrap();
             Pin::new(&mut reader).start_file(file).unwrap();
             Pin::new(&mut reader).close_files().unwrap();
             let mut sum = 0;

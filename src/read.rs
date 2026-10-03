@@ -374,7 +374,9 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
                     let Some(file) = slot.file.as_ref() else {
                         return Err(ContractError::UnexpectedEof.into());
                     };
-                    slot.io.set(ReadIo::Opening { future: file.open() });
+                    slot.io.set(ReadIo::Opening {
+                        future: file.open(),
+                    });
                     self.ready.schedule(id + FIRST_SLOT);
                 }
             },
@@ -462,7 +464,11 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         if self.terminated {
             return;
         }
-        if self.waker.as_ref().is_none_or(|old| !old.will_wake(cx.waker())) {
+        if self
+            .waker
+            .as_ref()
+            .is_none_or(|old| !old.will_wake(cx.waker()))
+        {
             self.waker = Some(cx.waker().clone());
         }
         if self.error.is_some() {
@@ -502,10 +508,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
 
     // Keep wakeups out of poll_next's ready-output path.
     #[inline]
-    fn poll_work(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Result<(), SchedulerError<F::Error>> {
+    fn poll_work(&mut self, cx: &mut Context<'_>) -> Result<(), SchedulerError<F::Error>> {
         self.ready.register(cx.waker());
         for _ in 0..MAX_POLL_OPS {
             let Some(id) = self.ready.pop() else { break };

@@ -1,6 +1,6 @@
 //! Waker routing, bounded work, backpressure, and non-starvation tests.
 mod support;
-use carbon_io::{FrameBudget};
+use carbon_io::FrameBudget;
 use futures::{Stream, StreamExt, stream};
 use std::{
     pin::Pin,
