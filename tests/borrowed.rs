@@ -199,7 +199,8 @@ fn read_cancellation_preserves_remaining_files_and_updates_the_callers_config() 
     let budget = FrameBudget::new(1);
     let mut cfg = config(1, 1, 1, 0);
     let new_window = config(1, 2, 1, 0).window;
-    let mut scheduler = ReadScheduler::new(&mut files, &budget, &mut cfg);
+    let mut scheduler = ReadScheduler::new(&budget, &mut cfg);
+    admit_read_file(&mut scheduler, block_on(files.as_mut().next()).unwrap());
     assert!(poll(&mut scheduler).is_pending());
     scheduler.set_window(new_window).unwrap();
     drop(scheduler);
@@ -221,8 +222,12 @@ fn read_eof_does_not_drop_or_repoll_the_callers_stream() {
             drops.clone(),
             polls.clone(),
         ));
-        let mut scheduler = ReadScheduler::new(&mut files, &budget, &mut cfg);
+        let mut scheduler = ReadScheduler::new(&budget, &mut cfg);
+        admit_read_file(&mut scheduler, block_on(files.as_mut().next()).unwrap());
+        Pin::new(&mut scheduler).close_files().unwrap();
+        let before = polls.get();
         assert_eq!(collect(&mut scheduler), [Ok(3)]);
+        assert_eq!(polls.get(), before);
         assert_eq!(drops.get(), 0);
         let count = polls.get();
         for _ in 0..3 {
@@ -241,7 +246,9 @@ fn read_failure_preserves_remaining_descriptors() {
     let mut files = pin!(PinnedStream::new(stream::iter([first, Read::new([2])])));
     let budget = FrameBudget::new(1);
     let mut cfg = config(1, 1, 1, 0);
-    let mut scheduler = ReadScheduler::new(&mut files, &budget, &mut cfg);
+    let mut scheduler = ReadScheduler::new(&budget, &mut cfg);
+    admit_read_file(&mut scheduler, block_on(files.as_mut().next()).unwrap());
+    Pin::new(&mut scheduler).close_files().unwrap();
     assert_eq!(
         poll(&mut scheduler),
         Poll::Ready(Some(Err(SchedulerError::Backend("read"))))

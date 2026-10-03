@@ -9,12 +9,11 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
-const FILES: usize = 0;
-const BUDGET: usize = 1;
-const FIRST_SLOT: usize = 2;
+const BUDGET: usize = 0;
+const FIRST_SLOT: usize = 1;
 
 pin_project! {
     #[project = ReadIoProj]
@@ -37,15 +36,19 @@ struct Slot<T, F: ReadFile<T>> {
 
 /// Ordered reading with anticipatory opens and a contiguous shared-budget window.
 ///
-/// Polling drives all work. No background task is created. The input yields files
-/// directly; errors come from each file's opening future and reader.
-/// Borrowed streams must be `Unpin`; a pinned wrapper supports `!Unpin` streams.
-/// Backend futures and readers may be `!Unpin`.
+/// Admit owned file descriptors with `poll_file_ready` followed by `start_file`.
+/// A successful readiness poll reserves one admission until its start call,
+/// explicit closure or terminal failure, including across window changes.
+/// `close_files` ends admission; buffered frames remain available in order.
+/// Polling drives all work. No input stream or background task is retained.
+/// Descriptors and frames need neither `Clone` nor `Unpin`. Backend futures and
+/// readers remain pinned internally. Fatal errors release resources and are
+/// reported once by the next fallible operation or stream poll.
 ///
 /// # Examples
 ///
 /// ```
-/// use std::{convert::Infallible, future::ready, ops::Range};
+/// use std::{convert::Infallible, future::{ready, poll_fn}, ops::Range, pin::Pin};
 /// use futures::{executor::block_on, stream, StreamExt};
 /// use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 ///
@@ -61,29 +64,23 @@ struct Slot<T, F: ReadFile<T>> {
 /// }
 ///
 /// block_on(async {
-///     let mut scheduler_files_1 = stream::iter([MemFile(0..2)]);
-///     let scheduler_budget_1 = FrameBudget::new(16);
-///     let mut scheduler_config_1 = SchedulerConfig::default();
-///     let mut scheduler = ReadScheduler::new(
-///         &mut scheduler_files_1,
-///         &scheduler_budget_1,
-///         &mut scheduler_config_1,
-///     );
+///     let budget = FrameBudget::new(16);
+///     let mut config = SchedulerConfig::default();
+///     let mut scheduler = ReadScheduler::new(&budget, &mut config);
+///     poll_fn(|cx| Pin::new(&mut scheduler).poll_file_ready(cx)).await.unwrap();
+///     Pin::new(&mut scheduler).start_file(MemFile(0..2)).unwrap();
+///     Pin::new(&mut scheduler).close_files().unwrap();
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 0);
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 1);
 ///     assert!(scheduler.next().await.is_none());
 /// });
 /// ```
-pub struct ReadScheduler<'a, T, S>
-where
-    S: Stream + Unpin,
-    S::Item: ReadFile<T>,
-{
-    files: &'a mut S,
-    slots: Vec<Slot<T, S::Item>>,
+pub struct ReadScheduler<'a, T, F: ReadFile<T>> {
+    slots: Vec<Slot<T, F>>,
     order: VecDeque<usize>,
     free: Vec<usize>,
     ready: ReadyQueue,
+    waker: Option<Waker>,
     permit: FramePermit<'a>,
     config: &'a mut SchedulerConfig,
     ring: Vec<Option<T>>,
@@ -93,17 +90,13 @@ where
     authorized: usize,
     allow_cursor: usize,
     active: usize,
-    error: Option<SchedulerError<<S::Item as ReadFile<T>>::Error>>,
-    files_done: bool,
-    files_ready: bool,
+    error: Option<SchedulerError<F::Error>>,
+    files_closed: bool,
+    file_ready: bool,
     terminated: bool,
 }
 
-impl<T, S> fmt::Debug for ReadScheduler<'_, T, S>
-where
-    S: Stream + Unpin,
-    S::Item: ReadFile<T>,
-{
+impl<T, F: ReadFile<T>> fmt::Debug for ReadScheduler<'_, T, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadScheduler")
             .field("window", &self.config.window)
@@ -112,64 +105,23 @@ where
             .field("emitted", &self.emitted)
             .field("discovered", &self.discovered)
             .field("authorized", &self.authorized)
+            .field("files_closed", &self.files_closed)
+            .field("file_ready", &self.file_ready)
             .field("terminated", &self.terminated)
             .finish()
     }
 }
 
-// Borrowed streams are Unpin; backend I/O stays boxed and pinned.
-impl<T, S> Unpin for ReadScheduler<'_, T, S>
-where
-    S: Stream + Unpin,
-    S::Item: ReadFile<T>,
-{
-}
+// Only boxed backend I/O states are structurally pinned. T and F remain movable.
+impl<T, F: ReadFile<T>> Unpin for ReadScheduler<'_, T, F> {}
 
-impl<'a, T, S> ReadScheduler<'a, T, S>
-where
-    S: Stream + Unpin,
-    S::Item: ReadFile<T>,
-{
-    /// Borrow streams, shared budget, and mutable configuration.
-    ///
-    /// Streams must be `Unpin`. For a `!Unpin` stream, borrow a wrapper produced
-    /// by `std::pin::pin!` or `Box::pin`. Pinning for polling stays internal.
-    /// Dropping the scheduler cancels its operations and releases the
-    /// borrows; EOF and errors never destroy the caller's streams. `set_window`
-    /// updates the borrowed configuration.
-    ///
-    /// Build a scheduler. Invalid initial configuration is returned by its stream.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use futures::stream;
-    /// use carbon_io::{FrameBudget, ReadScheduler, SchedulerConfig};
-    /// # use std::{convert::Infallible, future::{ready, Ready}};
-    /// # use carbon_io::ReadFile;
-    /// # struct Dummy;
-    /// # impl ReadFile<u32> for Dummy {
-    /// #     type Error = Infallible;
-    /// #     type Reader = stream::Empty<Result<u32, Infallible>>;
-    /// #     type Open = Ready<Result<Self::Reader, Self::Error>>;
-    /// #     fn frame_count(&self) -> u32 { 1 }
-    /// #     fn open(&self) -> Self::Open { ready(Ok(stream::empty())) }
-    /// # }
-    ///
-    /// let mut scheduler_files_1 = stream::empty::<Dummy>();
-    /// let scheduler_budget_1 = FrameBudget::new(64);
-    /// let mut scheduler_config_1 = SchedulerConfig::default();
-    /// let scheduler = ReadScheduler::new(
-    ///     &mut scheduler_files_1,
-    ///     &scheduler_budget_1,
-    ///     &mut scheduler_config_1,
-    /// );
-    /// ```
-    pub fn new(files: &'a mut S, budget: &'a FrameBudget, config: &'a mut SchedulerConfig) -> Self {
+impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
+    /// Borrow the shared budget and mutable configuration, without input streams.
+    /// Initial configuration errors are reported by the first fallible operation
+    /// or stream poll. `set_window` updates the borrowed configuration.
+    pub fn new(budget: &'a FrameBudget, config: &'a mut SchedulerConfig) -> Self {
         let mut ready = ReadyQueue::new();
         ready.add();
-        ready.add();
-        ready.schedule(FILES);
         ready.schedule(BUDGET);
         let error = config
             .window
@@ -178,11 +130,11 @@ where
             .or_else(|| (budget.total_capacity() == 0).then_some(ContractError::ZeroBudget))
             .map(Into::into);
         Self {
-            files,
             slots: Vec::new(),
             order: VecDeque::new(),
             free: Vec::new(),
             ready,
+            waker: None,
             permit: budget.permit(),
             config,
             ring: Vec::new(),
@@ -193,46 +145,14 @@ where
             allow_cursor: 0,
             active: 0,
             error,
-            files_done: false,
-            files_ready: true,
+            files_closed: false,
+            file_ready: false,
             terminated: false,
         }
     }
-    /// Change the window. Already authorized frames and opened files are retained.
-    /// The caller must poll again to drive the updated configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContractError::InvalidWindow`] if `window.target_frames == 0` or
-    /// `window.max_active_files == 0`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use futures::stream;
-    /// use carbon_io::{FrameBudget, ReadScheduler, SchedulerConfig, Window};
-    /// # use std::{convert::Infallible, future::{ready, Ready}};
-    /// # use carbon_io::ReadFile;
-    /// # struct Dummy;
-    /// # impl ReadFile<u32> for Dummy {
-    /// #     type Error = Infallible;
-    /// #     type Reader = stream::Empty<Result<u32, Infallible>>;
-    /// #     type Open = Ready<Result<Self::Reader, Self::Error>>;
-    /// #     fn frame_count(&self) -> u32 { 1 }
-    /// #     fn open(&self) -> Self::Open { ready(Ok(stream::empty())) }
-    /// # }
-    ///
-    /// let mut scheduler_files_1 = stream::empty::<Dummy>();
-    /// let scheduler_budget_1 = FrameBudget::new(16);
-    /// let mut scheduler_config_1 = SchedulerConfig::default();
-    /// let mut scheduler = ReadScheduler::new(
-    ///     &mut scheduler_files_1,
-    ///     &scheduler_budget_1,
-    ///     &mut scheduler_config_1,
-    /// );
-    /// let new_window = Window::new(64, 256, 8).unwrap();
-    /// assert!(scheduler.set_window(new_window).is_ok());
-    /// ```
+    /// Change the window while preserving authorized frames, opened files and
+    /// outstanding file admission. Returns `InvalidWindow` for zero target frames
+    /// or zero active-file limit. Poll again to drive the updated configuration.
     pub fn set_window(&mut self, window: Window) -> Result<(), ContractError> {
         window.validate()?;
         self.config.window = window;
@@ -244,7 +164,7 @@ where
             ),
         );
         self.ready.schedule(BUDGET);
-        self.schedule_files();
+        self.wake();
         Ok(())
     }
     /// Current window configuration.
@@ -256,10 +176,15 @@ where
         self.permit.capacity()
     }
 
-    fn schedule_files(&mut self) {
-        if self.files_ready && !self.files_done {
-            self.ready.schedule(FILES);
+    fn wake(&self) {
+        if let Some(waker) = &self.waker {
+            waker.wake_by_ref();
         }
+    }
+    fn reject(&mut self, error: ContractError) -> SchedulerError<F::Error> {
+        self.finish();
+        self.wake();
+        error.into()
     }
     fn adjust_capacity(&mut self) {
         let keep = self
@@ -318,32 +243,76 @@ where
             }
         }
     }
-    fn discover(
-        &mut self,
+    /// Drive I/O and reserve one file admission. A file may extend beyond the
+    /// discovery horizon if its beginning is inside it. An existing reservation
+    /// survives progress and subsequent window reductions.
+    /// Returns `InputClosed` after closure or a reported terminal error.
+    pub fn poll_file_ready(
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Result<(), SchedulerError<<S::Item as ReadFile<T>>::Error>> {
-        if self.active >= self.config.window.max_active_files
-            || self.discovered.wrapping_sub(self.emitted) >= self.config.window.horizon()
+    ) -> Poll<Result<(), SchedulerError<F::Error>>> {
+        let this = self.get_mut();
+        this.drive(cx);
+        if let Some(error) = this.error.take() {
+            return Poll::Ready(Err(error));
+        }
+        if this.terminated || this.files_closed {
+            return Poll::Ready(Err(this.reject(ContractError::InputClosed)));
+        }
+        if this.file_ready {
+            return Poll::Ready(Ok(()));
+        }
+        if this.active >= this.config.window.max_active_files
+            || this.discovered.wrapping_sub(this.emitted) >= this.config.window.horizon()
         {
-            return Ok(());
+            return Poll::Pending;
         }
-        if self.files_done {
-            return Ok(());
+        this.file_ready = true;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Transfer ownership of a file after a successful `poll_file_ready`.
+    /// Starts its opening attempt; backend polling stays in the common I/O engine.
+    /// Missing readiness, closed admission and zero frame counts return terminal
+    /// `AdmissionNotReady`, `InputClosed` and `ZeroFrameCount` contract errors.
+    pub fn start_file(self: Pin<&mut Self>, file: F) -> Result<(), SchedulerError<F::Error>> {
+        let this = self.get_mut();
+        if let Some(error) = this.error.take() {
+            this.finish();
+            this.wake();
+            return Err(error);
         }
-        let file = match Pin::new(&mut *self.files).poll_next(cx) {
-            Poll::Pending => {
-                self.files_ready = false;
-                return Ok(());
-            }
-            Poll::Ready(None) => {
-                self.files_done = true;
-                return Ok(());
-            }
-            Poll::Ready(Some(file)) => file,
-        };
+        if this.terminated || this.files_closed {
+            return Err(this.reject(ContractError::InputClosed));
+        }
+        if !this.file_ready {
+            return Err(this.reject(ContractError::AdmissionNotReady));
+        }
+        this.file_ready = false;
+        this.admit(file)
+    }
+
+    /// Close file admission and cancel its outstanding reservation.
+    /// Already accepted files continue reading and their frames remain ordered.
+    /// Closure is idempotent. The output ends after all accepted files are drained
+    /// and their readers have confirmed EOF.
+    pub fn close_files(self: Pin<&mut Self>) -> Result<(), SchedulerError<F::Error>> {
+        let this = self.get_mut();
+        if let Some(error) = this.error.take() {
+            this.finish();
+            this.wake();
+            return Err(error);
+        }
+        this.files_closed = true;
+        this.file_ready = false;
+        this.wake();
+        Ok(())
+    }
+
+    fn admit(&mut self, file: F) -> Result<(), SchedulerError<F::Error>> {
         let count = file.frame_count();
         if count == 0 {
-            return Err(ContractError::ZeroFrameCount.into());
+            return Err(self.reject(ContractError::ZeroFrameCount));
         }
         let opening = ReadIo::Opening {
             future: file.open(),
@@ -369,23 +338,22 @@ where
                 allowed: 0,
                 retries: 0,
             });
-            let signal_id = self.ready.add();
-            debug_assert_eq!(signal_id, id + FIRST_SLOT);
+            self.ready.add();
             id
         };
         self.discovered = self.discovered.wrapping_add(count as usize);
         self.active += 1;
         self.order.push_back(id);
         self.ready.schedule(id + FIRST_SLOT);
-        self.schedule_files();
         self.allow();
+        self.wake();
         Ok(())
     }
     fn poll_slot(
         &mut self,
         id: usize,
         cx: &mut Context<'_>,
-    ) -> Result<(), SchedulerError<<S::Item as ReadFile<T>>::Error>> {
+    ) -> Result<(), SchedulerError<F::Error>> {
         let slot = &mut self.slots[id];
         if slot.file.is_none() {
             return Ok(());
@@ -403,9 +371,10 @@ where
                         return Err(SchedulerError::Backend(error));
                     }
                     slot.retries += 1;
-                    slot.io.set(ReadIo::Opening {
-                        future: slot.file.as_ref().unwrap().open(),
-                    });
+                    let Some(file) = slot.file.as_ref() else {
+                        return Err(ContractError::UnexpectedEof.into());
+                    };
+                    slot.io.set(ReadIo::Opening { future: file.open() });
                     self.ready.schedule(id + FIRST_SLOT);
                 }
             },
@@ -436,7 +405,7 @@ where
                         }
                         slot.io.set(ReadIo::Idle);
                         self.active -= 1;
-                        self.schedule_files();
+                        self.wake();
                     }
                 }
             }
@@ -456,7 +425,7 @@ where
         self.head = (self.head + 1) % self.ring.len();
         self.emitted = self.emitted.wrapping_add(1);
         if self.discovered.wrapping_sub(self.emitted) < self.config.window.horizon() {
-            self.schedule_files();
+            self.wake();
         }
         self.retire();
         self.adjust_capacity();
@@ -475,7 +444,7 @@ where
             self.order.pop_front();
             self.allow_cursor = self.allow_cursor.saturating_sub(1);
             self.free.push(id);
-            self.schedule_files();
+            self.wake();
         }
     }
     /// Advance I/O without consuming any output, processing at most 256 work items.
@@ -486,8 +455,15 @@ where
     /// Fatal errors release resources immediately and remain available to the next
     /// stream poll. Calling this after completion or failure does nothing.
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
+        self.drive(cx);
+    }
+
+    fn drive(&mut self, cx: &mut Context<'_>) {
         if self.terminated {
             return;
+        }
+        if self.waker.as_ref().is_none_or(|old| !old.will_wake(cx.waker())) {
+            self.waker = Some(cx.waker().clone());
         }
         if self.error.is_some() {
             self.finish();
@@ -498,7 +474,7 @@ where
             self.error = Some(error);
             return;
         }
-        if self.files_done && self.order.is_empty() {
+        if self.files_closed && self.order.is_empty() {
             self.finish();
             return;
         }
@@ -529,17 +505,13 @@ where
     fn poll_work(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Result<(), SchedulerError<<S::Item as ReadFile<T>>::Error>> {
+    ) -> Result<(), SchedulerError<F::Error>> {
         self.ready.register(cx.waker());
         for _ in 0..MAX_POLL_OPS {
             let Some(id) = self.ready.pop() else { break };
             let waker = self.ready.waker(id);
             let mut child = Context::from_waker(&waker);
             let result = match id {
-                FILES => {
-                    self.files_ready = true;
-                    self.discover(&mut child)
-                }
                 BUDGET => {
                     self.grow(&mut child);
                     Ok(())
@@ -553,21 +525,21 @@ where
     }
 
     fn finish(&mut self) {
-        self.files_done = true;
+        self.files_closed = true;
+        self.file_ready = false;
         self.slots.clear();
         self.order.clear();
+        self.free.clear();
+        self.active = 0;
+        self.allow_cursor = 0;
         self.ring.clear();
         self.permit.shrink_to(0);
         self.terminated = true;
     }
 }
 
-impl<T, S> Stream for ReadScheduler<'_, T, S>
-where
-    S: Stream + Unpin,
-    S::Item: ReadFile<T>,
-{
-    type Item = Result<T, SchedulerError<<S::Item as ReadFile<T>>::Error>>;
+impl<T, F: ReadFile<T>> Stream for ReadScheduler<'_, T, F> {
+    type Item = Result<T, SchedulerError<F::Error>>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if this.terminated {
@@ -581,14 +553,17 @@ where
         if let Some(frame) = this.take_frame() {
             return Poll::Ready(Some(Ok(frame)));
         }
-        if let Err(error) = this.poll_work(cx) {
-            this.finish();
+        this.drive(cx);
+        if let Some(error) = this.error.take() {
             return Poll::Ready(Some(Err(error)));
+        }
+        if this.terminated {
+            return Poll::Ready(None);
         }
         if let Some(frame) = this.take_frame() {
             return Poll::Ready(Some(Ok(frame)));
         }
-        if this.files_done && this.order.is_empty() {
+        if this.files_closed && this.order.is_empty() {
             this.finish();
             return Poll::Ready(None);
         }
@@ -598,11 +573,7 @@ where
         Poll::Pending
     }
 }
-impl<T, S> FusedStream for ReadScheduler<'_, T, S>
-where
-    S: Stream + Unpin,
-    S::Item: ReadFile<T>,
-{
+impl<T, F: ReadFile<T>> FusedStream for ReadScheduler<'_, T, F> {
     fn is_terminated(&self) -> bool {
         self.terminated && self.error.is_none()
     }

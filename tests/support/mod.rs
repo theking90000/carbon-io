@@ -577,3 +577,115 @@ pub fn admit_frame<T, F: WriteFile<T>>(
     ));
     Pin::new(scheduler).start_frame(frame).unwrap();
 }
+
+/// External descriptor producer for the read regression fixtures.
+pub struct ReadDriver<'a, T, S>
+where
+    S: Stream + Unpin,
+    S::Item: ReadFile<T>,
+{
+    scheduler: carbon_io::ReadScheduler<'a, T, S::Item>,
+    files: &'a mut S,
+    source_wake: Arc<SourceWake>,
+    closed: bool,
+    stopped: bool,
+    error: Option<carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>>,
+}
+impl<T, S> Unpin for ReadDriver<'_, T, S>
+where S: Stream + Unpin, S::Item: ReadFile<T> {}
+
+impl<'a, T, S> ReadDriver<'a, T, S>
+where S: Stream + Unpin, S::Item: ReadFile<T> {
+    pub fn new(files: &'a mut S, budget: &'a carbon_io::FrameBudget, config: &'a mut SchedulerConfig) -> Self {
+        Self {
+            scheduler: carbon_io::ReadScheduler::new(budget, config),
+            files,
+            source_wake: SourceWake::new(),
+            closed: false,
+            stopped: false,
+            error: None,
+        }
+    }
+    fn feed(&mut self, cx: &mut Context<'_>) -> Result<(), carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>> {
+        self.source_wake.register(cx);
+        for turn in 0..64 {
+            if self.closed || !self.source_wake.ready.load(Ordering::Acquire) {
+                break;
+            }
+            if Pin::new(&mut self.scheduler).poll_file_ready(cx)?.is_pending() {
+                break;
+            }
+            self.source_wake.ready.store(false, Ordering::Release);
+            let waker = Waker::from(self.source_wake.clone());
+            match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
+                Poll::Pending => break,
+                Poll::Ready(None) => {
+                    Pin::new(&mut self.scheduler).close_files()?;
+                    self.closed = true;
+                    break;
+                }
+                Poll::Ready(Some(file)) => {
+                    Pin::new(&mut self.scheduler).start_file(file)?;
+                    self.source_wake.ready.store(true, Ordering::Release);
+                }
+            }
+            if turn == 63 {
+                cx.waker().wake_by_ref();
+            }
+        }
+        Ok(())
+    }
+    pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
+        self.scheduler.poll_progress(cx);
+        if !self.stopped {
+            if let Err(error) = self.feed(cx) {
+                self.error = Some(error);
+                self.stopped = true;
+            }
+        }
+        self.scheduler.poll_progress(cx);
+    }
+    pub async fn progress(&mut self) {
+        std::future::poll_fn(|cx| {
+            self.poll_progress(cx);
+            Poll::<()>::Pending
+        }).await
+    }
+}
+impl<'a, T, S> std::ops::Deref for ReadDriver<'a, T, S>
+where S: Stream + Unpin, S::Item: ReadFile<T> {
+    type Target = carbon_io::ReadScheduler<'a, T, S::Item>;
+    fn deref(&self) -> &Self::Target { &self.scheduler }
+}
+impl<T, S> std::ops::DerefMut for ReadDriver<'_, T, S>
+where S: Stream + Unpin, S::Item: ReadFile<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.scheduler }
+}
+impl<T, S> Stream for ReadDriver<'_, T, S>
+where S: Stream + Unpin, S::Item: ReadFile<T> {
+    type Item = Result<T, carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.poll_progress(cx);
+        if let Some(error) = this.error.take() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        Pin::new(&mut this.scheduler).poll_next(cx)
+    }
+}
+impl<T, S> futures::stream::FusedStream for ReadDriver<'_, T, S>
+where S: Stream + Unpin, S::Item: ReadFile<T> {
+    fn is_terminated(&self) -> bool {
+        self.error.is_none() && self.scheduler.is_terminated()
+    }
+}
+
+pub fn admit_read_file<T, F: ReadFile<T>>(
+    scheduler: &mut carbon_io::ReadScheduler<'_, T, F>,
+    file: F,
+) where F::Error: std::fmt::Debug {
+    let (_, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(Pin::new(&mut *scheduler).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+    Pin::new(scheduler).start_file(file).unwrap();
+}

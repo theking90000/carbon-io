@@ -222,16 +222,34 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
         ));
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut scheduler_files_2 = stream::iter(files);
+    let mut files = files.into_iter();
     let scheduler_budget_2 = FrameBudget::new(PIPELINE_FRAMES);
     let mut scheduler_config_2 = config();
-    let mut reader = ReadScheduler::new(
-        &mut scheduler_files_2,
-        &scheduler_budget_2,
-        &mut scheduler_config_2,
-    );
+    let mut reader = ReadScheduler::new(&scheduler_budget_2, &mut scheduler_config_2);
+    let mut closed = false;
     let mut remaining = total;
-    while let Some(frame) = reader.next().await {
+    while let Some(frame) = std::future::poll_fn(|cx| {
+        while !closed {
+            match Pin::new(&mut reader).poll_file_ready(cx) {
+                Poll::Pending => break,
+                Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(Ok(())) => match files.next() {
+                    Some(file) => {
+                        if let Err(error) = Pin::new(&mut reader).start_file(file) {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                    None => {
+                        closed = true;
+                        if let Err(error) = Pin::new(&mut reader).close_files() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                },
+            }
+        }
+        Pin::new(&mut reader).poll_next(cx)
+    }).await {
         let frame = frame.map_err(io::Error::other)?;
         let length = remaining.min(BLOCK as u64) as usize;
         tokio::select! {

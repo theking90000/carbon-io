@@ -1,6 +1,6 @@
 //! Shared capacity, reservation, wakeup, and cancellation regressions.
 mod support;
-use carbon_io::{FrameBudget, ReadScheduler};
+use carbon_io::{FrameBudget};
 use futures::Stream;
 use futures::stream;
 use std::{
@@ -112,7 +112,7 @@ fn scheduler_can_grow_when_capacity_is_released() {
     file.reading.close();
     let mut scheduler_files_1 = stream::iter([file]);
     let mut scheduler_config_1 = config(128, 256, 1, 0);
-    let mut reader = ReadScheduler::new(&mut scheduler_files_1, &b, &mut scheduler_config_1);
+    let mut reader = ReadDriver::new(&mut scheduler_files_1, &b, &mut scheduler_config_1);
     assert!(poll(&mut reader).is_pending());
     assert_eq!(reader.granted_frames(), 32);
     drop(owner);
@@ -125,7 +125,7 @@ fn scheduler_can_shrink() {
     let file = Read::new(0..128);
     let mut scheduler_files_2 = stream::iter([file]);
     let mut scheduler_config_2 = config(64, 128, 1, 0);
-    let mut r = ReadScheduler::new(&mut scheduler_files_2, &b, &mut scheduler_config_2);
+    let mut r = ReadDriver::new(&mut scheduler_files_2, &b, &mut scheduler_config_2);
     assert!(poll(&mut r).is_ready());
     r.set_window(config(4, 128, 1, 0).window).unwrap();
     for _ in 0..63 {
@@ -144,7 +144,7 @@ fn multiple_read_and_write_schedulers_share_budget() {
     let (input, _) = frames(4);
     let mut scheduler_files_3 = stream::iter([rfile]);
     let mut scheduler_config_3 = config(4, 4, 1, 0);
-    let mut r = ReadScheduler::new(&mut scheduler_files_3, &b, &mut scheduler_config_3);
+    let mut r = ReadDriver::new(&mut scheduler_files_3, &b, &mut scheduler_config_3);
     let mut scheduler_input_4 = input;
     let mut scheduler_files_4 = stream::iter([wfile]);
     let mut scheduler_config_4 = config(4, 4, 1, 1);
@@ -209,7 +209,7 @@ fn small_releases_do_not_cause_unit_grants() {
     f.reading.close();
     let mut scheduler_files_7 = stream::iter([f]);
     let mut scheduler_config_7 = config(128, 128, 1, 0);
-    let mut s = ReadScheduler::new(&mut scheduler_files_7, &b, &mut scheduler_config_7);
+    let mut s = ReadDriver::new(&mut scheduler_files_7, &b, &mut scheduler_config_7);
     let (c, w) = context_waker();
     let mut cx = Context::from_waker(&w);
     assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());

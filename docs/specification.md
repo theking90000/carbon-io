@@ -2106,13 +2106,11 @@ Pas davantage en V1.
 Exemple conceptuel :
 
 ```rust
-let mut scheduler_files_1 = files;
 let mut scheduler_config_1 = config;
-let scheduler = ReadScheduler::new(
-    &mut scheduler_files_1,
-    &budget,
-    &mut scheduler_config_1,
-);
+let mut scheduler = ReadScheduler::new(&budget, &mut scheduler_config_1);
+poll_fn(|cx| Pin::new(&mut scheduler).poll_file_ready(cx)).await?;
+Pin::new(&mut scheduler).start_file(file)?;
+Pin::new(&mut scheduler).close_files()?;
 
 while let Some(frame) = scheduler.next().await {
     let frame = frame?;
@@ -2120,7 +2118,9 @@ while let Some(frame) = scheduler.next().await {
 }
 ```
 
-Le stream `files` peut continuer à produire des fichiers pendant l'exécution.
+Le producteur conserve sa source de fichiers et les admet pendant l'exécution.
+Pour plusieurs fichiers, il alterne admission et consommation des trames dans
+la tâche appelante afin que la fenêtre puisse avancer.
 
 Le scheduler ne nécessite pas de connaître tous les fichiers à l'avance.
 

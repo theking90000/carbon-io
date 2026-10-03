@@ -29,6 +29,10 @@ pub enum ContractError {
     ZeroBudget,
     /// The target or active-file limit is zero.
     InvalidWindow,
+    /// Admission was attempted after its input closed or the scheduler terminated.
+    InputClosed,
+    /// An item was supplied without a successful readiness reservation.
+    AdmissionNotReady,
 }
 
 impl fmt::Display for ContractError {
@@ -42,6 +46,8 @@ impl fmt::Display for ContractError {
             Self::FrameCapacityExceedsBudget => "replayable file exceeds the global frame budget",
             Self::ZeroBudget => "frame budget must be nonzero",
             Self::InvalidWindow => "target frames and active file limit must be nonzero",
+            Self::InputClosed => "scheduler input is closed",
+            Self::AdmissionNotReady => "admission requires a successful readiness poll",
         })
     }
 }

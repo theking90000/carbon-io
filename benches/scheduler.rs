@@ -193,20 +193,38 @@ fn read_case(name: &str, n: usize, size: u32, active: usize, pending: bool) {
     let count = n * size as usize;
     let target = (active * size as usize).clamp(1, 4096);
     measure(name, count, n, polls.clone(), || {
-        let files = stream::iter((0..n).map(|i| ReadSource {
+        let mut files = (0..n).map(|i| ReadSource {
             start: (i * size as usize) as u64,
             count: size,
             pending,
             polls: polls.clone(),
-        }));
-        let mut scheduler_files_1 = files;
+        });
         let scheduler_budget_1 = FrameBudget::new(target);
         let mut scheduler_config_1 = config(target, active, 0);
-        consume(ReadScheduler::new(
-            &mut scheduler_files_1,
-            &scheduler_budget_1,
-            &mut scheduler_config_1,
-        ))
+        let mut reader = ReadScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
+        let mut closed = false;
+        consume(stream::poll_fn(|cx| {
+            while !closed {
+                match Pin::new(&mut reader).poll_file_ready(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
+                    Poll::Ready(Ok(())) => match files.next() {
+                        Some(file) => {
+                            if let Err(error) = Pin::new(&mut reader).start_file(file) {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        }
+                        None => {
+                            closed = true;
+                            if let Err(error) = Pin::new(&mut reader).close_files() {
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        }
+                    },
+                }
+            }
+            Pin::new(&mut reader).poll_next(cx)
+        }))
     })
 }
 fn write_case(name: &str, n: usize, size: u32, active: usize, pending: bool, retry: bool) {
@@ -238,24 +256,25 @@ fn shared_case(n: usize) {
     let polls = Rc::new(Cell::new(0));
     measure("shared_four_schedulers", n * 4, 4, polls.clone(), || {
         let budget = FrameBudget::new(4096);
-        let mut files: Vec<_> = (0..4)
-            .map(|i| {
-                stream::iter([ReadSource {
-                    start: (i * n) as u64,
-                    count: n as u32,
-                    pending: false,
-                    polls: polls.clone(),
-                }])
-            })
-            .collect();
+        let files = (0..4).map(|i| ReadSource {
+            start: (i * n) as u64,
+            count: n as u32,
+            pending: false,
+            polls: polls.clone(),
+        });
         let mut configs = [config(1024, 1, 0); 4];
-        let mut schedulers: Vec<_> = files
-            .iter_mut()
-            .zip(&mut configs)
-            .map(|(files, config)| ReadScheduler::new(files, &budget, config))
-            .collect();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
+        let mut schedulers: Vec<_> = files
+            .zip(&mut configs)
+            .map(|(file, config)| {
+                let mut reader = ReadScheduler::new(&budget, config);
+                assert!(matches!(Pin::new(&mut reader).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+                Pin::new(&mut reader).start_file(file).unwrap();
+                Pin::new(&mut reader).close_files().unwrap();
+                reader
+            })
+            .collect();
         let mut sum = 0;
         let mut finished = [false; 4];
         while finished.iter().any(|done| !*done) {
@@ -291,19 +310,18 @@ fn read_consumer_case(name: &str, count: u32, drive: bool) {
     let polls = Rc::new(Cell::new(0));
     measure(name, count as usize, 1, polls.clone(), || {
         futures::executor::block_on(async {
-            let mut scheduler_files_3 = stream::iter([ReadSource {
+            let file = ReadSource {
                 start: 0,
                 count,
                 pending: true,
                 polls,
-            }]);
+            };
             let scheduler_budget_3 = FrameBudget::new(64);
             let mut scheduler_config_3 = config(64, 1, 0);
-            let mut reader = ReadScheduler::new(
-                &mut scheduler_files_3,
-                &scheduler_budget_3,
-                &mut scheduler_config_3,
-            );
+            let mut reader = ReadScheduler::new(&scheduler_budget_3, &mut scheduler_config_3);
+            std::future::poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx)).await.unwrap();
+            Pin::new(&mut reader).start_file(file).unwrap();
+            Pin::new(&mut reader).close_files().unwrap();
             let mut sum = 0;
             while let Some(frame) = reader.next().await {
                 sum += black_box(frame.unwrap());

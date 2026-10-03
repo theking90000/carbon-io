@@ -18,7 +18,7 @@ fn select_drives_reads_until_window_full_and_preserves_output() {
     let mut scheduler_files_1 = stream::iter([file.clone()]);
     let scheduler_budget_1 = FrameBudget::new(4);
     let mut scheduler_config_1 = config(4, 4, 1, 0);
-    let mut reader = ReadScheduler::new(
+    let mut reader = ReadDriver::new(
         &mut scheduler_files_1,
         &scheduler_budget_1,
         &mut scheduler_config_1,
@@ -105,7 +105,7 @@ fn cancelling_drive_and_next_preserves_pending_io_and_replaces_waker() {
     let budget = FrameBudget::new(2);
     let mut scheduler_files_3 = stream::iter([file.clone()]);
     let mut scheduler_config_3 = config(2, 2, 1, 0);
-    let mut reader = ReadScheduler::new(&mut scheduler_files_3, &budget, &mut scheduler_config_3);
+    let mut reader = ReadDriver::new(&mut scheduler_files_3, &budget, &mut scheduler_config_3);
     let (old_wakes, old_waker) = context_waker();
     {
         let mut drive = Box::pin(reader.progress());
@@ -178,7 +178,7 @@ fn read_drive_releases_resources_on_error_but_delivers_error_once() {
     let budget = FrameBudget::new(3);
     let mut scheduler_files_5 = stream::iter([file.clone()]);
     let mut scheduler_config_5 = config(3, 3, 1, 0);
-    let mut reader = ReadScheduler::new(&mut scheduler_files_5, &budget, &mut scheduler_config_5);
+    let mut reader = ReadDriver::new(&mut scheduler_files_5, &budget, &mut scheduler_config_5);
     let (wakes, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
     {
@@ -189,7 +189,9 @@ fn read_drive_releases_resources_on_error_but_delivers_error_once() {
     assert_eq!(budget.available_capacity(), 3);
     assert_eq!(file.drops.get(), 1);
     assert!(!reader.is_terminated());
-    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    let before = wakes.0.load(Ordering::Relaxed);
+    reader.poll_progress(&mut cx);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
     assert_eq!(
         poll(&mut reader),
         Poll::Ready(Some(Err(SchedulerError::Backend("read"))))
@@ -197,7 +199,7 @@ fn read_drive_releases_resources_on_error_but_delivers_error_once() {
     assert!(reader.is_terminated());
     assert_eq!(poll(&mut reader), Poll::Ready(None));
     reader.poll_progress(&mut cx);
-    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
 }
 
 #[test]
@@ -242,7 +244,7 @@ fn progress_handles_initial_errors_and_empty_streams() {
         let budget = FrameBudget::new(capacity);
         let mut scheduler_files_7 = stream::empty::<Read>();
         let mut scheduler_config_7 = config(1, 1, 1, 0);
-        let mut reader = ReadScheduler::<usize, _>::new(
+        let mut reader = ReadDriver::<usize, _>::new(
             &mut scheduler_files_7,
             &budget,
             &mut scheduler_config_7,
@@ -298,12 +300,19 @@ fn progress_yields_after_bounded_work_and_can_resume_from_budget_wake() {
     let mut cx = Context::from_waker(&waker);
     assert!(held.poll_grow(&mut cx, 1024, 1024).is_ready());
     let file = Read::new(0..1024);
-    let mut scheduler_files_9 = stream::iter([file.clone()]);
     let mut scheduler_config_9 = config(1024, 1024, 1, 0);
-    let mut reader = ReadScheduler::new(&mut scheduler_files_9, &budget, &mut scheduler_config_9);
+    let mut reader = ReadScheduler::new(&budget, &mut scheduler_config_9);
+    assert_eq!(
+        Pin::new(&mut reader).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    );
+    Pin::new(&mut reader).start_file(file.clone()).unwrap();
+    Pin::new(&mut reader).close_files().unwrap();
     reader.poll_progress(&mut cx);
     assert_eq!(file.reading.polls(), 0);
+    let before = wakes.0.load(Ordering::Relaxed);
     drop(held);
+    assert!(wakes.0.load(Ordering::Relaxed) > before);
     let before = wakes.0.load(Ordering::Relaxed);
     reader.poll_progress(&mut cx);
     assert!(file.reading.polls() > 0 && file.reading.polls() <= 256);

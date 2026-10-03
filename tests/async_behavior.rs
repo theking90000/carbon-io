@@ -1,6 +1,6 @@
 //! Waker routing, bounded work, backpressure, and non-starvation tests.
 mod support;
-use carbon_io::{FrameBudget, ReadScheduler};
+use carbon_io::{FrameBudget};
 use futures::{Stream, StreamExt, stream};
 use std::{
     pin::Pin,
@@ -18,7 +18,7 @@ fn no_busy_loop_when_all_sources_pending() {
     let mut scheduler_files_1 = stream::iter([a.clone(), b.clone()]);
     let scheduler_budget_1 = FrameBudget::new(4);
     let mut scheduler_config_1 = config(4, 100, 10, 0);
-    let mut s = ReadScheduler::new(
+    let mut s = ReadDriver::new(
         &mut scheduler_files_1,
         &scheduler_budget_1,
         &mut scheduler_config_1,
@@ -46,7 +46,7 @@ fn only_woken_slot_is_polled_among_ten_thousand_pending_opens() {
     let mut scheduler_files_2 = stream::iter(files.clone());
     let scheduler_budget_2 = FrameBudget::new(32);
     let mut scheduler_config_2 = config(32, 20_000, 10_000, 0);
-    let mut s = ReadScheduler::new(
+    let mut s = ReadDriver::new(
         &mut scheduler_files_2,
         &scheduler_budget_2,
         &mut scheduler_config_2,
@@ -68,7 +68,7 @@ fn ready_source_does_not_starve_other_sources() {
     let mut scheduler_files_3 = stream::iter([a, b.clone()]);
     let scheduler_budget_3 = FrameBudget::new(10_002);
     let mut scheduler_config_3 = config(10_002, 20_000, 2, 0);
-    let mut s = ReadScheduler::new(
+    let mut s = ReadDriver::new(
         &mut scheduler_files_3,
         &scheduler_budget_3,
         &mut scheduler_config_3,
@@ -147,7 +147,7 @@ fn blocked_consumer_does_not_prevent_allowed_readers_from_filling_window() {
     let mut scheduler_files_6 = stream::iter([a, b.clone()]);
     let scheduler_budget_6 = FrameBudget::new(8);
     let mut scheduler_config_6 = config(8, 100, 2, 0);
-    let mut s = ReadScheduler::new(
+    let mut s = ReadDriver::new(
         &mut scheduler_files_6,
         &scheduler_budget_6,
         &mut scheduler_config_6,
@@ -219,7 +219,7 @@ fn eof_probe_waits_for_its_own_waker() {
         std::pin::pin!(stream::iter([File(gate.clone()), File(Gate::new(true))]));
     let scheduler_budget_8 = FrameBudget::new(2);
     let mut scheduler_config_8 = config(2, 10, 2, 0);
-    let mut s = ReadScheduler::new(
+    let mut s = ReadDriver::new(
         &mut scheduler_files_8,
         &scheduler_budget_8,
         &mut scheduler_config_8,

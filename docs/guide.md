@@ -26,9 +26,16 @@ in-memory backends return ready results; a backend may also return pending I/O.
 
 ## Reading files
 
-`ReadScheduler` borrows an `Unpin` stream of file descriptors. Each descriptor declares
-its frame count and opens a stream that yields exactly that many successful
-frames, followed by EOF.
+`ReadScheduler` accepts owned file descriptors through `poll_file_ready` and
+`start_file`. A readiness reservation remains valid until the descriptor is
+supplied, even if the window changes in between. `close_files` ends admission;
+already accepted files continue producing frames until the output reaches EOF.
+Each descriptor declares its frame count and opens a stream that yields exactly
+that many successful frames, followed by EOF.
+
+The producer keeps its source and feeds descriptors from the calling task while
+also consuming output. No input stream is retained by the scheduler. Descriptors
+and frames need neither `Clone` nor `Unpin`.
 
 Files may open and produce frames concurrently. A later file can fill its part
 of the buffer while an earlier file waits for I/O. CARBON emits frames in file

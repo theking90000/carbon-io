@@ -14,20 +14,17 @@ Each file contains frames of your chosen Rust type. CARBON schedules reads and
 writes across files, limits buffering, and delivers results in order.
 
 - `ReadScheduler` reads files into a stream of frames in file order.
-- `WriteScheduler` distributes a stream of frames across destinations and returns
+- `WriteScheduler` distributes admitted frames across destinations and returns
   their finalization results in destination order.
 
 Consuming the stream drives I/O. CARBON starts no background tasks.
 
-Schedulers borrow `Unpin` streams via `&mut`, a shared `&FrameBudget`, and a mutable
-`&mut SchedulerConfig`. Streams stay with the caller at EOF and on failure. Pinning for polling stays
-inside Carbon. Borrow a pinned wrapper to use a `!Unpin` stream.
-Dropping a scheduler cancels its operations and makes the borrowed values
-available again. `set_window()` updates the caller's configuration.
-
-`WriteScheduler::input_mut()` temporarily exposes `&mut I` and wakes the
-scheduler so the input can be filled before polling resumes. EOF is final.
-Version 0.3.2 introduces a borrowing API incompatible with 0.3.1.
+Schedulers borrow a shared `&FrameBudget` and a mutable `&mut SchedulerConfig`.
+Files are supplied with `poll_file_ready()` followed by `start_file()`;
+`WriteScheduler` also accepts owned frames with `poll_frame_ready()` followed by
+`start_frame()`. The producer retains its sources and drives admission and output
+in the same task. Dropping a scheduler cancels its operations and releases its
+budget. `set_window()` updates the caller's configuration.
 
 See the [detailed guide](docs/guide.md) for more on scheduling, buffering,
 backpressure, and backend integration.
@@ -63,10 +60,10 @@ The Tokio snippets below require Tokio.
 
 Implement `ReadFile<T>` for your file descriptors. Each descriptor declares its
 frame count and opens a stream that yields exactly that many successful frames,
-followed by EOF. Pass a stream of descriptors to `ReadScheduler`:
+followed by EOF. Admit each descriptor to `ReadScheduler`, then close file input:
 
 ```rust
-use std::{convert::Infallible, error::Error, future::{Ready, ready}, ops::Range};
+use std::{convert::Infallible, error::Error, future::{Ready, ready, poll_fn}, ops::Range, pin::Pin};
 use futures::{executor::block_on, stream, StreamExt};
 use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 
@@ -86,14 +83,14 @@ impl ReadFile<u32> for File {
 
 fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
-        let mut scheduler_files_1 = stream::iter([File(0..3), File(3..5)]);
-        let scheduler_budget_1 = FrameBudget::new(64);
-        let mut scheduler_config_1 = SchedulerConfig::default();
-        let mut reader = ReadScheduler::new(
-            &mut scheduler_files_1,
-            &scheduler_budget_1,
-            &mut scheduler_config_1,
-        );
+        let budget = FrameBudget::new(64);
+        let mut config = SchedulerConfig::default();
+        let mut reader = ReadScheduler::new(&budget, &mut config);
+        for file in [File(0..3), File(3..5)] {
+            poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx)).await?;
+            Pin::new(&mut reader).start_file(file)?;
+        }
+        Pin::new(&mut reader).close_files()?;
 
         let mut values = Vec::new();
         while let Some(frame) = reader.next().await {
