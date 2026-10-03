@@ -1,6 +1,6 @@
 use crate::{
-    ContractError, FrameBudget, FramePermit, FrameWriter, Interest, MAX_POLL_OPS, SchedulerConfig,
-    SchedulerError, Window, WriteFile, ready::ReadyQueue,
+    ContractError, EventPoll, FrameBudget, FramePermit, FrameWriter, Interest, MAX_POLL_OPS,
+    SchedulerConfig, SchedulerError, Window, WriteFile, ready::ReadyQueue,
 };
 use futures_core::{Stream, stream::FusedStream};
 use pin_project_lite::pin_project;
@@ -449,10 +449,7 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
     /// Handle readiness with the matching `enqueue_*` or `close_*` call. Close an
     /// input as soon as its producer ends, without waiting for another admission.
     /// Returns `None` after both inputs close and results drain, or an error once.
-    pub fn poll(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<WriteEvent<F::Output>>, SchedulerError<F::Error>>> {
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> EventPoll<WriteEvent<F::Output>, F::Error> {
         self.poll_with_interest(cx, Interest::ALL)
     }
 
@@ -464,7 +461,7 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         &mut self,
         cx: &mut Context<'_>,
         interest: Interest,
-    ) -> Poll<Result<Option<WriteEvent<F::Output>>, SchedulerError<F::Error>>> {
+    ) -> EventPoll<WriteEvent<F::Output>, F::Error> {
         self.drive(cx);
         if let Some(error) = self.error.take() {
             return Poll::Ready(Err(error));
@@ -889,7 +886,6 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         }
         if self.frames_closed && self.files_closed && self.order.is_empty() {
             self.finish();
-            return;
         }
     }
 

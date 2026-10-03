@@ -1,6 +1,6 @@
 use crate::{
-    ContractError, FrameBudget, FramePermit, Interest, MAX_POLL_OPS, ReadFile, SchedulerConfig,
-    SchedulerError, Window, ready::ReadyQueue,
+    ContractError, EventPoll, FrameBudget, FramePermit, Interest, MAX_POLL_OPS, ReadFile,
+    SchedulerConfig, SchedulerError, Window, ready::ReadyQueue,
 };
 use futures_core::{Stream, stream::FusedStream};
 use pin_project_lite::pin_project;
@@ -327,10 +327,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
     /// Alternates admission and output priority when both are ready. Handle each
     /// `FileReady` with `enqueue_file` or `close_files`; unconsumed grants persist.
     /// Returns `None` after closure and draining, or a terminal error once.
-    pub fn poll(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<ReadEvent<T>>, SchedulerError<F::Error>>> {
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> EventPoll<ReadEvent<T>, F::Error> {
         self.poll_with_interest(cx, Interest::ALL)
     }
 
@@ -341,7 +338,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         &mut self,
         cx: &mut Context<'_>,
         interest: Interest,
-    ) -> Poll<Result<Option<ReadEvent<T>>, SchedulerError<F::Error>>> {
+    ) -> EventPoll<ReadEvent<T>, F::Error> {
         self.drive(cx);
         if let Some(error) = self.error.take() {
             return Poll::Ready(Err(error));
@@ -605,7 +602,6 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         }
         if self.files_closed && self.order.is_empty() {
             self.finish();
-            return;
         }
     }
 

@@ -15,6 +15,9 @@ pub use read::{ReadEvent, ReadScheduler};
 pub use traits::{FrameWriter, ReadFile, WriteFile};
 pub use write::{WriteEvent, WriteScheduler};
 
+/// A pending event, an available event, EOF or a scheduler error.
+pub type EventPoll<T, E> = std::task::Poll<Result<Option<T>, SchedulerError<E>>>;
+
 /// Events requested from a scheduler, combined with `|`.
 /// Unrequested admissions are neither returned nor newly reserved. Existing
 /// reservations survive interest changes. Errors and EOF are always reported.
