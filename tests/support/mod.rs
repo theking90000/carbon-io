@@ -412,27 +412,27 @@ where
         self.files_wake.register(cx);
         for turn in 0..64 {
             let mut advanced = false;
-            if !self.files_closed && self.files_wake.ready.load(Ordering::Acquire) {
-                if Pin::new(&mut self.scheduler)
+            if !self.files_closed
+                && self.files_wake.ready.load(Ordering::Acquire)
+                && Pin::new(&mut self.scheduler)
                     .poll_file_ready(cx)?
                     .is_ready()
-                {
-                    self.files_wake.ready.store(false, Ordering::Release);
-                    let waker = Waker::from(self.files_wake.clone());
-                    match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
-                        Poll::Ready(Some(file)) => {
-                            self.remaining += file.frame_capacity() as usize;
-                            Pin::new(&mut self.scheduler).start_file(file)?;
-                            self.files_wake.ready.store(true, Ordering::Release);
-                            advanced = true;
-                        }
-                        Poll::Ready(None) => {
-                            Pin::new(&mut self.scheduler).close_files()?;
-                            self.files_closed = true;
-                            advanced = true;
-                        }
-                        Poll::Pending => {}
+            {
+                self.files_wake.ready.store(false, Ordering::Release);
+                let waker = Waker::from(self.files_wake.clone());
+                match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
+                    Poll::Ready(Some(file)) => {
+                        self.remaining += file.frame_capacity() as usize;
+                        Pin::new(&mut self.scheduler).start_file(file)?;
+                        self.files_wake.ready.store(true, Ordering::Release);
+                        advanced = true;
                     }
+                    Poll::Ready(None) => {
+                        Pin::new(&mut self.scheduler).close_files()?;
+                        self.files_closed = true;
+                        advanced = true;
+                    }
+                    Poll::Pending => {}
                 }
             }
             if !self.frames_closed
