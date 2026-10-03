@@ -27,7 +27,7 @@ in-memory backends return ready results; a backend may also return pending I/O.
 ## Reading files
 
 `ReadScheduler` accepts owned file descriptors through `poll_file_ready` and
-`start_file`. A readiness reservation remains valid until the descriptor is
+`enqueue_file`. A readiness reservation remains valid until the descriptor is
 supplied, even if the window changes in between. `close_files` ends admission;
 already accepted files continue producing frames until the output reaches EOF.
 Each descriptor declares its frame count and opens a stream that yields exactly

@@ -210,7 +210,7 @@ fn read_case(name: &str, n: usize, size: u32, active: usize, pending: bool) {
                     Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
                     Poll::Ready(Ok(())) => match files.next() {
                         Some(file) => {
-                            if let Err(error) = Pin::new(&mut reader).start_file(file) {
+                            if let Err(error) = Pin::new(&mut reader).enqueue_file(file) {
                                 return Poll::Ready(Some(Err(error)));
                             }
                         }
@@ -240,7 +240,7 @@ fn feed_writer(
         let mut advanced = false;
         if !*files_closed && Pin::new(&mut *writer).poll_file_ready(cx)?.is_ready() {
             match files.next() {
-                Some(file) => Pin::new(&mut *writer).start_file(file)?,
+                Some(file) => Pin::new(&mut *writer).enqueue_file(file)?,
                 None => {
                     Pin::new(&mut *writer).close_files()?;
                     *files_closed = true;
@@ -249,7 +249,7 @@ fn feed_writer(
             advanced = true;
         }
         if *next < total && Pin::new(&mut *writer).poll_frame_ready(cx)?.is_ready() {
-            Pin::new(&mut *writer).start_frame(*next)?;
+            Pin::new(&mut *writer).enqueue_frame(*next)?;
             *next += 1;
             advanced = true;
             if *next == total {
@@ -322,7 +322,7 @@ fn shared_case(n: usize) {
                     Pin::new(&mut reader).poll_file_ready(&mut cx),
                     Poll::Ready(Ok(()))
                 ));
-                Pin::new(&mut reader).start_file(file).unwrap();
+                Pin::new(&mut reader).enqueue_file(file).unwrap();
                 Pin::new(&mut reader).close_files().unwrap();
                 reader
             })
@@ -374,7 +374,7 @@ fn read_consumer_case(name: &str, count: u32, drive: bool) {
             std::future::poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx))
                 .await
                 .unwrap();
-            Pin::new(&mut reader).start_file(file).unwrap();
+            Pin::new(&mut reader).enqueue_file(file).unwrap();
             Pin::new(&mut reader).close_files().unwrap();
             let mut sum = 0;
             while let Some(frame) = reader.next().await {

@@ -47,7 +47,7 @@ fn granted_file_survives_progress_and_window_shrink() {
         Poll::Ready(Ok(()))
     );
     let second = Read::new(4..6);
-    Pin::new(&mut reader).start_file(second.clone()).unwrap();
+    Pin::new(&mut reader).enqueue_file(second.clone()).unwrap();
     assert_eq!(second.opens.get(), 1);
     assert!(Pin::new(&mut reader).poll_file_ready(&mut cx).is_pending());
     Pin::new(&mut reader).close_files().unwrap();
@@ -97,7 +97,7 @@ fn rejected_admissions_return_errors_without_opening_the_file() {
     let mut reader = ReadScheduler::new(&budget, &mut cfg);
     let file = Read::new([0]);
     assert_eq!(
-        Pin::new(&mut reader).start_file(file.clone()),
+        Pin::new(&mut reader).enqueue_file(file.clone()),
         Err(E::Contract(C::AdmissionNotReady))
     );
     assert_eq!(file.opens.get(), 0);
@@ -114,7 +114,7 @@ fn rejected_admissions_return_errors_without_opening_the_file() {
     );
     Pin::new(&mut reader).close_files().unwrap();
     assert_eq!(
-        Pin::new(&mut reader).start_file(file.clone()),
+        Pin::new(&mut reader).enqueue_file(file.clone()),
         Err(E::Contract(C::InputClosed))
     );
     assert_eq!(file.opens.get(), 0);
@@ -143,7 +143,7 @@ fn backend_error_invalidates_grant_and_is_delivered_once() {
     reader.poll_progress(&mut cx);
     let second = Read::new([1]);
     assert_eq!(
-        Pin::new(&mut reader).start_file(second.clone()),
+        Pin::new(&mut reader).enqueue_file(second.clone()),
         Err(E::Backend("read"))
     );
     assert_eq!(second.opens.get(), 0);

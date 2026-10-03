@@ -61,7 +61,9 @@ fn push_admissions_wake_the_scheduler_and_update_the_callers_config() {
         Poll::Ready(Ok(()))
     ));
     let before = wakes.0.load(Ordering::Relaxed);
-    Pin::new(&mut scheduler).start_file(Write::new(4)).unwrap();
+    Pin::new(&mut scheduler)
+        .enqueue_file(Write::new(4))
+        .unwrap();
     assert!(wakes.0.load(Ordering::Relaxed) > before);
     let drops = Rc::new(Cell::new(0));
     for value in [7, 9] {
@@ -71,7 +73,7 @@ fn push_admissions_wake_the_scheduler_and_update_the_callers_config() {
         ));
         let before = wakes.0.load(Ordering::Relaxed);
         Pin::new(&mut scheduler)
-            .start_frame(Frame {
+            .enqueue_frame(Frame {
                 value,
                 drops: drops.clone(),
             })
@@ -177,7 +179,7 @@ fn write_failure_preserves_external_input_and_remaining_files() {
         Poll::Ready(Ok(()))
     ));
     assert_eq!(
-        Pin::new(&mut scheduler).start_file(block_on(files.as_mut().next()).unwrap()),
+        Pin::new(&mut scheduler).enqueue_file(block_on(files.as_mut().next()).unwrap()),
         Err(SchedulerError::Contract(ContractError::ZeroFrameCapacity))
     );
     assert_eq!(poll(&mut scheduler), Poll::Ready(None));

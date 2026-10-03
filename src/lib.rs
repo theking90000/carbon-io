@@ -11,8 +11,8 @@ mod write;
 pub use budget::{FrameBudget, FramePermit};
 pub use config::{SchedulerConfig, Window};
 pub use error::{ContractError, SchedulerError};
-pub use read::ReadScheduler;
+pub use read::{ReadEvent, ReadScheduler};
 pub use traits::{FrameWriter, ReadFile, WriteFile};
-pub use write::WriteScheduler;
+pub use write::{WriteEvent, WriteScheduler};
 
 const MAX_POLL_OPS: usize = 256;

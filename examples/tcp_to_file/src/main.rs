@@ -235,7 +235,7 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
                 Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
                 Poll::Ready(Ok(())) => match files.next() {
                     Some(file) => {
-                        if let Err(error) = Pin::new(&mut reader).start_file(file) {
+                        if let Err(error) = Pin::new(&mut reader).enqueue_file(file) {
                             return Poll::Ready(Some(Err(error)));
                         }
                     }

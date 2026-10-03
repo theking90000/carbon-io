@@ -15,6 +15,16 @@ use std::{
 const BUDGET: usize = 0;
 const FIRST_SLOT: usize = 1;
 
+/// File admission or an ordered frame from a [`ReadScheduler`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadEvent<T> {
+    /// File admission is available. Use `accept_file` and `enqueue_file` to fill
+    /// the available window. The first admission remains reserved until consumed.
+    FileReady,
+    /// The next frame, transferred to the caller.
+    Frame(T),
+}
+
 pin_project! {
     #[project = ReadIoProj]
     enum ReadIo<O, R> {
@@ -36,8 +46,8 @@ struct Slot<T, F: ReadFile<T>> {
 
 /// Ordered reading with anticipatory opens and a contiguous shared-budget window.
 ///
-/// Admit owned file descriptors with `poll_file_ready` followed by `start_file`.
-/// A successful readiness poll reserves one admission until its start call,
+/// Admit owned file descriptors with `poll_file_ready` followed by `enqueue_file`.
+/// A successful readiness poll reserves one admission until its enqueue call,
 /// explicit closure or terminal failure, including across window changes.
 /// `close_files` ends admission; buffered frames remain available in order.
 /// Polling drives all work. No input stream or background task is retained.
@@ -48,7 +58,7 @@ struct Slot<T, F: ReadFile<T>> {
 /// # Examples
 ///
 /// ```
-/// use std::{convert::Infallible, future::{ready, poll_fn}, ops::Range, pin::Pin};
+/// use std::{convert::Infallible, future::ready, ops::Range};
 /// use futures::{executor::block_on, stream, StreamExt};
 /// use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 ///
@@ -67,9 +77,9 @@ struct Slot<T, F: ReadFile<T>> {
 ///     let budget = FrameBudget::new(16);
 ///     let mut config = SchedulerConfig::default();
 ///     let mut scheduler = ReadScheduler::new(&budget, &mut config);
-///     poll_fn(|cx| Pin::new(&mut scheduler).poll_file_ready(cx)).await.unwrap();
-///     Pin::new(&mut scheduler).start_file(MemFile(0..2)).unwrap();
-///     Pin::new(&mut scheduler).close_files().unwrap();
+///     scheduler.file_ready().await.unwrap();
+///     scheduler.enqueue_file(MemFile(0..2)).unwrap();
+///     scheduler.close_files().unwrap();
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 0);
 ///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 1);
 ///     assert!(scheduler.next().await.is_none());
@@ -93,6 +103,7 @@ pub struct ReadScheduler<'a, T, F: ReadFile<T>> {
     error: Option<SchedulerError<F::Error>>,
     files_closed: bool,
     file_ready: bool,
+    event_cursor: usize,
     terminated: bool,
 }
 
@@ -147,6 +158,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
             error,
             files_closed: false,
             file_ready: false,
+            event_cursor: 0,
             terminated: false,
         }
     }
@@ -248,10 +260,10 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
     /// survives progress and subsequent window reductions.
     /// Returns `InputClosed` after closure or a reported terminal error.
     pub fn poll_file_ready(
-        self: Pin<&mut Self>,
+        &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), SchedulerError<F::Error>>> {
-        let this = self.get_mut();
+        let this = self;
         this.drive(cx);
         if let Some(error) = this.error.take() {
             return Poll::Ready(Err(error));
@@ -259,24 +271,85 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         if this.terminated || this.files_closed {
             return Poll::Ready(Err(this.reject(ContractError::InputClosed)));
         }
-        if this.file_ready {
-            return Poll::Ready(Ok(()));
+        this.reserve_file().map(Ok)
+    }
+
+    fn reserve_file(&mut self) -> Poll<()> {
+        if self.file_ready {
+            return Poll::Ready(());
         }
-        if this.active >= this.config.window.max_active_files
-            || this.discovered.wrapping_sub(this.emitted) >= this.config.window.horizon()
+        if self.active >= self.config.window.max_active_files
+            || self.discovered.wrapping_sub(self.emitted) >= self.config.window.horizon()
         {
             return Poll::Pending;
         }
-        this.file_ready = true;
-        Poll::Ready(Ok(()))
+        self.file_ready = true;
+        Poll::Ready(())
     }
 
-    /// Transfer ownership of a file after a successful `poll_file_ready`.
+    /// Wait for and reserve one file admission, driving I/O while pending.
+    /// Dropping this future preserves the scheduler and any granted admission.
+    pub async fn file_ready(&mut self) -> Result<(), SchedulerError<F::Error>> {
+        std::future::poll_fn(|cx| self.poll_file_ready(cx)).await
+    }
+
+    /// Reserve one file admission without polling backend I/O.
+    /// Returns `false` on backpressure, closure or terminal failure. Errors remain
+    /// available through the next fallible operation. Repeated calls preserve the
+    /// same admission until `enqueue_file` consumes it or admission closes.
+    pub fn accept_file(&mut self) -> bool {
+        !self.terminated
+            && self.error.is_none()
+            && !self.files_closed
+            && self.reserve_file().is_ready()
+    }
+
+    /// Drive I/O and return a file admission or the next ordered frame.
+    /// Alternates admission and output priority when both are ready. Handle each
+    /// `FileReady` with `enqueue_file` or `close_files`; unconsumed grants persist.
+    /// Returns `None` after closure and draining, or a terminal error once.
+    pub fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<ReadEvent<T>>, SchedulerError<F::Error>>> {
+        self.drive(cx);
+        if let Some(error) = self.error.take() {
+            return Poll::Ready(Err(error));
+        }
+        if self.terminated {
+            return Poll::Ready(Ok(None));
+        }
+        for offset in 0..2 {
+            match (self.event_cursor + offset) % 2 {
+                0 if !self.files_closed && self.reserve_file().is_ready() => {
+                    self.event_cursor = 1;
+                    return Poll::Ready(Ok(Some(ReadEvent::FileReady)));
+                }
+                1 => {
+                    if let Some(frame) = self.take_frame() {
+                        self.event_cursor = 0;
+                        return Poll::Ready(Ok(Some(ReadEvent::Frame(frame))));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Poll::Pending
+    }
+
+    /// Wait for a file admission, ordered frame, error or EOF with one borrow.
+    /// Dropping a pending future preserves the scheduler and outstanding admissions.
+    pub async fn next_event(&mut self) -> Result<Option<ReadEvent<T>>, SchedulerError<F::Error>> {
+        std::future::poll_fn(|cx| self.poll(cx)).await
+    }
+
+    /// Transfer ownership of a file reserved by `accept_file`, a readiness poll
+    /// or a `FileReady` event.
     /// Starts its opening attempt; backend polling stays in the common I/O engine.
     /// Missing readiness, closed admission and zero frame counts return terminal
     /// `AdmissionNotReady`, `InputClosed` and `ZeroFrameCount` contract errors.
-    pub fn start_file(self: Pin<&mut Self>, file: F) -> Result<(), SchedulerError<F::Error>> {
-        let this = self.get_mut();
+    pub fn enqueue_file(&mut self, file: F) -> Result<(), SchedulerError<F::Error>> {
+        let this = self;
         if let Some(error) = this.error.take() {
             this.finish();
             this.wake();
@@ -296,8 +369,8 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
     /// Already accepted files continue reading and their frames remain ordered.
     /// Closure is idempotent. The output ends after all accepted files are drained
     /// and their readers have confirmed EOF.
-    pub fn close_files(self: Pin<&mut Self>) -> Result<(), SchedulerError<F::Error>> {
-        let this = self.get_mut();
+    pub fn close_files(&mut self) -> Result<(), SchedulerError<F::Error>> {
+        let this = self;
         if let Some(error) = this.error.take() {
             this.finish();
             this.wake();

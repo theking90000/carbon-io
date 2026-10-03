@@ -303,7 +303,7 @@ fn progress_yields_after_bounded_work_and_can_resume_from_budget_wake() {
         Pin::new(&mut reader).poll_file_ready(&mut cx),
         Poll::Ready(Ok(()))
     );
-    Pin::new(&mut reader).start_file(file.clone()).unwrap();
+    Pin::new(&mut reader).enqueue_file(file.clone()).unwrap();
     Pin::new(&mut reader).close_files().unwrap();
     reader.poll_progress(&mut cx);
     assert_eq!(file.reading.polls(), 0);

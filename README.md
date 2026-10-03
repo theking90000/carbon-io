@@ -20,10 +20,12 @@ writes across files, limits buffering, and delivers results in order.
 Consuming the stream drives I/O. CARBON starts no background tasks.
 
 Schedulers borrow a shared `&FrameBudget` and a mutable `&mut SchedulerConfig`.
-Files are supplied with `poll_file_ready()` followed by `start_file()`;
-`WriteScheduler` also accepts owned frames with `poll_frame_ready()` followed by
-`start_frame()`. The producer retains its sources and drives admission and output
-in the same task. Dropping a scheduler cancels its operations and releases its
+Files are supplied with `file_ready().await` followed by `enqueue_file()`;
+`WriteScheduler` also accepts owned frames with `frame_ready().await` followed by
+`enqueue_frame()`. `next_event().await` combines readiness and output in one borrow.
+After a readiness event, `accept_file()` and `accept_frame()` reserve further
+admissions without polling I/O again. The producer retains its sources and drives
+admission and output in the same task. Dropping a scheduler cancels its operations and releases its
 budget. `set_window()` updates the caller's configuration.
 
 See the [detailed guide](docs/guide.md) for more on scheduling, buffering,
@@ -50,7 +52,7 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 carbon-io = "0.3.2"
-futures = "0.3" # StreamExt and the executor used in the examples.
+futures = "0.3" # StreamExt, select! and the executor used in the examples.
 ```
 
 Requires Rust 1.85 or newer. Works with any compatible async runtime.
@@ -60,12 +62,30 @@ The Tokio snippets below require Tokio.
 
 Implement `ReadFile<T>` for your file descriptors. Each descriptor declares its
 frame count and opens a stream that yields exactly that many successful frames,
-followed by EOF. Admit each descriptor to `ReadScheduler`, then close file input:
+followed by EOF.
+
+```text
+            poll_file_ready(cx)
+                      │ Ready(Ok(()))
+                enqueue_file(F)
+                      │
+                      ▼
+            ┌──────────────────┐
+            │  ReadScheduler   │ ── next().await ──► Frame (T)
+            │     (Stream)     │
+            └──────────────────┘
+```
+
+Admission follows the Sink pattern: poll readiness, then transfer ownership of
+the file with `enqueue_file(F)`. On `Pending`, the producer keeps the file and waits
+for a wakeup. `close_files()` ends admission; accepted files still drain in order.
+`ReadScheduler` implements `Stream`; `next().await` yields a frame or an error,
+and returns `None` after all accepted files have drained.
 
 ```rust
-use std::{convert::Infallible, error::Error, future::{Ready, ready, poll_fn}, ops::Range, pin::Pin};
-use futures::{executor::block_on, stream, StreamExt};
-use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
+use std::{collections::VecDeque, convert::Infallible, error::Error, future::{Ready, ready}, ops::Range};
+use futures::{executor::block_on, stream};
+use carbon_io::{FrameBudget, ReadEvent, ReadFile, ReadScheduler, SchedulerConfig};
 
 struct File(Range<u32>);
 
@@ -75,7 +95,6 @@ impl ReadFile<u32> for File {
     type Open = Ready<Result<Self::Reader, Self::Error>>;
 
     fn frame_count(&self) -> u32 { self.0.end - self.0.start }
-
     fn open(&self) -> Self::Open {
         ready(Ok(stream::iter(self.0.clone().map(Ok).collect::<Vec<_>>())))
     }
@@ -86,15 +105,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         let budget = FrameBudget::new(64);
         let mut config = SchedulerConfig::default();
         let mut reader = ReadScheduler::new(&budget, &mut config);
-        for file in [File(0..3), File(3..5)] {
-            poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx)).await?;
-            Pin::new(&mut reader).start_file(file)?;
-        }
-        Pin::new(&mut reader).close_files()?;
-
+        let mut files = VecDeque::from([File(0..3), File(3..5)]);
         let mut values = Vec::new();
-        while let Some(frame) = reader.next().await {
-            values.push(frame?);
+
+        while let Some(event) = reader.next_event().await? {
+            match event {
+                ReadEvent::FileReady => {
+                    while !files.is_empty() && reader.accept_file() {
+                        reader.enqueue_file(files.pop_front().unwrap())?;
+                    }
+                    if files.is_empty() {
+                        reader.close_files()?;
+                    }
+                }
+                ReadEvent::Frame(frame) => values.push(frame),
+            }
         }
         assert_eq!(values, [0, 1, 2, 3, 4]);
         Ok(())
@@ -102,39 +127,90 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
+`next_event()` handles file readiness and frame output with one mutable borrow.
+Files stay in the caller's queue until admission is ready. One `FileReady` event
+can admit several files: `accept_file()` reserves a place and returns `true`,
+then `enqueue_file()` transfers ownership. The loop stops on backpressure;
+`next_event()` drives I/O until another event is available. The same operation is
+available as `poll(cx)` when implementing a custom future.
+
 ### Keep reading while the consumer waits
 
-To keep I/O advancing while processing a frame, poll `progress()` alongside
-the consumer's async work:
+When handling `ReadEvent::Frame(frame)`, poll file readiness alongside the TCP
+send. Once the file queue is empty, close admission and switch to `progress()`:
 
 ```ignore
-while let Some(frame) = reader.next().await {
+let sending = write_tcp(frame);
+tokio::pin!(sending);
+loop {
     tokio::select! {
-        result = write_tcp(frame?) => result?,
-        _ = reader.progress() => unreachable!("progress never completes"),
+        result = &mut sending => {
+            result?;
+            break;
+        }
+        ready = async {
+            if files.is_empty() {
+                reader.close_files()?;
+                reader.progress().await;
+            }
+            reader.file_ready().await
+        } => {
+            ready?;
+            while !files.is_empty() && reader.accept_file() {
+                reader.enqueue_file(files.pop_front().unwrap())?;
+            }
+            if files.is_empty() {
+                reader.close_files()?;
+            }
+        }
     }
 }
 ```
 
-`progress()` consumes no frames and never completes. Put this `select!` in the
-task that awaits the consumer.
+`file_ready()` drives I/O without consuming frames. `progress()` does the same
+after admission closes and never completes. The pinned send survives each loop
+turn, so a successful admission does not cancel a partially completed TCP write.
 
 ## Writing files
 
 Implement `WriteFile<T>` to describe a destination and `FrameWriter<T>` to write
 its frames. A destination declares its frame capacity. Its writer accepts frames
-by reference and returns a result after finalization:
+by reference and returns a result after finalization.
+
+```text
+                         poll_file_ready(cx)
+                                   │ Ready(Ok(()))
+                             enqueue_file(F)
+                                   │
+                                   ▼
+                         ┌──────────────────┐
+enqueue_frame(T) ─────────►│  WriteScheduler  │ ── next().await ──► FileResult
+                         │     (Stream)     │
+                         └──────────────────┘
+      ▲
+      │ Ready(Ok(()))
+poll_frame_ready(cx)
+```
+
+Files and frames are injected independently using the Sink pattern. Each
+successful readiness poll reserves one admission; the corresponding `enqueue_*`
+call transfers ownership to the scheduler. On `Pending`, the producer keeps the
+item and waits for a wakeup. Close each input with `close_files()` or
+`close_frames()` when its producer finishes. `WriteScheduler` implements `Stream`;
+`next().await` yields finalization results or errors in destination order, and
+returns `None` after all results have drained.
 
 ```rust
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     error::Error,
-    future::{Ready, ready, poll_fn},
+    future::{Ready, ready},
     pin::Pin,
     task::{Context, Poll},
 };
-use futures::{executor::block_on, StreamExt};
-use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
+use futures::executor::block_on;
+use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteEvent, WriteFile, WriteScheduler};
 
 struct File;
 struct Writer(u32);
@@ -159,7 +235,6 @@ impl FrameWriter<u32> for Writer {
         self.get_mut().0 += frame;
         Poll::Ready(Ok(()))
     }
-
     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>)
         -> Poll<Result<u32, Infallible>>
     {
@@ -172,20 +247,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         let budget = FrameBudget::new(64);
         let mut config = SchedulerConfig::default();
         let mut writer = WriteScheduler::new(&budget, &mut config);
-        for file in [File, File] {
-            poll_fn(|cx| Pin::new(&mut writer).poll_file_ready(cx)).await?;
-            Pin::new(&mut writer).start_file(file)?;
-        }
-        Pin::new(&mut writer).close_files()?;
-        for frame in [1, 2, 3, 4] {
-            poll_fn(|cx| Pin::new(&mut writer).poll_frame_ready(cx)).await?;
-            Pin::new(&mut writer).start_frame(frame)?;
-        }
-        Pin::new(&mut writer).close_frames()?;
-
+        let mut files = VecDeque::from([File, File]);
+        let mut frames = VecDeque::from([1, 2, 3, 4]);
         let mut results = Vec::new();
-        while let Some(result) = writer.next().await {
-            results.push(result?);
+
+        while let Some(event) = writer.next_event().await? {
+            match event {
+                WriteEvent::FileReady => {
+                    while !files.is_empty() && writer.accept_file() {
+                        writer.enqueue_file(files.pop_front().unwrap())?;
+                    }
+                    if files.is_empty() {
+                        writer.close_files()?;
+                    }
+                }
+                WriteEvent::FrameReady => {
+                    while !frames.is_empty() && writer.accept_frame() {
+                        writer.enqueue_frame(frames.pop_front().unwrap())?;
+                    }
+                    if frames.is_empty() {
+                        writer.close_frames()?;
+                        writer.close_files()?;
+                    }
+                }
+                WriteEvent::File(result) => results.push(result),
+            }
         }
         assert_eq!(results, [6, 4]);
         Ok(())
@@ -197,15 +283,19 @@ Input frames fill destinations in order, up to each destination's capacity.
 Destinations open only after receiving a frame. The last file may be partial;
 an empty input opens no file.
 
-If processing a result involves an asynchronous wait, use the same pattern as
-for reads to keep subsequent files writing and finalizing:
+`accept_frame()` reserves budget capacity before `enqueue_frame()` takes the
+frame. It returns `false` when the budget or current destination is unavailable.
+Each successful enqueue consumes its reservation; the next call checks the
+limits again. Calling `accept_file()` or `accept_frame()` repeatedly without an
+enqueue preserves the same reservation. Neither method polls backend I/O.
+
+When handling `WriteEvent::File(result)`, poll `progress()` while processing the
+result to keep accepted files writing and finalizing:
 
 ```ignore
-while let Some(result) = writer.next().await {
-    tokio::select! {
-        outcome = process_result(result?) => outcome?,
-        _ = writer.progress() => unreachable!("progress never completes"),
-    }
+tokio::select! {
+    outcome = process_result(result) => outcome?,
+    _ = writer.progress() => unreachable!("progress never completes"),
 }
 ```
 
@@ -268,6 +358,10 @@ Both schedulers implement `Stream`.
 | Entry point | Behavior |
 | --- | --- |
 | `next().await` / `poll_next(cx)` | Remove the next ordered output, advancing I/O if needed |
+| `next_event().await` / `poll(cx)` | Return input readiness or the next ordered output with one mutable borrow |
+| `file_ready().await` / `frame_ready().await` | Reserve one input admission without consuming output |
+| `accept_file()` / `accept_frame()` | Reserve one admission synchronously, returning a bool without taking an item or polling backend I/O |
+| `enqueue_file(file)` / `enqueue_frame(frame)` | Transfer ownership into a reserved admission |
 | `progress()` | Keep advancing I/O without consuming output; never completes |
 | `poll_progress(cx)` | Advance at most 256 work items from a custom future or stream |
 

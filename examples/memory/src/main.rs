@@ -108,7 +108,7 @@ fn main() {
         let mut reader = ReadScheduler::new(&budget, &mut scheduler_config_1);
         for file in [Source(0..3), Source(3..6)] {
             poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx)).await.unwrap();
-            Pin::new(&mut reader).start_file(file).unwrap();
+            Pin::new(&mut reader).enqueue_file(file).unwrap();
         }
         Pin::new(&mut reader).close_files().unwrap();
         let mut frames = Vec::new();

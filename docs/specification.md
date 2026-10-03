@@ -2109,7 +2109,7 @@ Exemple conceptuel :
 let mut scheduler_config_1 = config;
 let mut scheduler = ReadScheduler::new(&budget, &mut scheduler_config_1);
 poll_fn(|cx| Pin::new(&mut scheduler).poll_file_ready(cx)).await?;
-Pin::new(&mut scheduler).start_file(file)?;
+Pin::new(&mut scheduler).enqueue_file(file)?;
 Pin::new(&mut scheduler).close_files()?;
 
 while let Some(frame) = scheduler.next().await {

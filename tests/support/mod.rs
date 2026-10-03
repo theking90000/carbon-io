@@ -423,7 +423,7 @@ where
                 match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
                     Poll::Ready(Some(file)) => {
                         self.remaining += file.frame_capacity() as usize;
-                        Pin::new(&mut self.scheduler).start_file(file)?;
+                        Pin::new(&mut self.scheduler).enqueue_file(file)?;
                         self.files_wake.ready.store(true, Ordering::Release);
                         advanced = true;
                     }
@@ -454,7 +454,7 @@ where
                                 let _ = Pin::new(&mut self.scheduler).poll_frame_ready(cx)?;
                                 unreachable!("an extra frame must fail destination admission");
                             }
-                            Pin::new(&mut self.scheduler).start_frame(frame)?;
+                            Pin::new(&mut self.scheduler).enqueue_frame(frame)?;
                             self.remaining -= 1;
                             self.input_wake.ready.store(true, Ordering::Release);
                             advanced = true;
@@ -561,7 +561,7 @@ where
         Pin::new(&mut *scheduler).poll_file_ready(&mut cx),
         Poll::Ready(Ok(()))
     ));
-    Pin::new(scheduler).start_file(file).unwrap();
+    Pin::new(scheduler).enqueue_file(file).unwrap();
 }
 pub fn admit_frame<T, F: WriteFile<T>>(
     scheduler: &mut carbon_io::WriteScheduler<'_, T, F>,
@@ -575,7 +575,7 @@ pub fn admit_frame<T, F: WriteFile<T>>(
         Pin::new(&mut *scheduler).poll_frame_ready(&mut cx),
         Poll::Ready(Ok(()))
     ));
-    Pin::new(scheduler).start_frame(frame).unwrap();
+    Pin::new(scheduler).enqueue_frame(frame).unwrap();
 }
 
 /// External descriptor producer for the read regression fixtures.
@@ -642,7 +642,7 @@ where
                     break;
                 }
                 Poll::Ready(Some(file)) => {
-                    Pin::new(&mut self.scheduler).start_file(file)?;
+                    Pin::new(&mut self.scheduler).enqueue_file(file)?;
                     self.source_wake.ready.store(true, Ordering::Release);
                 }
             }
@@ -726,5 +726,5 @@ pub fn admit_read_file<T, F: ReadFile<T>>(
         Pin::new(&mut *scheduler).poll_file_ready(&mut cx),
         Poll::Ready(Ok(()))
     ));
-    Pin::new(scheduler).start_file(file).unwrap();
+    Pin::new(scheduler).enqueue_file(file).unwrap();
 }

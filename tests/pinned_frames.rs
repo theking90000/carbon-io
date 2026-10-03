@@ -50,13 +50,13 @@ fn neither_clone_nor_unpin_is_required_on_frames() {
             Pin::new(&mut s).poll_file_ready(&mut cx),
             Poll::Ready(Ok(()))
         ));
-        Pin::new(&mut s).start_file(File).unwrap();
+        Pin::new(&mut s).enqueue_file(File).unwrap();
         for frame in [Frame(2, PhantomPinned), Frame(3, PhantomPinned)] {
             assert!(matches!(
                 Pin::new(&mut s).poll_frame_ready(&mut cx),
                 Poll::Ready(Ok(()))
             ));
-            Pin::new(&mut s).start_frame(frame).unwrap();
+            Pin::new(&mut s).enqueue_frame(frame).unwrap();
         }
         Pin::new(&mut s).close_files().unwrap();
         Pin::new(&mut s).close_frames().unwrap();
