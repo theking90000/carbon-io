@@ -237,8 +237,10 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         if let Some(error) = this.error.take() {
             return Poll::Ready(Err(error));
         }
-        assert!(!this.terminated && !this.files_closed && !this.frames_closed,
-            "file admission is closed");
+        assert!(
+            !this.terminated && !this.files_closed && !this.frames_closed,
+            "file admission is closed"
+        );
         if this.file_ready {
             return Poll::Ready(Ok(()));
         }
@@ -260,8 +262,10 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
     pub fn start_file(self: Pin<&mut Self>, file: F) -> Result<(), SchedulerError<F::Error>> {
         let this = self.get_mut();
         this.check_error()?;
-        assert!(this.file_ready && !this.files_closed && !this.frames_closed,
-            "start_file requires a successful poll_file_ready");
+        assert!(
+            this.file_ready && !this.files_closed && !this.frames_closed,
+            "start_file requires a successful poll_file_ready"
+        );
         this.file_ready = false;
         let capacity = file.frame_capacity();
         let error = if capacity == 0 {
@@ -326,7 +330,10 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         if let Some(error) = this.error.take() {
             return Poll::Ready(Err(error));
         }
-        assert!(!this.terminated && !this.frames_closed, "frame admission is closed");
+        assert!(
+            !this.terminated && !this.frames_closed,
+            "frame admission is closed"
+        );
         if this.frame_ready.is_some() {
             return Poll::Ready(Ok(()));
         }
@@ -369,7 +376,9 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         let this = self.get_mut();
         this.check_error()?;
         assert!(!this.frames_closed, "frame admission is closed");
-        let id = this.frame_ready.take()
+        let id = this
+            .frame_ready
+            .take()
             .expect("start_frame requires a successful poll_frame_ready");
         let slot = &mut this.slots[id];
         slot.frames.push(frame);
@@ -457,7 +466,9 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         window.validate()?;
         self.config.window = window;
         self.permit.shrink_to(
-            self.permit.capacity().min(window.target_frames.max(self.engaged())),
+            self.permit
+                .capacity()
+                .min(window.target_frames.max(self.engaged())),
         );
         self.budget_waiting = false;
         self.wake();
@@ -516,8 +527,12 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         if self.permit.capacity() > engaged {
             self.permit.shrink_to(engaged);
         }
-        let target = self.config.window.target_frames
-            .max(minimum).min(self.permit.total_capacity());
+        let target = self
+            .config
+            .window
+            .target_frames
+            .max(minimum)
+            .min(self.permit.total_capacity());
         let minimum = if self.replay() {
             minimum
         } else {
@@ -579,7 +594,9 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
                             None
                         }
                     }
-                } else if slot.assigned == slot.capacity || (self.frames_closed && slot.assigned > 0) {
+                } else if slot.assigned == slot.capacity
+                    || (self.frames_closed && slot.assigned > 0)
+                {
                     match writer.poll_finalize(cx) {
                         Poll::Pending => {
                             slot.pending = true;
@@ -667,7 +684,11 @@ impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
         if self.terminated {
             return;
         }
-        if self.waker.as_ref().is_none_or(|old| !old.will_wake(cx.waker())) {
+        if self
+            .waker
+            .as_ref()
+            .is_none_or(|old| !old.will_wake(cx.waker()))
+        {
             self.waker = Some(cx.waker().clone());
         }
         if self.error.is_some() {
@@ -773,7 +794,11 @@ mod tests {
     }
     impl Frame {
         fn new(value: u32, drops: &Rc<Cell<usize>>) -> Self {
-            Self { value, drops: drops.clone(), _pin: PhantomPinned }
+            Self {
+                value,
+                drops: drops.clone(),
+                _pin: PhantomPinned,
+            }
         }
     }
     impl Drop for Frame {
@@ -864,7 +889,10 @@ mod tests {
                 self.open_failures.set(self.open_failures.get() - 1);
                 return ready(Err(Failure::Open));
             }
-            ready(Ok(Writer { file: self.clone(), values: Vec::new() }))
+            ready(Ok(Writer {
+                file: self.clone(),
+                values: Vec::new(),
+            }))
         }
     }
     impl FrameWriter<Frame> for Writer {
@@ -881,7 +909,9 @@ mod tests {
                 return Poll::Pending;
             }
             if this.file.write_failures.get() > 0 {
-                this.file.write_failures.set(this.file.write_failures.get() - 1);
+                this.file
+                    .write_failures
+                    .set(this.file.write_failures.get() - 1);
                 return Poll::Ready(Err(Failure::Write));
             }
             this.values.push(frame.value);
@@ -896,7 +926,9 @@ mod tests {
                 return Poll::Pending;
             }
             if this.file.finalize_failures.get() > 0 {
-                this.file.finalize_failures.set(this.file.finalize_failures.get() - 1);
+                this.file
+                    .finalize_failures
+                    .set(this.file.finalize_failures.get() - 1);
                 return Poll::Ready(Err(Failure::Finalize));
             }
             this.file.finalized.set(this.file.finalized.get() + 1);
@@ -910,11 +942,17 @@ mod tests {
         SchedulerConfig::new(Window::new(target, horizon, active).unwrap(), retries)
     }
     fn file(s: &mut Scheduler<'_>, cx: &mut Context<'_>, file: File) {
-        assert!(matches!(Pin::new(&mut *s).poll_file_ready(cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut *s).poll_file_ready(cx),
+            Poll::Ready(Ok(()))
+        ));
         Pin::new(s).start_file(file).unwrap();
     }
     fn frame(s: &mut Scheduler<'_>, cx: &mut Context<'_>, value: u32, drops: &Rc<Cell<usize>>) {
-        assert!(matches!(Pin::new(&mut *s).poll_frame_ready(cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut *s).poll_frame_ready(cx),
+            Poll::Ready(Ok(()))
+        ));
         Pin::new(s).start_frame(Frame::new(value, drops)).unwrap();
     }
     fn close(s: &mut Scheduler<'_>) {
@@ -935,7 +973,10 @@ mod tests {
         assert!(Pin::new(&mut s).poll_frame_ready(&mut cx).is_pending());
         assert_eq!(budget.available_capacity(), 4);
         file(&mut s, &mut cx, File::new(2));
-        assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_frame_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         assert_eq!(s.retained_frames(), 0);
         close(&mut s);
         assert_eq!(budget.available_capacity(), 4);
@@ -966,7 +1007,10 @@ mod tests {
         let wakes = counter.0.load(Ordering::Relaxed);
         held.shrink_to(0);
         assert!(counter.0.load(Ordering::Relaxed) > wakes);
-        assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_frame_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         assert_eq!(s.granted_frames(), 1);
         assert_eq!(budget.available_capacity(), 0);
         let drops = Rc::new(Cell::new(0));
@@ -995,7 +1039,10 @@ mod tests {
         assert_eq!(s.retained_frames(), 1);
         assert_eq!(drops.get(), 0);
         file_a.writing.open();
-        assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_frame_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         assert_eq!(drops.get(), 1);
         Pin::new(&mut s).start_frame(Frame::new(2, &drops)).unwrap();
         close(&mut s);
@@ -1017,13 +1064,22 @@ mod tests {
             file(&mut s, &mut cx, file_a.clone());
             file(&mut s, &mut cx, File::new(2));
             frame(&mut s, &mut cx, 1, &drops);
-            assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(
+                Pin::new(&mut s).poll_frame_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             file_a.finalizing.open();
             s.poll_progress(&mut cx);
             s.set_window(Window::new(1, 1, 1).unwrap()).unwrap();
             assert!(s.granted_frames() >= 1);
-            assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(Some(Ok(vec![1]))));
-            assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+            assert_eq!(
+                Pin::new(&mut s).poll_next(&mut cx),
+                Poll::Ready(Some(Ok(vec![1])))
+            );
+            assert!(matches!(
+                Pin::new(&mut s).poll_frame_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             Pin::new(&mut s).start_frame(Frame::new(2, &drops)).unwrap();
             close(&mut s);
             assert_eq!(results(&mut s), [vec![2]]);
@@ -1039,7 +1095,10 @@ mod tests {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         file(&mut s, &mut cx, File::new(2));
-        assert!(matches!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_file_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         s.set_window(Window::new(1, 1, 1).unwrap()).unwrap();
         s.poll_progress(&mut cx);
         Pin::new(&mut s).start_file(File::new(2)).unwrap();
@@ -1064,13 +1123,22 @@ mod tests {
         for value in 0..3 {
             frame(&mut s, &mut cx, value, &drops);
         }
-        assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(Some(Ok(vec![0, 1, 2]))));
+        assert_eq!(
+            Pin::new(&mut s).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(vec![0, 1, 2])))
+        );
         assert!(Pin::new(&mut s).poll_file_ready(&mut cx).is_pending());
         for value in 3..8 {
             frame(&mut s, &mut cx, value, &drops);
         }
-        assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(Some(Ok(vec![3, 4, 5, 6, 7]))));
-        assert!(matches!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(
+            Pin::new(&mut s).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(vec![3, 4, 5, 6, 7])))
+        );
+        assert!(matches!(
+            Pin::new(&mut s).poll_file_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         close(&mut s);
         assert!(results(&mut s).is_empty());
         assert_eq!(drops.get(), 8);
@@ -1090,7 +1158,10 @@ mod tests {
         frame(&mut s, &mut cx, 1, &drops);
         assert!(Pin::new(&mut s).poll_file_ready(&mut cx).is_pending());
         file_a.finalizing.open();
-        assert!(matches!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_file_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         Pin::new(&mut s).start_file(File::new(1)).unwrap();
         close(&mut s);
         assert_eq!(results(&mut s), [vec![1]]);
@@ -1135,7 +1206,10 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let drops = Rc::new(Cell::new(0));
         file(&mut s, &mut cx, file_a.clone());
-        assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_frame_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         assert_eq!(s.granted_frames(), 4);
         assert_eq!(budget.available_capacity(), 0);
         Pin::new(&mut s).start_frame(Frame::new(9, &drops)).unwrap();
@@ -1216,7 +1290,10 @@ mod tests {
                 frame(&mut s, &mut cx, 5, &drops);
                 if frames_first {
                     Pin::new(&mut s).close_frames().unwrap();
-                    assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(Some(Ok(vec![5]))));
+                    assert_eq!(
+                        Pin::new(&mut s).poll_next(&mut cx),
+                        Poll::Ready(Some(Ok(vec![5])))
+                    );
                     assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
                     Pin::new(&mut s).close_files().unwrap();
                     assert!(results(&mut s).is_empty());
@@ -1243,7 +1320,10 @@ mod tests {
             let waker = futures::task::noop_waker();
             let mut cx = Context::from_waker(&waker);
             file(&mut s, &mut cx, unused.clone());
-            assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(
+                Pin::new(&mut s).poll_frame_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             assert_eq!(budget.available_capacity(), 0);
             close(&mut s);
             assert!(results(&mut s).is_empty());
@@ -1269,11 +1349,15 @@ mod tests {
             assert_eq!(drops.get(), 1);
             assert_eq!(budget.available_capacity(), 4);
             if via_stream {
-                assert_eq!(Pin::new(&mut s).poll_next(&mut cx),
-                    Poll::Ready(Some(Err(SchedulerError::Backend(Failure::Write)))));
+                assert_eq!(
+                    Pin::new(&mut s).poll_next(&mut cx),
+                    Poll::Ready(Some(Err(SchedulerError::Backend(Failure::Write))))
+                );
             } else {
-                assert_eq!(Pin::new(&mut s).poll_frame_ready(&mut cx),
-                    Poll::Ready(Err(SchedulerError::Backend(Failure::Write))));
+                assert_eq!(
+                    Pin::new(&mut s).poll_frame_ready(&mut cx),
+                    Poll::Ready(Err(SchedulerError::Backend(Failure::Write)))
+                );
             }
             assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
             assert!(s.is_terminated());
@@ -1288,8 +1372,12 @@ mod tests {
         Pin::new(&mut s).close_files().unwrap();
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        assert_eq!(Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Err(SchedulerError::Contract(ContractError::MissingWriteFile))));
+        assert_eq!(
+            Pin::new(&mut s).poll_frame_ready(&mut cx),
+            Poll::Ready(Err(SchedulerError::Contract(
+                ContractError::MissingWriteFile
+            )))
+        );
         assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
     }
 
@@ -1301,13 +1389,19 @@ mod tests {
             let mut s = Scheduler::new(&budget, &mut config);
             let waker = futures::task::noop_waker();
             let mut cx = Context::from_waker(&waker);
-            assert!(matches!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(
+                Pin::new(&mut s).poll_file_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             let expected = if capacity == 0 {
                 ContractError::ZeroFrameCapacity
             } else {
                 ContractError::FrameCapacityExceedsBudget
             };
-            assert_eq!(Pin::new(&mut s).start_file(File::new(capacity)), Err(expected.into()));
+            assert_eq!(
+                Pin::new(&mut s).start_file(File::new(capacity)),
+                Err(expected.into())
+            );
             assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
             assert_eq!(budget.available_capacity(), 4);
         }
@@ -1325,7 +1419,10 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         file(&mut s, &mut cx, file_a);
         frame(&mut s, &mut cx, 0, &drops);
-        assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_frame_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         drop(s);
         assert_eq!(drops.get(), 1);
         assert_eq!(budget.available_capacity(), 4);
@@ -1340,11 +1437,17 @@ mod tests {
             let waker = futures::task::noop_waker();
             let mut cx = Context::from_waker(&waker);
             file(&mut s, &mut cx, File::new(4));
-            assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(
+                Pin::new(&mut s).poll_frame_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             let granted = s.granted_frames();
             let reserved = s.reserved;
             for _ in 0..3 {
-                assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+                assert!(matches!(
+                    Pin::new(&mut s).poll_frame_ready(&mut cx),
+                    Poll::Ready(Ok(()))
+                ));
                 assert_eq!(s.granted_frames(), granted);
                 assert_eq!(s.reserved, reserved);
                 assert_eq!(s.retained_frames(), 0);
@@ -1386,7 +1489,10 @@ mod tests {
             } else {
                 ContractError::InvalidWindow
             };
-            assert_eq!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Err(expected.into())));
+            assert_eq!(
+                Pin::new(&mut s).poll_file_ready(&mut cx),
+                Poll::Ready(Err(expected.into()))
+            );
             assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
         }
     }

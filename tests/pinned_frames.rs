@@ -46,10 +46,16 @@ fn neither_clone_nor_unpin_is_required_on_frames() {
         let mut s = WriteScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        assert!(matches!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut s).poll_file_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         Pin::new(&mut s).start_file(File).unwrap();
         for frame in [Frame(2, PhantomPinned), Frame(3, PhantomPinned)] {
-            assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(
+                Pin::new(&mut s).poll_frame_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             Pin::new(&mut s).start_frame(frame).unwrap();
         }
         Pin::new(&mut s).close_files().unwrap();

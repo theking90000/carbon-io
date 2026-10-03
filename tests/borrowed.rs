@@ -56,15 +56,26 @@ fn push_admissions_wake_the_scheduler_and_update_the_callers_config() {
     let (wakes, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(Pin::new(&mut scheduler).poll_next(&mut cx).is_pending());
-    assert!(matches!(Pin::new(&mut scheduler).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+    assert!(matches!(
+        Pin::new(&mut scheduler).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
     let before = wakes.0.load(Ordering::Relaxed);
     Pin::new(&mut scheduler).start_file(Write::new(4)).unwrap();
     assert!(wakes.0.load(Ordering::Relaxed) > before);
     let drops = Rc::new(Cell::new(0));
     for value in [7, 9] {
-        assert!(matches!(Pin::new(&mut scheduler).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            Pin::new(&mut scheduler).poll_frame_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
         let before = wakes.0.load(Ordering::Relaxed);
-        Pin::new(&mut scheduler).start_frame(Frame { value, drops: drops.clone() }).unwrap();
+        Pin::new(&mut scheduler)
+            .start_frame(Frame {
+                value,
+                drops: drops.clone(),
+            })
+            .unwrap();
         assert!(wakes.0.load(Ordering::Relaxed) > before);
     }
     Pin::new(&mut scheduler).close_frames().unwrap();
@@ -88,7 +99,10 @@ fn dropping_a_writer_preserves_unread_external_frames_and_destinations() {
     let first = Write::new(4);
     first.writing.close();
     let second = Write::new(4);
-    let mut files = pin!(PinnedStream::new(stream::iter([first.clone(), second.clone()])));
+    let mut files = pin!(PinnedStream::new(stream::iter([
+        first.clone(),
+        second.clone()
+    ])));
     let budget = FrameBudget::new(2);
     let mut cfg = config(2, 1, 1, 0);
     let mut scheduler = WriteScheduler::new(&budget, &mut cfg);
@@ -117,10 +131,15 @@ fn write_eof_does_not_poll_or_drop_external_pinned_streams() {
     let mut cfg = config(4, 1, 1, 0);
     {
         let (input, _) = frames(2);
-        let mut input = pin!(Tracked::new(input, input_drops.clone(), input_polls.clone()));
+        let mut input = pin!(Tracked::new(
+            input,
+            input_drops.clone(),
+            input_polls.clone()
+        ));
         let mut files = pin!(Tracked::new(
             stream::iter([Write::new(4), Write::new(4)]),
-            files_drops.clone(), files_polls.clone(),
+            files_drops.clone(),
+            files_polls.clone(),
         ));
         let mut scheduler = WriteScheduler::new(&budget, &mut cfg);
         admit_file(&mut scheduler, block_on(files.as_mut().next()).unwrap());
@@ -153,9 +172,14 @@ fn write_failure_preserves_external_input_and_remaining_files() {
     let mut scheduler = WriteScheduler::new(&budget, &mut cfg);
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(Pin::new(&mut scheduler).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
-    assert_eq!(Pin::new(&mut scheduler).start_file(block_on(files.as_mut().next()).unwrap()),
-        Err(SchedulerError::Contract(ContractError::ZeroFrameCapacity)));
+    assert!(matches!(
+        Pin::new(&mut scheduler).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(
+        Pin::new(&mut scheduler).start_file(block_on(files.as_mut().next()).unwrap()),
+        Err(SchedulerError::Contract(ContractError::ZeroFrameCapacity))
+    );
     assert_eq!(poll(&mut scheduler), Poll::Ready(None));
     assert_eq!(drops.get(), 0);
     assert_eq!(budget.available_capacity(), 4);

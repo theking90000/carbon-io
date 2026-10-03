@@ -375,7 +375,8 @@ where
     I: Stream<Item = T> + Unpin,
     S: Stream + Unpin,
     S::Item: WriteFile<T>,
-{}
+{
+}
 
 impl<'a, T, I, S> WriteDriver<'a, T, I, S>
 where
@@ -403,13 +404,19 @@ where
         }
     }
 
-    fn feed(&mut self, cx: &mut Context<'_>) -> Result<(), carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>> {
+    fn feed(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>> {
         self.input_wake.register(cx);
         self.files_wake.register(cx);
         for turn in 0..64 {
             let mut advanced = false;
             if !self.files_closed && self.files_wake.ready.load(Ordering::Acquire) {
-                if Pin::new(&mut self.scheduler).poll_file_ready(cx)?.is_ready() {
+                if Pin::new(&mut self.scheduler)
+                    .poll_file_ready(cx)?
+                    .is_ready()
+                {
                     self.files_wake.ready.store(false, Ordering::Release);
                     let waker = Waker::from(self.files_wake.clone());
                     match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
@@ -428,13 +435,16 @@ where
                     }
                 }
             }
-            if !self.frames_closed && self.input_wake.ready.load(Ordering::Acquire)
+            if !self.frames_closed
+                && self.input_wake.ready.load(Ordering::Acquire)
                 && (self.remaining > 0 || self.files_closed)
             {
                 // After destination EOF, inspect source EOF before requesting an
                 // admission that would correctly reject an extra data frame.
                 let ready = self.remaining == 0
-                    || Pin::new(&mut self.scheduler).poll_frame_ready(cx)?.is_ready();
+                    || Pin::new(&mut self.scheduler)
+                        .poll_frame_ready(cx)?
+                        .is_ready();
                 if ready {
                     self.input_wake.ready.store(false, Ordering::Release);
                     let waker = Waker::from(self.input_wake.clone());
@@ -485,7 +495,8 @@ where
         std::future::poll_fn(|cx| {
             self.poll_progress(cx);
             Poll::<()>::Pending
-        }).await
+        })
+        .await
     }
 }
 
@@ -496,7 +507,9 @@ where
     S::Item: WriteFile<T>,
 {
     type Target = carbon_io::WriteScheduler<'a, T, S::Item>;
-    fn deref(&self) -> &Self::Target { &self.scheduler }
+    fn deref(&self) -> &Self::Target {
+        &self.scheduler
+    }
 }
 impl<T, I, S> std::ops::DerefMut for WriteDriver<'_, T, I, S>
 where
@@ -504,7 +517,9 @@ where
     S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.scheduler }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scheduler
+    }
 }
 impl<T, I, S> Stream for WriteDriver<'_, T, I, S>
 where
@@ -512,7 +527,10 @@ where
     S: Stream + Unpin,
     S::Item: WriteFile<T>,
 {
-    type Item = Result<<S::Item as WriteFile<T>>::Output, carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>>;
+    type Item = Result<
+        <S::Item as WriteFile<T>>::Output,
+        carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>,
+    >;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         this.poll_progress(cx);
@@ -533,21 +551,29 @@ where
     }
 }
 
-pub fn admit_file<T, F: WriteFile<T>>(
-    scheduler: &mut carbon_io::WriteScheduler<'_, T, F>,
-    file: F,
-) where F::Error: std::fmt::Debug {
+pub fn admit_file<T, F: WriteFile<T>>(scheduler: &mut carbon_io::WriteScheduler<'_, T, F>, file: F)
+where
+    F::Error: std::fmt::Debug,
+{
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(Pin::new(&mut *scheduler).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+    assert!(matches!(
+        Pin::new(&mut *scheduler).poll_file_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
     Pin::new(scheduler).start_file(file).unwrap();
 }
 pub fn admit_frame<T, F: WriteFile<T>>(
     scheduler: &mut carbon_io::WriteScheduler<'_, T, F>,
     frame: T,
-) where F::Error: std::fmt::Debug {
+) where
+    F::Error: std::fmt::Debug,
+{
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(Pin::new(&mut *scheduler).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+    assert!(matches!(
+        Pin::new(&mut *scheduler).poll_frame_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
     Pin::new(scheduler).start_frame(frame).unwrap();
 }
