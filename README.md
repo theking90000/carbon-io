@@ -289,6 +289,30 @@ Each successful enqueue consumes its reservation; the next call checks the
 limits again. Calling `accept_file()` or `accept_frame()` repeatedly without an
 enqueue preserves the same reservation. Neither method polls backend I/O.
 
+Readiness is reported while its reservation remains available. If a producer
+temporarily has no item, exclude that admission from the requested events:
+
+```ignore
+let interest = if frames.is_empty() {
+    Interest::FILES | Interest::RESULTS
+} else {
+    Interest::ALL
+};
+let event = writer.next_event_with_interest(interest).await?;
+```
+
+`Interest::FILES` requests file admission, `FRAMES` requests write-frame
+admission, and `RESULTS` requests ordered outputs. For reads, `RESULTS` yields
+frames. Excluding an interest preserves its existing reservation and prevents
+readiness from being returned repeatedly in a busy loop. Errors and EOF remain
+visible with any mask. An exhausted producer closes its input; a temporarily
+empty producer can be polled alongside this future in `select!`.
+
+Enqueueing after a ready event does not wake the task again. If the last poll
+returned `Pending`, the first enqueue or closure wakes the waiting task; further
+mutations before its next poll share that notification. Backend and budget
+wakers continue notifying the registered task independently.
+
 When handling `WriteEvent::File(result)`, poll `progress()` while processing the
 result to keep accepted files writing and finalizing:
 
@@ -359,6 +383,7 @@ Both schedulers implement `Stream`.
 | --- | --- |
 | `next().await` / `poll_next(cx)` | Remove the next ordered output, advancing I/O if needed |
 | `next_event().await` / `poll(cx)` | Return input readiness or the next ordered output with one mutable borrow |
+| `next_event_with_interest(interest).await` / `poll_with_interest(cx, interest)` | Return only requested event kinds, errors or EOF |
 | `file_ready().await` / `frame_ready().await` | Reserve one input admission without consuming output |
 | `accept_file()` / `accept_frame()` | Reserve one admission synchronously, returning a bool without taking an item or polling backend I/O |
 | `enqueue_file(file)` / `enqueue_frame(frame)` | Transfer ownership into a reserved admission |
@@ -376,6 +401,11 @@ Backends must follow these rules:
 Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Input streams, opening
 futures, readers, and writers may also be `!Unpin`. The crate contains no unsafe
 code.
+
+Invalid admissions return contract errors and release scheduler resources.
+`FramePermit::poll_grow` returns `Poll<Result<(), ContractError>>`; an invalid
+growth request returns `InvalidBudgetRequest` and preserves existing grants or
+waits.
 
 ## Examples and performance
 

@@ -29,6 +29,10 @@ pub enum ContractError {
     ZeroBudget,
     /// The target or active-file limit is zero.
     InvalidWindow,
+    /// A permit growth request violates `minimum <= desired <= total_capacity`.
+    InvalidBudgetRequest,
+    /// Internal read buffering cannot store a frame in its authorized position.
+    InvalidFramePosition,
     /// Admission was attempted after its input closed or the scheduler terminated.
     InputClosed,
     /// An item was supplied without a successful readiness reservation.
@@ -46,8 +50,12 @@ impl fmt::Display for ContractError {
             Self::FrameCapacityExceedsBudget => "replayable file exceeds the global frame budget",
             Self::ZeroBudget => "frame budget must be nonzero",
             Self::InvalidWindow => "target frames and active file limit must be nonzero",
+            Self::InvalidBudgetRequest => {
+                "budget request requires minimum <= desired <= total capacity"
+            }
+            Self::InvalidFramePosition => "frame position is outside the available read buffer",
             Self::InputClosed => "scheduler input is closed",
-            Self::AdmissionNotReady => "admission requires a successful readiness poll",
+            Self::AdmissionNotReady => "admission requires a readiness reservation",
         })
     }
 }

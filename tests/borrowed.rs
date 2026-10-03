@@ -49,7 +49,7 @@ impl<S: Stream> Stream for Tracked<S> {
 }
 
 #[test]
-fn push_admissions_wake_the_scheduler_and_update_the_callers_config() {
+fn ready_admissions_avoid_self_wakes_and_update_the_callers_config() {
     let budget = FrameBudget::new(4);
     let mut cfg = config(4, 4, 1, 0);
     let mut scheduler = WriteScheduler::new(&budget, &mut cfg);
@@ -64,7 +64,7 @@ fn push_admissions_wake_the_scheduler_and_update_the_callers_config() {
     Pin::new(&mut scheduler)
         .enqueue_file(Write::new(4))
         .unwrap();
-    assert!(wakes.0.load(Ordering::Relaxed) > before);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
     let drops = Rc::new(Cell::new(0));
     for value in [7, 9] {
         assert!(matches!(
@@ -78,7 +78,7 @@ fn push_admissions_wake_the_scheduler_and_update_the_callers_config() {
                 drops: drops.clone(),
             })
             .unwrap();
-        assert!(wakes.0.load(Ordering::Relaxed) > before);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), before);
     }
     Pin::new(&mut scheduler).close_frames().unwrap();
     Pin::new(&mut scheduler).close_files().unwrap();

@@ -1,5 +1,5 @@
 use crate::{
-    ContractError, FrameBudget, FramePermit, MAX_POLL_OPS, ReadFile, SchedulerConfig,
+    ContractError, FrameBudget, FramePermit, Interest, MAX_POLL_OPS, ReadFile, SchedulerConfig,
     SchedulerError, Window, ready::ReadyQueue,
 };
 use futures_core::{Stream, stream::FusedStream};
@@ -91,6 +91,7 @@ pub struct ReadScheduler<'a, T, F: ReadFile<T>> {
     free: Vec<usize>,
     ready: ReadyQueue,
     waker: Option<Waker>,
+    wake_armed: bool,
     permit: FramePermit<'a>,
     config: &'a mut SchedulerConfig,
     ring: Vec<Option<T>>,
@@ -146,6 +147,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
             free: Vec::new(),
             ready,
             waker: None,
+            wake_armed: false,
             permit: budget.permit(),
             config,
             ring: Vec::new(),
@@ -188,9 +190,21 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         self.permit.capacity()
     }
 
-    fn wake(&self) {
+    // Mutations notify only a task that last returned Pending, once per poll.
+    fn wake(&mut self) {
+        if !std::mem::take(&mut self.wake_armed) {
+            return;
+        }
         if let Some(waker) = &self.waker {
             waker.wake_by_ref();
+        }
+    }
+    fn wait(&mut self) {
+        if !self.terminated {
+            self.wake_armed = true;
+            if self.ready.has_work() {
+                self.wake();
+            }
         }
     }
     fn reject(&mut self, error: ContractError) -> SchedulerError<F::Error> {
@@ -209,7 +223,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
             self.permit.shrink_to(keep);
         }
     }
-    fn grow(&mut self, cx: &mut Context<'_>) {
+    fn grow(&mut self, cx: &mut Context<'_>) -> Result<(), SchedulerError<F::Error>> {
         let target = self
             .config
             .window
@@ -217,8 +231,8 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
             .min(self.permit.total_capacity());
         if self.permit.capacity() < target {
             let minimum = (self.permit.capacity() + target.min(32)).min(target);
-            if self.permit.poll_grow(cx, minimum, target).is_pending() {
-                return;
+            if self.permit.poll_grow(cx, minimum, target)?.is_pending() {
+                return Ok(());
             }
         }
         if self.ring.len() < self.permit.capacity() {
@@ -230,6 +244,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         if self.permit.capacity() < target {
             self.ready.schedule(BUDGET);
         }
+        Ok(())
     }
     fn allow(&mut self) {
         let mut space = self
@@ -271,7 +286,11 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         if this.terminated || this.files_closed {
             return Poll::Ready(Err(this.reject(ContractError::InputClosed)));
         }
-        this.reserve_file().map(Ok)
+        let result = this.reserve_file().map(Ok);
+        if result.is_pending() {
+            this.wait();
+        }
+        result
     }
 
     fn reserve_file(&mut self) -> Poll<()> {
@@ -312,6 +331,17 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<ReadEvent<T>>, SchedulerError<F::Error>>> {
+        self.poll_with_interest(cx, Interest::ALL)
+    }
+
+    /// Drive I/O and return only requested events, errors or EOF.
+    /// Exclude `Interest::FILES` when no file is currently available, to wait
+    /// without repeatedly receiving `FileReady`. Unconsumed grants persist.
+    pub fn poll_with_interest(
+        &mut self,
+        cx: &mut Context<'_>,
+        interest: Interest,
+    ) -> Poll<Result<Option<ReadEvent<T>>, SchedulerError<F::Error>>> {
         self.drive(cx);
         if let Some(error) = self.error.take() {
             return Poll::Ready(Err(error));
@@ -321,11 +351,14 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         }
         for offset in 0..2 {
             match (self.event_cursor + offset) % 2 {
-                0 if !self.files_closed && self.reserve_file().is_ready() => {
+                0 if interest.contains(Interest::FILES)
+                    && !self.files_closed
+                    && self.reserve_file().is_ready() =>
+                {
                     self.event_cursor = 1;
                     return Poll::Ready(Ok(Some(ReadEvent::FileReady)));
                 }
-                1 => {
+                1 if interest.contains(Interest::RESULTS) => {
                     if let Some(frame) = self.take_frame() {
                         self.event_cursor = 0;
                         return Poll::Ready(Ok(Some(ReadEvent::Frame(frame))));
@@ -334,6 +367,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
                 _ => {}
             }
         }
+        self.wait();
         Poll::Pending
     }
 
@@ -341,6 +375,14 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
     /// Dropping a pending future preserves the scheduler and outstanding admissions.
     pub async fn next_event(&mut self) -> Result<Option<ReadEvent<T>>, SchedulerError<F::Error>> {
         std::future::poll_fn(|cx| self.poll(cx)).await
+    }
+
+    /// Wait for requested events, errors or EOF using one mutable borrow.
+    pub async fn next_event_with_interest(
+        &mut self,
+        interest: Interest,
+    ) -> Result<Option<ReadEvent<T>>, SchedulerError<F::Error>> {
+        std::future::poll_fn(|cx| self.poll_with_interest(cx, interest)).await
     }
 
     /// Transfer ownership of a file reserved by `accept_file`, a readiness poll
@@ -468,9 +510,15 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
                             .start
                             .wrapping_add(slot.received as usize)
                             .wrapping_sub(self.emitted);
-                        let index = (self.head + offset) % self.ring.len();
-                        debug_assert!(self.ring[index].is_none());
-                        self.ring[index] = Some(frame);
+                        if offset >= self.ring.len() {
+                            return Err(ContractError::InvalidFramePosition.into());
+                        }
+                        let index = self.head.wrapping_add(offset) % self.ring.len();
+                        let Some(place) = self.ring.get_mut(index).filter(|place| place.is_none())
+                        else {
+                            return Err(ContractError::InvalidFramePosition.into());
+                        };
+                        *place = Some(frame);
                         slot.received += 1;
                         self.ready.schedule(id + FIRST_SLOT);
                     }
@@ -531,9 +579,11 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
     /// stream poll. Calling this after completion or failure does nothing.
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
         self.drive(cx);
+        self.wait();
     }
 
     fn drive(&mut self, cx: &mut Context<'_>) {
+        self.wake_armed = false;
         if self.terminated {
             return;
         }
@@ -556,9 +606,6 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
         if self.files_closed && self.order.is_empty() {
             self.finish();
             return;
-        }
-        if self.ready.has_work() {
-            cx.waker().wake_by_ref();
         }
     }
 
@@ -588,10 +635,7 @@ impl<'a, T, F: ReadFile<T>> ReadScheduler<'a, T, F> {
             let waker = self.ready.waker(id);
             let mut child = Context::from_waker(&waker);
             let result = match id {
-                BUDGET => {
-                    self.grow(&mut child);
-                    Ok(())
-                }
+                BUDGET => self.grow(&mut child),
                 _ => self.poll_slot(id - FIRST_SLOT, &mut child),
             };
             result?;
@@ -618,6 +662,7 @@ impl<T, F: ReadFile<T>> Stream for ReadScheduler<'_, T, F> {
     type Item = Result<T, SchedulerError<F::Error>>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.wake_armed = false;
         if this.terminated {
             return Poll::Ready(this.error.take().map(Err));
         }
@@ -643,9 +688,7 @@ impl<T, F: ReadFile<T>> Stream for ReadScheduler<'_, T, F> {
             this.finish();
             return Poll::Ready(None);
         }
-        if this.ready.has_work() {
-            cx.waker().wake_by_ref();
-        }
+        this.wait();
         Poll::Pending
     }
 }

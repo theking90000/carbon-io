@@ -1,3 +1,4 @@
+use crate::ContractError;
 use std::{
     collections::VecDeque,
     fmt,
@@ -165,18 +166,26 @@ impl FramePermit<'_> {
     /// Pending requests are FIFO and reserve capacity before waking. Call again
     /// with the same sizes until completion, or call `shrink_to` to cancel.
     ///
-    /// # Panics
-    /// Panics unless `minimum <= desired <= total_capacity()`.
-    pub fn poll_grow(&mut self, cx: &mut Context<'_>, minimum: usize, desired: usize) -> Poll<()> {
-        assert!(minimum <= desired && desired <= self.budget.total);
+    /// Returns `InvalidBudgetRequest` unless
+    /// `minimum <= desired <= total_capacity()`. Invalid requests preserve the
+    /// current grant and any pending valid request.
+    pub fn poll_grow(
+        &mut self,
+        cx: &mut Context<'_>,
+        minimum: usize,
+        desired: usize,
+    ) -> Poll<Result<(), ContractError>> {
+        if minimum > desired || desired > self.budget.total {
+            return Poll::Ready(Err(ContractError::InvalidBudgetRequest));
+        }
         if self.capacity >= minimum {
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
         let mut state = lock(&self.budget.state);
         let mut request = lock(&self.request);
         self.capacity += std::mem::take(&mut request.granted);
         if self.capacity >= minimum {
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
         if request.waiting {
             if request
@@ -194,7 +203,7 @@ impl FramePermit<'_> {
             let grant = if state.available >= want { want } else { need };
             self.capacity += grant;
             state.available -= grant;
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
         request.minimum = need;
         request.desired = want;

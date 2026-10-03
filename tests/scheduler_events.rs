@@ -2,7 +2,7 @@
 mod support;
 
 use carbon_io::{
-    ContractError, FrameBudget, ReadEvent, ReadScheduler, SchedulerError, WriteEvent,
+    ContractError, FrameBudget, Interest, ReadEvent, ReadScheduler, SchedulerError, WriteEvent,
     WriteScheduler,
 };
 use futures::executor::block_on;
@@ -15,6 +15,190 @@ use std::{
     task::{Context, Poll},
 };
 use support::*;
+
+#[test]
+fn ignored_read_admission_waits_and_external_enqueue_wakes_once() {
+    let budget = FrameBudget::new(2);
+    let mut cfg = config(2, 8, 2, 0);
+    let mut reader = ReadScheduler::new(&budget, &mut cfg);
+    let (wakes, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    assert_eq!(
+        reader.poll(&mut cx),
+        Poll::Ready(Ok(Some(ReadEvent::FileReady)))
+    );
+    let before = wakes.0.load(Ordering::Relaxed);
+    for _ in 0..8 {
+        assert!(
+            reader
+                .poll_with_interest(&mut cx, Interest::RESULTS)
+                .is_pending()
+        );
+    }
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
+    // No producer Context is needed: the last waiting task is still notified.
+    reader.enqueue_file(Read::new(0..1)).unwrap();
+    assert!(reader.accept_file());
+    reader.enqueue_file(Read::new(1..2)).unwrap();
+    reader.close_files().unwrap();
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before + 1);
+    assert_eq!(collect(reader), [Ok(0), Ok(1)]);
+}
+
+#[test]
+fn ignored_write_admissions_preserve_grants_and_wake_once_for_a_batch() {
+    let budget = FrameBudget::new(2);
+    let mut cfg = config(2, 8, 2, 0);
+    let mut writer = WriteScheduler::new(&budget, &mut cfg);
+    let drops = Rc::new(Cell::new(0));
+    assert!(writer.accept_file());
+    writer.enqueue_file(Write::new(2)).unwrap();
+    let (wakes, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(
+        writer.poll_with_interest(&mut cx, Interest::FRAMES),
+        Poll::Ready(Ok(Some(WriteEvent::FrameReady)))
+    );
+    let capacity = writer.granted_frames();
+    let before = wakes.0.load(Ordering::Relaxed);
+    for _ in 0..8 {
+        assert!(
+            writer
+                .poll_with_interest(&mut cx, Interest::RESULTS)
+                .is_pending()
+        );
+    }
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
+    assert_eq!(writer.granted_frames(), capacity);
+    for value in [10, 20] {
+        assert!(writer.accept_frame());
+        writer
+            .enqueue_frame(Frame {
+                value,
+                drops: drops.clone(),
+            })
+            .unwrap();
+    }
+    writer.close_frames().unwrap();
+    writer.close_files().unwrap();
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before + 1);
+    assert_eq!(collect(writer), [Ok(vec![10, 20])]);
+    assert_eq!(drops.get(), 2);
+    assert_eq!(budget.available_capacity(), 2);
+}
+
+#[test]
+fn interests_do_not_create_unused_frame_grants_and_keep_rotating() {
+    let budget = FrameBudget::new(2);
+    let mut cfg = config(2, 8, 3, 0);
+    let mut writer = WriteScheduler::new(&budget, &mut cfg);
+    assert!(writer.accept_file());
+    writer.enqueue_file(Write::new(1)).unwrap();
+    let (_, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        writer
+            .poll_with_interest(&mut cx, Interest::RESULTS)
+            .is_pending()
+    );
+    assert_eq!(writer.granted_frames(), 0);
+    assert_eq!(budget.available_capacity(), 2);
+    assert!(writer.accept_frame());
+    writer
+        .enqueue_frame(Frame {
+            value: 7,
+            drops: Rc::new(Cell::new(0)),
+        })
+        .unwrap();
+
+    let interest = Interest::FILES | Interest::RESULTS;
+    assert_eq!(
+        writer.poll_with_interest(&mut cx, interest),
+        Poll::Ready(Ok(Some(WriteEvent::FileReady)))
+    );
+    assert_eq!(
+        writer.poll_with_interest(&mut cx, interest),
+        Poll::Ready(Ok(Some(WriteEvent::File(vec![7]))))
+    );
+    writer.close_frames().unwrap();
+    writer.close_files().unwrap();
+    assert_eq!(
+        writer.poll_with_interest(&mut cx, Interest::NONE),
+        Poll::Ready(Ok(None))
+    );
+}
+
+#[test]
+fn write_admission_misuse_returns_errors_instead_of_panicking() {
+    for scenario in 0..6 {
+        let budget = FrameBudget::new(2);
+        let mut cfg = config(2, 4, 1, 0);
+        let mut writer = WriteScheduler::new(&budget, &mut cfg);
+        let file = Write::new(2);
+        let drops = Rc::new(Cell::new(0));
+        let frame = || Frame {
+            value: 1,
+            drops: drops.clone(),
+        };
+        let (_, waker) = context_waker();
+        let mut cx = Context::from_waker(&waker);
+        let expected = if scenario < 2 {
+            ContractError::AdmissionNotReady
+        } else {
+            ContractError::InputClosed
+        };
+        let result = match scenario {
+            0 => writer.enqueue_file(file.clone()),
+            1 => writer.enqueue_frame(frame()),
+            2 => {
+                writer.close_files().unwrap();
+                writer.enqueue_file(file.clone())
+            }
+            3 => {
+                writer.close_files().unwrap();
+                match writer.poll_file_ready(&mut cx) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => panic!("closed input must return an error"),
+                }
+            }
+            4 => {
+                assert!(writer.accept_file());
+                writer.enqueue_file(file.clone()).unwrap();
+                assert!(writer.accept_frame());
+                writer.close_frames().unwrap();
+                writer.enqueue_frame(frame())
+            }
+            _ => {
+                writer.close_frames().unwrap();
+                match writer.poll_frame_ready(&mut cx) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => panic!("closed input must return an error"),
+                }
+            }
+        };
+        assert_eq!(result, Err(SchedulerError::Contract(expected)));
+        assert_eq!(file.opens.get(), 0);
+        assert_eq!(budget.available_capacity(), 2);
+        assert_eq!(writer.poll(&mut cx), Poll::Ready(Ok(None)));
+        assert_eq!(
+            writer.enqueue_file(file),
+            Err(SchedulerError::Contract(ContractError::InputClosed))
+        );
+        assert_eq!(
+            writer.enqueue_frame(frame()),
+            Err(SchedulerError::Contract(ContractError::InputClosed))
+        );
+        assert_eq!(
+            writer.poll_file_ready(&mut cx),
+            Poll::Ready(Err(SchedulerError::Contract(ContractError::InputClosed)))
+        );
+        assert_eq!(
+            writer.poll_frame_ready(&mut cx),
+            Poll::Ready(Err(SchedulerError::Contract(ContractError::InputClosed)))
+        );
+    }
+}
 
 #[test]
 fn one_read_notification_admits_files_until_the_horizon_or_active_limit() {
@@ -340,13 +524,19 @@ fn event_errors_are_reported_once_then_end() {
     let (_, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
     assert_eq!(
-        reader.poll(&mut cx),
+        reader.poll_with_interest(&mut cx, Interest::NONE),
         Poll::Ready(Err(SchedulerError::Contract(ContractError::ZeroBudget)))
     );
     assert_eq!(
-        writer.poll(&mut cx),
+        writer.poll_with_interest(&mut cx, Interest::NONE),
         Poll::Ready(Err(SchedulerError::Contract(ContractError::ZeroBudget)))
     );
-    assert_eq!(reader.poll(&mut cx), Poll::Ready(Ok(None)));
-    assert_eq!(writer.poll(&mut cx), Poll::Ready(Ok(None)));
+    assert_eq!(
+        reader.poll_with_interest(&mut cx, Interest::NONE),
+        Poll::Ready(Ok(None))
+    );
+    assert_eq!(
+        writer.poll_with_interest(&mut cx, Interest::NONE),
+        Poll::Ready(Ok(None))
+    );
 }

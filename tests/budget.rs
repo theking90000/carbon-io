@@ -1,14 +1,45 @@
 //! Shared capacity, reservation, wakeup, and cancellation regressions.
 mod support;
-use carbon_io::FrameBudget;
+use carbon_io::{ContractError, FrameBudget};
 use futures::Stream;
 use futures::stream;
 use std::{
     pin::Pin,
     sync::{Arc, atomic::Ordering},
-    task::Context,
+    task::{Context, Poll},
 };
 use support::*;
+
+#[test]
+fn invalid_growth_requests_preserve_grants_and_fifo_waits() {
+    let budget = FrameBudget::new(8);
+    let mut owner = budget.permit();
+    let mut waiting = budget.permit();
+    let (_, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(owner.poll_grow(&mut cx, 8, 8), Poll::Ready(Ok(())));
+    assert!(waiting.poll_grow(&mut cx, 4, 8).is_pending());
+    for (minimum, desired) in [(9, 8), (8, 9)] {
+        assert_eq!(
+            waiting.poll_grow(&mut cx, minimum, desired),
+            Poll::Ready(Err(ContractError::InvalidBudgetRequest))
+        );
+    }
+    drop(owner);
+    assert_eq!(budget.available_capacity(), 0);
+    assert_eq!(
+        waiting.poll_grow(&mut cx, 9, 9),
+        Poll::Ready(Err(ContractError::InvalidBudgetRequest))
+    );
+    assert_eq!(waiting.poll_grow(&mut cx, 4, 8), Poll::Ready(Ok(())));
+    assert_eq!(
+        waiting.poll_grow(&mut cx, 2, 1),
+        Poll::Ready(Err(ContractError::InvalidBudgetRequest))
+    );
+    assert_eq!(waiting.capacity(), 8);
+    drop(waiting);
+    assert_eq!(budget.available_capacity(), 8);
+}
 
 #[test]
 fn shared_budget_never_overallocates() {

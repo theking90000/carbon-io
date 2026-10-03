@@ -1,7 +1,7 @@
 //! Reproducible throughput, polling and allocation measurements without a harness.
 use carbon_io::{
-    FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteFile,
-    WriteScheduler,
+    FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteEvent,
+    WriteFile, WriteScheduler,
 };
 use futures::{FutureExt, Stream, StreamExt, stream, task::noop_waker};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
@@ -301,6 +301,51 @@ fn write_case(name: &str, n: usize, size: u32, active: usize, pending: bool, ret
         }))
     })
 }
+fn write_event_case(name: &str, count: usize, batch: usize) {
+    let polls = Rc::new(Cell::new(0));
+    measure(name, count, 1, polls.clone(), || {
+        let budget = FrameBudget::new(64);
+        let mut cfg = config(64, 1, 0);
+        let mut writer = WriteScheduler::new(&budget, &mut cfg);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut next = 0;
+        let mut sum = 0;
+        loop {
+            match writer.poll(&mut cx) {
+                Poll::Ready(Ok(Some(WriteEvent::FileReady))) => {
+                    writer
+                        .enqueue_file(Destination {
+                            count: count as u32,
+                            pending: false,
+                            retry: false,
+                            attempts: Cell::new(0),
+                            polls: polls.clone(),
+                        })
+                        .unwrap();
+                    writer.close_files().unwrap();
+                }
+                Poll::Ready(Ok(Some(WriteEvent::FrameReady))) => {
+                    for _ in 0..batch {
+                        if next == count || !writer.accept_frame() {
+                            break;
+                        }
+                        writer.enqueue_frame(black_box(next as u64)).unwrap();
+                        next += 1;
+                    }
+                    if next == count {
+                        writer.close_frames().unwrap();
+                    }
+                }
+                Poll::Ready(Ok(Some(WriteEvent::File(result)))) => sum += black_box(result),
+                Poll::Ready(Ok(None)) => return sum,
+                Poll::Ready(Err(error)) => panic!("{error:?}"),
+                Poll::Pending => {}
+            }
+        }
+    });
+}
+
 fn shared_case(n: usize) {
     let polls = Rc::new(Cell::new(0));
     measure("shared_four_schedulers", n * 4, 4, polls.clone(), || {
@@ -498,6 +543,8 @@ fn main() {
     write_case("write_multiple_active", 100 * scale, 1024, 32, false, false);
     write_case("write_backpressure", 50 * scale, 256, 16, true, false);
     write_case("write_finalize_retry", 100 * scale, 1024, 32, false, true);
+    write_event_case("write_event_per_frame", 100_000 * scale, 1);
+    write_event_case("write_event_batched", 100_000 * scale, usize::MAX);
     shared_case(25_000 * scale);
     // Initialize the executor outside allocation measurements for both variants.
     futures::executor::block_on(ready(()));

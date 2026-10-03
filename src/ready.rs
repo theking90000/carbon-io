@@ -7,6 +7,12 @@ use std::{
     task::{Wake, Waker},
 };
 
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Shared {
     queue: Mutex<VecDeque<usize>>,
     parent: Mutex<Option<Waker>>,
@@ -27,8 +33,8 @@ impl Wake for Signal {
             return;
         };
         if !self.queued.swap(true, Ordering::AcqRel) {
-            shared.queue.lock().unwrap().push_back(self.id);
-            let parent = shared.parent.lock().unwrap().clone();
+            lock(&shared.queue).push_back(self.id);
+            let parent = lock(&shared.parent).clone();
             if let Some(parent) = parent {
                 parent.wake();
             }
@@ -86,18 +92,47 @@ impl ReadyQueue {
         Waker::from(self.signals[id].clone())
     }
     pub(crate) fn register(&mut self, parent: &Waker) {
-        let mut registered = self.shared.parent.lock().unwrap();
+        let mut registered = lock(&self.shared.parent);
         if registered.as_ref().is_none_or(|old| !old.will_wake(parent)) {
             *registered = Some(parent.clone());
         }
         drop(registered);
-        std::mem::swap(
-            &mut *self.shared.queue.lock().unwrap(),
-            &mut self.notifications,
-        );
+        std::mem::swap(&mut *lock(&self.shared.queue), &mut self.notifications);
         while let Some(id) = self.notifications.pop_front() {
             self.signals[id].queued.store(false, Ordering::Release);
             self.schedule(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_notification_mutexes_still_deliver_work() {
+        let mut queue = ReadyQueue::new();
+        let id = queue.add();
+        let shared = queue.shared.clone();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = lock(&shared.queue);
+                panic!("poison the notification queue");
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = lock(&shared.parent);
+                panic!("poison the parent registration");
+            })
+            .is_err()
+        );
+        let waker = futures::task::noop_waker();
+        queue.register(&waker);
+        queue.waker(id).wake_by_ref();
+        queue.register(&waker);
+        assert_eq!(queue.pop(), Some(id));
+        assert_eq!(queue.pop(), None);
     }
 }

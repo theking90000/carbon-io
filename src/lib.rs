@@ -15,4 +15,36 @@ pub use read::{ReadEvent, ReadScheduler};
 pub use traits::{FrameWriter, ReadFile, WriteFile};
 pub use write::{WriteEvent, WriteScheduler};
 
+/// Events requested from a scheduler, combined with `|`.
+/// Unrequested admissions are neither returned nor newly reserved. Existing
+/// reservations survive interest changes. Errors and EOF are always reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interest(u8);
+
+impl Interest {
+    /// Drive I/O without returning admissions or outputs.
+    pub const NONE: Self = Self(0);
+    /// File admission for either scheduler.
+    pub const FILES: Self = Self(1);
+    /// Frame admission for `WriteScheduler`; ignored by `ReadScheduler`.
+    pub const FRAMES: Self = Self(2);
+    /// Ordered read frames or write finalization results.
+    pub const RESULTS: Self = Self(4);
+    /// All applicable events.
+    pub const ALL: Self = Self(7);
+
+    /// Whether all events in `other` are requested.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for Interest {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 const MAX_POLL_OPS: usize = 256;
