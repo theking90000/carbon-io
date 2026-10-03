@@ -1,7 +1,7 @@
 //! Driving under consumer backpressure, cancellation, and deferred errors.
 mod support;
 
-use carbon_io::{ContractError, FrameBudget, ReadScheduler, SchedulerError, WriteScheduler};
+use carbon_io::{ContractError, FrameBudget, ReadScheduler, SchedulerError};
 use futures::{FutureExt, StreamExt, stream, stream::FusedStream};
 use std::{
     future::{Future, poll_fn},
@@ -64,7 +64,7 @@ fn writes_finish_under_backpressure_but_results_stay_bounded_and_ordered() {
     let mut scheduler_files_2 = stream::iter(files.clone());
     let scheduler_budget_2 = FrameBudget::new(4);
     let mut scheduler_config_2 = config(4, 4, 2, 0);
-    let mut writer = WriteScheduler::new(
+    let mut writer = WriteDriver::new(
         &mut scheduler_input_2,
         &mut scheduler_files_2,
         &scheduler_budget_2,
@@ -143,7 +143,7 @@ fn cancelling_write_drive_preserves_attempt_and_scheduler_drop_releases_frames()
     let mut scheduler_input_4 = input;
     let mut scheduler_files_4 = stream::iter([file.clone()]);
     let mut scheduler_config_4 = config(4, 4, 1, 0);
-    let mut writer = WriteScheduler::new(
+    let mut writer = WriteDriver::new(
         &mut scheduler_input_4,
         &mut scheduler_files_4,
         &budget,
@@ -209,7 +209,7 @@ fn write_drive_releases_resources_on_error_but_delivers_error_once() {
     let mut scheduler_input_6 = input;
     let mut scheduler_files_6 = stream::iter([file.clone()]);
     let mut scheduler_config_6 = config(3, 3, 1, 0);
-    let mut writer = WriteScheduler::new(
+    let mut writer = WriteDriver::new(
         &mut scheduler_input_6,
         &mut scheduler_files_6,
         &budget,
@@ -230,9 +230,10 @@ fn write_drive_releases_resources_on_error_but_delivers_error_once() {
         Poll::Ready(Some(Err(SchedulerError::Backend("finalize"))))
     );
     assert!(writer.is_terminated());
+    let before = wakes.0.load(Ordering::Relaxed);
     assert_eq!(poll(&mut writer), Poll::Ready(None));
     writer.poll_progress(&mut cx);
-    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
 }
 
 #[test]
@@ -249,7 +250,7 @@ fn progress_handles_initial_errors_and_empty_streams() {
         let mut scheduler_input_8 = stream::empty::<Frame>();
         let mut scheduler_files_8 = stream::empty::<Write>();
         let mut scheduler_config_8 = config(1, 1, 1, 0);
-        let mut writer = WriteScheduler::new(
+        let mut writer = WriteDriver::new(
             &mut scheduler_input_8,
             &mut scheduler_files_8,
             &budget,
@@ -257,9 +258,13 @@ fn progress_handles_initial_errors_and_empty_streams() {
         );
         let (wakes, waker) = context_waker();
         let mut cx = Context::from_waker(&waker);
+        reader.poll_progress(&mut cx);
+        writer.poll_progress(&mut cx);
+        let before = wakes.0.load(Ordering::Relaxed);
         for _ in 0..2 {
             reader.poll_progress(&mut cx);
             writer.poll_progress(&mut cx);
+            assert_eq!(wakes.0.load(Ordering::Relaxed), before);
         }
         if capacity == 0 {
             assert!(!reader.is_terminated());
@@ -281,7 +286,7 @@ fn progress_handles_initial_errors_and_empty_streams() {
         assert!(writer.is_terminated());
         assert_eq!(poll(&mut reader), Poll::Ready(None));
         assert_eq!(poll(&mut writer), Poll::Ready(None));
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), before);
     }
 }
 
@@ -311,7 +316,7 @@ fn progress_yields_after_bounded_work_and_can_resume_from_budget_wake() {
     let mut scheduler_files_10 = stream::iter([file.clone()]);
     let scheduler_budget_10 = FrameBudget::new(4);
     let mut scheduler_config_10 = config(4, 4, 1, 0);
-    let mut writer = WriteScheduler::new(
+    let mut writer = WriteDriver::new(
         &mut scheduler_input_10,
         &mut scheduler_files_10,
         &scheduler_budget_10,

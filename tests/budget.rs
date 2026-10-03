@@ -1,6 +1,6 @@
 //! Shared capacity, reservation, wakeup, and cancellation regressions.
 mod support;
-use carbon_io::{FrameBudget, ReadScheduler, WriteScheduler};
+use carbon_io::{FrameBudget, ReadScheduler};
 use futures::Stream;
 use futures::stream;
 use std::{
@@ -148,7 +148,7 @@ fn multiple_read_and_write_schedulers_share_budget() {
     let mut scheduler_input_4 = input;
     let mut scheduler_files_4 = stream::iter([wfile]);
     let mut scheduler_config_4 = config(4, 4, 1, 1);
-    let mut w = WriteScheduler::new(
+    let mut w = WriteDriver::new(
         &mut scheduler_input_4,
         &mut scheduler_files_4,
         &b,
@@ -172,7 +172,7 @@ fn two_replay_writers_do_not_deadlock_with_partial_local_grants() {
     let mut scheduler_input_5 = i1;
     let mut scheduler_files_5 = stream::iter([a.clone()]);
     let mut scheduler_config_5 = config(8, 10, 1, 1);
-    let mut s1 = WriteScheduler::new(
+    let mut s1 = WriteDriver::new(
         &mut scheduler_input_5,
         &mut scheduler_files_5,
         &b,
@@ -181,7 +181,7 @@ fn two_replay_writers_do_not_deadlock_with_partial_local_grants() {
     let mut scheduler_input_6 = i2;
     let mut scheduler_files_6 = stream::iter([c]);
     let mut scheduler_config_6 = config(8, 10, 1, 1);
-    let mut s2 = WriteScheduler::new(
+    let mut s2 = WriteDriver::new(
         &mut scheduler_input_6,
         &mut scheduler_files_6,
         &b,

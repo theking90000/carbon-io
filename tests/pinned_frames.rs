@@ -1,6 +1,6 @@
 //! Frames are movable values even if their type does not implement Unpin or Clone.
 use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
-use futures::{StreamExt, executor::block_on, stream};
+use futures::{StreamExt, executor::block_on};
 use std::{
     convert::Infallible,
     future::{Ready, ready},
@@ -41,17 +41,19 @@ impl FrameWriter<Frame> for Writer {
 #[test]
 fn neither_clone_nor_unpin_is_required_on_frames() {
     for max_retries in [0, 1] {
-        let input = stream::iter([Frame(2, PhantomPinned), Frame(3, PhantomPinned)]);
-        let mut scheduler_input_1 = input;
-        let mut scheduler_files_1 = stream::iter([File]);
         let scheduler_budget_1 = FrameBudget::new(4);
         let mut scheduler_config_1 = SchedulerConfig::default().with_max_retries(max_retries);
-        let mut s = WriteScheduler::new(
-            &mut scheduler_input_1,
-            &mut scheduler_files_1,
-            &scheduler_budget_1,
-            &mut scheduler_config_1,
-        );
+        let mut s = WriteScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(Pin::new(&mut s).poll_file_ready(&mut cx), Poll::Ready(Ok(()))));
+        Pin::new(&mut s).start_file(File).unwrap();
+        for frame in [Frame(2, PhantomPinned), Frame(3, PhantomPinned)] {
+            assert!(matches!(Pin::new(&mut s).poll_frame_ready(&mut cx), Poll::Ready(Ok(()))));
+            Pin::new(&mut s).start_frame(frame).unwrap();
+        }
+        Pin::new(&mut s).close_files().unwrap();
+        Pin::new(&mut s).close_frames().unwrap();
         block_on(async {
             assert_eq!(s.next().await.unwrap().unwrap(), 5);
             assert!(s.next().await.is_none());

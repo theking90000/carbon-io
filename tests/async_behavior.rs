@@ -1,6 +1,6 @@
 //! Waker routing, bounded work, backpressure, and non-starvation tests.
 mod support;
-use carbon_io::{FrameBudget, ReadScheduler, WriteScheduler};
+use carbon_io::{FrameBudget, ReadScheduler};
 use futures::{Stream, StreamExt, stream};
 use std::{
     pin::Pin,
@@ -85,7 +85,7 @@ fn work_budget_yields_to_executor() {
     let mut scheduler_files_4 = stream::iter([f]);
     let scheduler_budget_4 = FrameBudget::new(32);
     let mut scheduler_config_4 = config(32, 10_000, 1, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_4,
         &mut scheduler_files_4,
         &scheduler_budget_4,
@@ -118,7 +118,7 @@ fn write_opens_when_pending_input_wakes_with_first_frame() {
         let mut scheduler_files_5 = stream::iter([f.clone()]);
         let scheduler_budget_5 = FrameBudget::new(4);
         let mut scheduler_config_5 = config(4, 10, 1, retry);
-        let mut s = WriteScheduler::new(
+        let mut s = WriteDriver::new(
             &mut scheduler_input_5,
             &mut scheduler_files_5,
             &scheduler_budget_5,
@@ -164,7 +164,7 @@ fn blocked_writer_does_not_prevent_input_buffering_until_capacity() {
     let mut scheduler_files_7 = stream::iter([f.clone()]);
     let scheduler_budget_7 = FrameBudget::new(100);
     let mut scheduler_config_7 = config(4, 100, 1, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_7,
         &mut scheduler_files_7,
         &scheduler_budget_7,
@@ -244,7 +244,7 @@ fn pending_input_is_not_repolled_when_writers_progress() {
     let mut scheduler_files_9 = stream::iter([f]);
     let scheduler_budget_9 = FrameBudget::new(4);
     let mut scheduler_config_9 = config(4, 10, 1, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_9,
         &mut scheduler_files_9,
         &scheduler_budget_9,

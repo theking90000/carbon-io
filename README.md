@@ -132,11 +132,11 @@ by reference and returns a result after finalization:
 use std::{
     convert::Infallible,
     error::Error,
-    future::{Ready, ready},
+    future::{Ready, ready, poll_fn},
     pin::Pin,
     task::{Context, Poll},
 };
-use futures::{executor::block_on, stream, StreamExt};
+use futures::{executor::block_on, StreamExt};
 use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
 
 struct File;
@@ -172,16 +172,19 @@ impl FrameWriter<u32> for Writer {
 
 fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
-        let mut scheduler_input_1 = stream::iter([1, 2, 3, 4]);
-        let mut scheduler_files_1 = stream::iter([File, File]);
-        let scheduler_budget_1 = FrameBudget::new(64);
-        let mut scheduler_config_1 = SchedulerConfig::default();
-        let mut writer = WriteScheduler::new(
-            &mut scheduler_input_1,
-            &mut scheduler_files_1,
-            &scheduler_budget_1,
-            &mut scheduler_config_1,
-        );
+        let budget = FrameBudget::new(64);
+        let mut config = SchedulerConfig::default();
+        let mut writer = WriteScheduler::new(&budget, &mut config);
+        for file in [File, File] {
+            poll_fn(|cx| Pin::new(&mut writer).poll_file_ready(cx)).await?;
+            Pin::new(&mut writer).start_file(file)?;
+        }
+        Pin::new(&mut writer).close_files()?;
+        for frame in [1, 2, 3, 4] {
+            poll_fn(|cx| Pin::new(&mut writer).poll_frame_ready(cx)).await?;
+            Pin::new(&mut writer).start_frame(frame)?;
+        }
+        Pin::new(&mut writer).close_frames()?;
 
         let mut results = Vec::new();
         while let Some(result) = writer.next().await {

@@ -1,6 +1,6 @@
 //! Scheduler contract regression tests.
 mod support;
-use carbon_io::{ContractError as C, FrameBudget, SchedulerError as E, WriteScheduler};
+use carbon_io::{ContractError as C, FrameBudget, SchedulerError as E};
 use futures::stream;
 use std::task::Poll;
 use support::*;
@@ -15,7 +15,7 @@ fn write_assigns_frames_strictly_by_capacity() {
                 std::pin::pin!(stream::iter([Write::new(4), Write::new(4), Write::new(4)]));
             let scheduler_budget_1 = FrameBudget::new(budget);
             let mut scheduler_config_1 = config(2, 100, 3, retry);
-            let s = WriteScheduler::new(
+            let s = WriteDriver::new(
                 &mut scheduler_input_1,
                 &mut scheduler_files_1,
                 &scheduler_budget_1,
@@ -37,7 +37,7 @@ fn write_starts_writer_on_first_frame() {
     let mut scheduler_files_2 = stream::iter([f.clone()]);
     let scheduler_budget_2 = FrameBudget::new(4);
     let mut scheduler_config_2 = config(4, 10, 2, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_2,
         &mut scheduler_files_2,
         &scheduler_budget_2,
@@ -55,7 +55,7 @@ fn write_does_not_open_destinations_without_frames() {
         let mut scheduler_files_3 = stream::iter(files.clone());
         let scheduler_budget_3 = FrameBudget::new(1000);
         let mut scheduler_config_3 = config(100, 1000, 10, retry);
-        let mut s = WriteScheduler::new(
+        let mut s = WriteDriver::new(
             &mut scheduler_input_3,
             &mut scheduler_files_3,
             &scheduler_budget_3,
@@ -83,7 +83,7 @@ fn write_opens_only_used_lazy_destinations() {
             let mut scheduler_input_4 = input;
             let mut scheduler_files_4 = destinations;
             let mut scheduler_config_4 = config(100, 1000, 10, retry);
-            let results = collect(WriteScheduler::new(
+            let results = collect(WriteDriver::new(
                 &mut scheduler_input_4,
                 &mut scheduler_files_4,
                 &budget,
@@ -117,7 +117,7 @@ fn write_starts_next_writer_when_previous_file_capacity_is_reached() {
     let mut scheduler_files_5 = stream::iter([a.clone(), b.clone()]);
     let scheduler_budget_5 = FrameBudget::new(8);
     let mut scheduler_config_5 = config(8, 100, 2, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_5,
         &mut scheduler_files_5,
         &scheduler_budget_5,
@@ -138,7 +138,7 @@ fn write_allows_multiple_concurrent_writers() {
     let mut scheduler_files_6 = stream::iter([a.clone(), b.clone()]);
     let scheduler_budget_6 = FrameBudget::new(4);
     let mut scheduler_config_6 = config(4, 10, 2, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_6,
         &mut scheduler_files_6,
         &scheduler_budget_6,
@@ -158,7 +158,7 @@ fn write_retains_frames_after_successful_write() {
     let mut scheduler_files_7 = stream::iter([f.clone()]);
     let scheduler_budget_7 = FrameBudget::new(4);
     let mut scheduler_config_7 = config(4, 10, 1, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_7,
         &mut scheduler_files_7,
         &scheduler_budget_7,
@@ -184,7 +184,7 @@ fn zero_retry_drops_each_successful_write_before_finalize() {
     let mut scheduler_files_8 = stream::iter([f.clone()]);
     let scheduler_budget_8 = FrameBudget::new(2);
     let mut scheduler_config_8 = config(2, 100, 1, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_8,
         &mut scheduler_files_8,
         &scheduler_budget_8,
@@ -211,7 +211,7 @@ fn zero_retry_preserves_pending_frames() {
     let mut scheduler_files_9 = stream::iter([f.clone()]);
     let scheduler_budget_9 = FrameBudget::new(2);
     let mut scheduler_config_9 = config(2, 100, 1, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_9,
         &mut scheduler_files_9,
         &scheduler_budget_9,
@@ -233,7 +233,7 @@ fn write_retries_from_first_frame_after_write_error() {
     let mut scheduler_files_10 = stream::iter([f.clone()]);
     let scheduler_budget_10 = FrameBudget::new(4);
     let mut scheduler_config_10 = config(2, 10, 1, 1);
-    let s = WriteScheduler::new(
+    let s = WriteDriver::new(
         &mut scheduler_input_10,
         &mut scheduler_files_10,
         &scheduler_budget_10,
@@ -252,7 +252,7 @@ fn write_retries_from_first_frame_after_finalize_error() {
     let mut scheduler_files_11 = stream::iter([f.clone()]);
     let scheduler_budget_11 = FrameBudget::new(4);
     let mut scheduler_config_11 = config(2, 10, 1, 1);
-    let s = WriteScheduler::new(
+    let s = WriteDriver::new(
         &mut scheduler_input_11,
         &mut scheduler_files_11,
         &scheduler_budget_11,
@@ -271,7 +271,7 @@ fn write_fails_after_max_retries() {
     let mut scheduler_files_12 = stream::iter([f]);
     let scheduler_budget_12 = FrameBudget::new(2);
     let mut scheduler_config_12 = config(2, 10, 1, 1);
-    let s = WriteScheduler::new(
+    let s = WriteDriver::new(
         &mut scheduler_input_12,
         &mut scheduler_files_12,
         &scheduler_budget_12,
@@ -293,7 +293,7 @@ fn write_frees_committed_future_file_before_previous_result_is_ready() {
     let mut scheduler_input_13 = input;
     let mut scheduler_files_13 = stream::iter([a, b]);
     let mut scheduler_config_13 = config(8, 100, 2, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_13,
         &mut scheduler_files_13,
         &budget,
@@ -312,7 +312,7 @@ fn write_handles_partial_final_file() {
     let scheduler_budget_14 = FrameBudget::new(4);
     let mut scheduler_config_14 = config(1, 10, 1, 1);
     assert_eq!(
-        collect(WriteScheduler::new(
+        collect(WriteDriver::new(
             &mut scheduler_input_14,
             &mut scheduler_files_14,
             &scheduler_budget_14,
@@ -331,7 +331,7 @@ fn write_does_not_create_empty_final_file() {
         let mut scheduler_files_15 = stream::iter([a.clone(), b.clone()]);
         let scheduler_budget_15 = FrameBudget::new(8);
         let mut scheduler_config_15 = config(8, 100, 2, 1);
-        let results = collect(WriteScheduler::new(
+        let results = collect(WriteDriver::new(
             &mut scheduler_input_15,
             &mut scheduler_files_15,
             &scheduler_budget_15,
@@ -351,7 +351,7 @@ fn write_fails_when_write_files_run_out() {
         let mut scheduler_files_16 = stream::iter(files);
         let scheduler_budget_16 = FrameBudget::new(4);
         let mut scheduler_config_16 = config(4, 10, 2, 1);
-        let result = collect(WriteScheduler::new(
+        let result = collect(WriteDriver::new(
             &mut scheduler_input_16,
             &mut scheduler_files_16,
             &scheduler_budget_16,
@@ -372,7 +372,7 @@ fn write_rejects_file_larger_than_global_budget() {
     let scheduler_budget_17 = FrameBudget::new(4);
     let mut scheduler_config_17 = config(4, 10, 2, 1);
     assert_eq!(
-        collect(WriteScheduler::new(
+        collect(WriteDriver::new(
             &mut scheduler_input_17,
             &mut scheduler_files_17,
             &scheduler_budget_17,
@@ -390,7 +390,7 @@ fn write_releases_budget_on_drop() {
     let mut scheduler_input_18 = input;
     let mut scheduler_files_18 = stream::iter([f]);
     let mut scheduler_config_18 = config(4, 10, 2, 1);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_18,
         &mut scheduler_files_18,
         &b,
@@ -411,7 +411,7 @@ fn write_accepts_unpin_free_input() {
     let scheduler_budget_19 = FrameBudget::new(4);
     let mut scheduler_config_19 = config(4, 10, 1, 1);
     assert_eq!(
-        collect(WriteScheduler::new(
+        collect(WriteDriver::new(
             &mut scheduler_input_19,
             &mut scheduler_files_19,
             &scheduler_budget_19,
@@ -428,7 +428,7 @@ fn write_rejects_zero_capacity() {
     let scheduler_budget_20 = FrameBudget::new(4);
     let mut scheduler_config_20 = config(4, 10, 1, 0);
     assert_eq!(
-        collect(WriteScheduler::new(
+        collect(WriteDriver::new(
             &mut scheduler_input_20,
             &mut scheduler_files_20,
             &scheduler_budget_20,
@@ -444,7 +444,7 @@ fn write_is_fused_after_failure() {
     let mut scheduler_files_21 = stream::empty::<Write>();
     let scheduler_budget_21 = FrameBudget::new(4);
     let mut scheduler_config_21 = config(4, 10, 1, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_21,
         &mut scheduler_files_21,
         &scheduler_budget_21,
@@ -467,7 +467,7 @@ fn shrinking_zero_retry_window_takes_effect_while_file_is_partial() {
     let mut scheduler_files_22 = stream::iter([file.clone()]);
     let scheduler_budget_22 = FrameBudget::new(16);
     let mut scheduler_config_22 = config(8, 100, 1, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_22,
         &mut scheduler_files_22,
         &scheduler_budget_22,
@@ -493,7 +493,7 @@ fn future_commit_survives_an_earlier_fatal_failure() {
     let mut scheduler_input_23 = input;
     let mut scheduler_files_23 = stream::iter([first.clone(), second.clone()]);
     let mut scheduler_config_23 = config(4, 100, 2, 0);
-    let mut s = WriteScheduler::new(
+    let mut s = WriteDriver::new(
         &mut scheduler_input_23,
         &mut scheduler_files_23,
         &budget,
