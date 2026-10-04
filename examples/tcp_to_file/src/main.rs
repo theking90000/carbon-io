@@ -23,7 +23,7 @@ use tokio::{
 
 const BLOCK: usize = 1 << 16; // 64 KiB per frame.
 const FRAMES_PER_FILE: u32 = 160; // 10 MiB per complete file.
-const PIPELINE_FILES: usize = 2; // Discovery horizon and active-file limit.
+const PIPELINE_FILES: usize = 40; // Discovery horizon and active-file limit.
 const PIPELINE_FRAMES: usize = 400; // Frame budget and local buffering target.
 type Frame = Vec<u8>;
 
