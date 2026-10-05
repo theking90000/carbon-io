@@ -14,8 +14,8 @@ pub use error::{ContractError, SchedulerError};
 pub use read::{ReadEvent, ReadScheduler};
 pub use traits::{ReadFile, WriteFile};
 pub use write::{
-    AsyncFilesWrite, BytesFrameAllocator, BytesPartialFrame, FilesWriteError, FrameAllocator,
-    PartialFrame, WriteError, WriteScheduler, WriteStatus,
+    AsyncFilesWrite, BytesFrameAllocator, BytesPartialFrame, FileCloseResult, FilesWriteError,
+    FrameAllocator, PartialFrame, WriteError, WriteScheduler, WriteStatus,
 };
 
 /// A pending event, an available event, EOF or a scheduler error.

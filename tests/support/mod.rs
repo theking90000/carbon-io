@@ -1,6 +1,8 @@
 #![allow(dead_code)]
-use carbon_io::{FrameWriter, ReadFile, SchedulerConfig, Window, WriteFile};
-use futures::{Stream, stream};
+use carbon_io::{
+    AsyncFilesWrite, FrameAllocator, PartialFrame, ReadFile, SchedulerConfig, Window, WriteFile,
+};
+use futures::Stream;
 use pin_project_lite::pin_project;
 use std::{
     cell::{Cell, RefCell},
@@ -179,18 +181,9 @@ impl Drop for Frame {
         self.drops.set(self.drops.get() + 1);
     }
 }
-pub fn frames(n: usize) -> (impl Stream<Item = Frame> + Unpin, Rc<Cell<usize>>) {
-    let drops = Rc::new(Cell::new(0));
-    let values: Vec<_> = (0..n)
-        .map(|value| Frame {
-            value,
-            drops: drops.clone(),
-        })
-        .collect();
-    (stream::iter(values), drops)
-}
 #[derive(Clone)]
 pub struct Write {
+    attempt: Option<usize>,
     pub capacity: u32,
     pub opens: Rc<Cell<usize>>,
     pub opening: Gate,
@@ -207,6 +200,7 @@ impl Write {
     pub fn new(capacity: u32) -> Self {
         Self {
             capacity,
+            attempt: None,
             opens: Rc::default(),
             opening: Gate::new(true),
             writing: Gate::new(true),
@@ -220,89 +214,150 @@ impl Write {
         }
     }
 }
-pin_project! { pub struct WriteOpen { file: Option<Write>, #[pin] _pin: PhantomPinned } }
-impl Future for WriteOpen {
-    type Output = Result<Writer, &'static str>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let file = this.file.as_ref().unwrap();
-        if !file.opening.ready(cx) {
-            return Poll::Pending;
-        }
-        if file.open_failures.get() > 0 {
-            file.open_failures.set(file.open_failures.get() - 1);
-            return Poll::Ready(Err("open"));
-        }
-        let file = this.file.take().unwrap();
-        let attempt = file.attempts.borrow().len();
-        file.attempts.borrow_mut().push(Vec::new());
-        Poll::Ready(Ok(Writer {
-            file,
-            attempt,
-            _pin: PhantomPinned,
-        }))
-    }
-}
-pin_project! { pub struct Writer { file: Write, attempt: usize, #[pin] _pin: PhantomPinned }
-    impl PinnedDrop for Writer { fn drop(this: Pin<&mut Self>) { this.file.drops.set(this.file.drops.get() + 1); } }
-}
-impl FrameWriter<Frame> for Writer {
+impl WriteFile<Frame> for Write {
     type Error = &'static str;
     type Output = Vec<usize>;
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        frame: &Frame,
-    ) -> Poll<Result<(), Self::Error>> {
-        let this = self.project();
-        if !this.file.writing.ready(cx) {
+    fn frame_capacity(&self) -> u32 {
+        self.capacity
+    }
+    fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        if !this.opening.ready(cx) {
             return Poll::Pending;
         }
-        let mut attempts = this.file.attempts.borrow_mut();
-        let frames = &mut attempts[*this.attempt];
-        if !frames.is_empty() && this.file.write_failures.get() > 0 {
-            this.file
-                .write_failures
-                .set(this.file.write_failures.get() - 1);
+        this.opens.set(this.opens.get() + 1);
+        if this.open_failures.get() > 0 {
+            this.open_failures.set(this.open_failures.get() - 1);
+            return Poll::Ready(Err("open"));
+        }
+        this.attempt = Some(this.attempts.borrow().len());
+        this.attempts.borrow_mut().push(Vec::new());
+        Poll::Ready(Ok(()))
+    }
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &Context<'_>,
+        frame: &Frame,
+    ) -> Poll<Result<(), Self::Error>> {
+        if !self.writing.ready(cx) {
+            return Poll::Pending;
+        }
+        let mut attempts = self.attempts.borrow_mut();
+        let frames = &mut attempts[self.attempt.unwrap()];
+        if !frames.is_empty() && self.write_failures.get() > 0 {
+            self.write_failures.set(self.write_failures.get() - 1);
             return Poll::Ready(Err("write"));
         }
         frames.push(frame.value);
         Poll::Ready(Ok(()))
     }
-    fn poll_finalize(
+    fn poll_close(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &Context<'_>,
     ) -> Poll<Result<Self::Output, Self::Error>> {
-        let this = self.project();
-        if !this.file.finalizing.ready(cx) {
+        if !self.finalizing.ready(cx) {
             return Poll::Pending;
         }
-        if this.file.finalize_failures.get() > 0 {
-            this.file
-                .finalize_failures
-                .set(this.file.finalize_failures.get() - 1);
+        if self.finalize_failures.get() > 0 {
+            self.finalize_failures.set(self.finalize_failures.get() - 1);
             return Poll::Ready(Err("finalize"));
         }
-        this.file.finalized.set(this.file.finalized.get() + 1);
-        Poll::Ready(Ok(this.file.attempts.borrow()[*this.attempt].clone()))
+        self.finalized.set(self.finalized.get() + 1);
+        Poll::Ready(Ok(self.attempts.borrow()[self.attempt.unwrap()].clone()))
     }
 }
-impl WriteFile<Frame> for Write {
-    type Error = &'static str;
-    type Output = Vec<usize>;
-    type Open = WriteOpen;
-    type Writer = Writer;
-    fn frame_capacity(&self) -> u32 {
-        self.capacity
-    }
-    fn open(&self) -> Self::Open {
-        self.opens.set(self.opens.get() + 1);
-        WriteOpen {
-            file: Some(self.clone()),
-            _pin: PhantomPinned,
+impl Drop for Write {
+    fn drop(&mut self) {
+        if self.attempt.is_some() {
+            self.drops.set(self.drops.get() + 1);
         }
     }
 }
+
+pub struct Allocator {
+    pub drops: Rc<Cell<usize>>,
+    pub filling: Gate,
+}
+impl Default for Allocator {
+    fn default() -> Self {
+        Self {
+            drops: Rc::default(),
+            filling: Gate::new(true),
+        }
+    }
+}
+pub struct Partial {
+    frame: Option<Frame>,
+    drops: Rc<Cell<usize>>,
+    filling: Gate,
+}
+impl FrameAllocator for Allocator {
+    type Partial = Partial;
+    fn allocate(&mut self) -> Partial {
+        Partial {
+            frame: None,
+            drops: self.drops.clone(),
+            filling: self.filling.clone(),
+        }
+    }
+}
+impl PartialFrame for Partial {
+    type Input = usize;
+    type Output = ();
+    type Frame = Frame;
+    type Error = std::convert::Infallible;
+    fn poll_fill(&mut self, cx: &Context<'_>, value: &usize) -> Poll<Result<(), Self::Error>> {
+        if !self.filling.ready(cx) {
+            return Poll::Pending;
+        }
+        self.frame = Some(Frame {
+            value: *value,
+            drops: self.drops.clone(),
+        });
+        Poll::Ready(Ok(()))
+    }
+    fn is_complete(&self) -> bool {
+        self.frame.is_some()
+    }
+    fn is_empty(&self) -> bool {
+        self.frame.is_none()
+    }
+    fn finish(self) -> Frame {
+        self.frame.unwrap()
+    }
+}
+pub type Writer<'a> = carbon_io::WriteScheduler<'a, Allocator, Write>;
+pub fn write_value(writer: &mut Writer<'_>, value: usize) {
+    let (_, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    let Poll::Ready(Ok(status)) = Pin::new(writer).poll_write(&cx, &value) else {
+        panic!("value was not accepted");
+    };
+    assert_eq!(status.output, Some(()));
+}
+pub fn close_writer(writer: &mut Writer<'_>) -> Vec<Vec<usize>> {
+    let (counter, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    let mut outputs = Vec::new();
+    for _ in 0..100_000 {
+        let before = counter.0.load(Ordering::Relaxed);
+        match Pin::new(&mut *writer).poll_close(&cx) {
+            Poll::Ready(Ok(0)) => return outputs,
+            Poll::Ready(Ok(count)) => {
+                for _ in 0..count {
+                    outputs.push(writer.pop_file().unwrap().unwrap().1);
+                }
+            }
+            Poll::Ready(Err(error)) => panic!("{error:?}"),
+            Poll::Pending => assert!(
+                counter.0.load(Ordering::Relaxed) > before,
+                "stalled without wakeup"
+            ),
+        }
+    }
+    panic!("writer failed to close");
+}
+
 pin_project! { pub struct PinnedStream<S> { #[pin] inner: S, #[pin] _pin: PhantomPinned } }
 impl<S> PinnedStream<S> {
     pub fn new(inner: S) -> Self {
@@ -317,26 +372,6 @@ impl<S: Stream> Stream for PinnedStream<S> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
     }
-}
-
-/// External producer used by stream-based regression fixtures. Only this test
-/// driver polls the sources; the scheduler receives files and frames by admission.
-pub struct WriteDriver<'a, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-    scheduler: carbon_io::WriteScheduler<'a, T, S::Item>,
-    input: &'a mut I,
-    files: &'a mut S,
-    input_wake: Arc<SourceWake>,
-    files_wake: Arc<SourceWake>,
-    remaining: usize,
-    frames_closed: bool,
-    files_closed: bool,
-    stopped: bool,
-    error: Option<carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>>,
 }
 
 struct SourceWake {
@@ -368,214 +403,6 @@ impl Wake for SourceWake {
             waker.wake();
         }
     }
-}
-
-impl<T, I, S> Unpin for WriteDriver<'_, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-}
-
-impl<'a, T, I, S> WriteDriver<'a, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-    pub fn new(
-        input: &'a mut I,
-        files: &'a mut S,
-        budget: &'a carbon_io::FrameBudget,
-        config: &'a mut SchedulerConfig,
-    ) -> Self {
-        Self {
-            scheduler: carbon_io::WriteScheduler::new(budget, config),
-            input,
-            files,
-            input_wake: SourceWake::new(),
-            files_wake: SourceWake::new(),
-            remaining: 0,
-            frames_closed: false,
-            files_closed: false,
-            stopped: false,
-            error: None,
-        }
-    }
-
-    fn feed(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Result<(), carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>> {
-        self.input_wake.register(cx);
-        self.files_wake.register(cx);
-        for turn in 0..64 {
-            let mut advanced = false;
-            if !self.files_closed
-                && self.files_wake.ready.load(Ordering::Acquire)
-                && Pin::new(&mut self.scheduler)
-                    .poll_file_ready(cx)?
-                    .is_ready()
-            {
-                self.files_wake.ready.store(false, Ordering::Release);
-                let waker = Waker::from(self.files_wake.clone());
-                match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
-                    Poll::Ready(Some(file)) => {
-                        self.remaining += file.frame_capacity() as usize;
-                        Pin::new(&mut self.scheduler).enqueue_file(file)?;
-                        self.files_wake.ready.store(true, Ordering::Release);
-                        advanced = true;
-                    }
-                    Poll::Ready(None) => {
-                        Pin::new(&mut self.scheduler).close_files()?;
-                        self.files_closed = true;
-                        advanced = true;
-                    }
-                    Poll::Pending => {}
-                }
-            }
-            if !self.frames_closed
-                && self.input_wake.ready.load(Ordering::Acquire)
-                && (self.remaining > 0 || self.files_closed)
-            {
-                // After destination EOF, inspect source EOF before requesting an
-                // admission that would correctly reject an extra data frame.
-                let ready = self.remaining == 0
-                    || Pin::new(&mut self.scheduler)
-                        .poll_frame_ready(cx)?
-                        .is_ready();
-                if ready {
-                    self.input_wake.ready.store(false, Ordering::Release);
-                    let waker = Waker::from(self.input_wake.clone());
-                    match Pin::new(&mut *self.input).poll_next(&mut Context::from_waker(&waker)) {
-                        Poll::Ready(Some(frame)) => {
-                            if self.remaining == 0 {
-                                let _ = Pin::new(&mut self.scheduler).poll_frame_ready(cx)?;
-                                unreachable!("an extra frame must fail destination admission");
-                            }
-                            Pin::new(&mut self.scheduler).enqueue_frame(frame)?;
-                            self.remaining -= 1;
-                            self.input_wake.ready.store(true, Ordering::Release);
-                            advanced = true;
-                        }
-                        Poll::Ready(None) => {
-                            Pin::new(&mut self.scheduler).close_frames()?;
-                            Pin::new(&mut self.scheduler).close_files()?;
-                            self.frames_closed = true;
-                            self.files_closed = true;
-                            advanced = true;
-                        }
-                        Poll::Pending => {}
-                    }
-                }
-            }
-            if !advanced {
-                break;
-            }
-            if turn == 63 {
-                cx.waker().wake_by_ref();
-            }
-        }
-        Ok(())
-    }
-
-    pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
-        self.scheduler.poll_progress(cx);
-        if !self.stopped {
-            if let Err(error) = self.feed(cx) {
-                self.error = Some(error);
-                self.stopped = true;
-            }
-        }
-        self.scheduler.poll_progress(cx);
-    }
-
-    pub async fn progress(&mut self) {
-        std::future::poll_fn(|cx| {
-            self.poll_progress(cx);
-            Poll::<()>::Pending
-        })
-        .await
-    }
-}
-
-impl<'a, T, I, S> std::ops::Deref for WriteDriver<'a, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-    type Target = carbon_io::WriteScheduler<'a, T, S::Item>;
-    fn deref(&self) -> &Self::Target {
-        &self.scheduler
-    }
-}
-impl<T, I, S> std::ops::DerefMut for WriteDriver<'_, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.scheduler
-    }
-}
-impl<T, I, S> Stream for WriteDriver<'_, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-    type Item = Result<
-        <S::Item as WriteFile<T>>::Output,
-        carbon_io::SchedulerError<<S::Item as WriteFile<T>>::Error>,
-    >;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        this.poll_progress(cx);
-        if let Some(error) = this.error.take() {
-            return Poll::Ready(Some(Err(error)));
-        }
-        Pin::new(&mut this.scheduler).poll_next(cx)
-    }
-}
-impl<T, I, S> futures::stream::FusedStream for WriteDriver<'_, T, I, S>
-where
-    I: Stream<Item = T> + Unpin,
-    S: Stream + Unpin,
-    S::Item: WriteFile<T>,
-{
-    fn is_terminated(&self) -> bool {
-        self.error.is_none() && self.scheduler.is_terminated()
-    }
-}
-
-pub fn admit_file<T, F: WriteFile<T>>(scheduler: &mut carbon_io::WriteScheduler<'_, T, F>, file: F)
-where
-    F::Error: std::fmt::Debug,
-{
-    let (_, waker) = context_waker();
-    let mut cx = Context::from_waker(&waker);
-    assert!(matches!(
-        Pin::new(&mut *scheduler).poll_file_ready(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
-    Pin::new(scheduler).enqueue_file(file).unwrap();
-}
-pub fn admit_frame<T, F: WriteFile<T>>(
-    scheduler: &mut carbon_io::WriteScheduler<'_, T, F>,
-    frame: T,
-) where
-    F::Error: std::fmt::Debug,
-{
-    let (_, waker) = context_waker();
-    let mut cx = Context::from_waker(&waker);
-    assert!(matches!(
-        Pin::new(&mut *scheduler).poll_frame_ready(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
-    Pin::new(scheduler).enqueue_frame(frame).unwrap();
 }
 
 /// External descriptor producer for the read regression fixtures.

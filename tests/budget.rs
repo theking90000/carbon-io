@@ -166,67 +166,6 @@ fn scheduler_can_shrink() {
     assert_eq!(b.available_capacity(), 60);
 }
 #[test]
-fn multiple_read_and_write_schedulers_share_budget() {
-    let b = FrameBudget::new(8);
-    let rfile = Read::new(0..4);
-    rfile.reading.close();
-    let wfile = Write::new(4);
-    wfile.writing.close();
-    let (input, _) = frames(4);
-    let mut scheduler_files_3 = stream::iter([rfile]);
-    let mut scheduler_config_3 = config(4, 4, 1, 0);
-    let mut r = ReadDriver::new(&mut scheduler_files_3, &b, &mut scheduler_config_3);
-    let mut scheduler_input_4 = input;
-    let mut scheduler_files_4 = stream::iter([wfile]);
-    let mut scheduler_config_4 = config(4, 4, 1, 1);
-    let mut w = WriteDriver::new(
-        &mut scheduler_input_4,
-        &mut scheduler_files_4,
-        &b,
-        &mut scheduler_config_4,
-    );
-    assert!(poll(&mut r).is_pending());
-    assert!(poll(&mut w).is_pending());
-    assert_eq!(r.granted_frames() + w.granted_frames(), 8);
-    drop(r);
-    drop(w);
-    assert_eq!(b.available_capacity(), 8);
-}
-#[test]
-fn two_replay_writers_do_not_deadlock_with_partial_local_grants() {
-    let b = FrameBudget::new(10);
-    let a = Write::new(6);
-    a.finalizing.close();
-    let c = Write::new(6);
-    let (i1, _) = frames(6);
-    let (i2, _) = frames(6);
-    let mut scheduler_input_5 = i1;
-    let mut scheduler_files_5 = stream::iter([a.clone()]);
-    let mut scheduler_config_5 = config(8, 10, 1, 1);
-    let mut s1 = WriteDriver::new(
-        &mut scheduler_input_5,
-        &mut scheduler_files_5,
-        &b,
-        &mut scheduler_config_5,
-    );
-    let mut scheduler_input_6 = i2;
-    let mut scheduler_files_6 = stream::iter([c]);
-    let mut scheduler_config_6 = config(8, 10, 1, 1);
-    let mut s2 = WriteDriver::new(
-        &mut scheduler_input_6,
-        &mut scheduler_files_6,
-        &b,
-        &mut scheduler_config_6,
-    );
-    assert!(poll(&mut s1).is_pending());
-    assert!(poll(&mut s2).is_pending());
-    assert_eq!(s2.retained_frames(), 0);
-    a.finalizing.open();
-    assert_eq!(collect(s1), [Ok((0..6).collect())]);
-    assert_eq!(collect(s2), [Ok((0..6).collect())]);
-    assert_eq!(b.available_capacity(), 10);
-}
-#[test]
 fn small_releases_do_not_cause_unit_grants() {
     let b = FrameBudget::new(128);
     let mut owner = b.permit();
@@ -275,4 +214,62 @@ fn concurrent_permits_conserve_capacity() {
         }
     });
     assert_eq!(b.available_capacity(), 64);
+}
+
+#[test]
+fn multiple_read_and_write_schedulers_share_budget() {
+    use carbon_io::{AsyncFilesWrite, WriteScheduler};
+    let budget = FrameBudget::new(8);
+    let read_file = Read::new(0..4);
+    read_file.reading.close();
+    let mut files = stream::iter([read_file]);
+    let mut read_cfg = config(4, 4, 1, 0);
+    let mut reader = ReadDriver::new(&mut files, &budget, &mut read_cfg);
+    let file = Write::new(4);
+    file.writing.close();
+    let mut write_cfg = config(4, 4, 1, 1);
+    let mut allocator = Allocator::default();
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut write_cfg).unwrap();
+    writer.push_file(file).unwrap();
+    assert!(poll(&mut reader).is_pending());
+    for value in 0..4 {
+        write_value(&mut writer, value);
+    }
+    assert_eq!(reader.granted_frames() + writer.granted_frames(), 8);
+    drop(reader);
+    drop(writer);
+    assert_eq!(budget.available_capacity(), 8);
+}
+
+#[test]
+fn two_replay_writers_do_not_deadlock_with_partial_local_grants() {
+    use carbon_io::{AsyncFilesWrite, WriteScheduler};
+    let budget = FrameBudget::new(10);
+    let first = Write::new(6);
+    first.finalizing.close();
+    let mut cfg1 = config(8, 10, 1, 1);
+    let mut cfg2 = cfg1;
+    let mut allocator1 = Allocator::default();
+    let mut allocator2 = Allocator::default();
+    let mut writer1 = WriteScheduler::new(&mut allocator1, &budget, &mut cfg1).unwrap();
+    let mut writer2 = WriteScheduler::new(&mut allocator2, &budget, &mut cfg2).unwrap();
+    writer1.push_file(first.clone()).unwrap();
+    writer2.push_file(Write::new(6)).unwrap();
+    for value in 0..6 {
+        write_value(&mut writer1, value);
+    }
+    let (wakes, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer1).poll_close(&cx).is_pending());
+    assert!(Pin::new(&mut writer2).poll_write(&cx, &0).is_pending());
+    assert_eq!(writer2.retained_frames(), 0);
+    let before = wakes.0.load(Ordering::Relaxed);
+    first.finalizing.open();
+    assert_eq!(close_writer(&mut writer1), [(0..6).collect::<Vec<_>>()]);
+    assert!(wakes.0.load(Ordering::Relaxed) > before);
+    for value in 0..6 {
+        write_value(&mut writer2, value);
+    }
+    assert_eq!(close_writer(&mut writer2), [(0..6).collect::<Vec<_>>()]);
+    assert_eq!(budget.available_capacity(), 10);
 }

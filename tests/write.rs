@@ -1,509 +1,431 @@
-//! Scheduler contract regression tests.
+//! Write lifecycle, FIFO replacement, replay, buffering, and contract regressions.
 mod support;
-use carbon_io::{ContractError as C, FrameBudget, SchedulerError as E};
-use futures::stream;
-use std::task::Poll;
+use carbon_io::{
+    AsyncFilesWrite, ContractError as C, FrameBudget, WriteError as E, WriteScheduler,
+};
+use std::{
+    pin::Pin,
+    sync::atomic::Ordering,
+    task::{Context, Poll},
+};
 use support::*;
 
 #[test]
-fn write_assigns_frames_strictly_by_capacity() {
+fn write_assigns_frames_strictly_by_capacity_and_handles_partial_final_file() {
     for retry in [0, 2] {
-        for budget in [4, 8, 32] {
-            let (input, _) = frames(10);
-            let mut scheduler_input_1 = input;
-            let mut scheduler_files_1 =
-                std::pin::pin!(stream::iter([Write::new(4), Write::new(4), Write::new(4)]));
-            let scheduler_budget_1 = FrameBudget::new(budget);
-            let mut scheduler_config_1 = config(2, 100, 3, retry);
-            let s = WriteDriver::new(
-                &mut scheduler_input_1,
-                &mut scheduler_files_1,
-                &scheduler_budget_1,
-                &mut scheduler_config_1,
-            );
+        for capacity in [4, 8, 32] {
+            let budget = FrameBudget::new(capacity);
+            let mut cfg = config(2, 100, 3, retry);
+            let mut allocator = Allocator::default();
+            let drops = allocator.drops.clone();
+            let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+            for _ in 0..3 {
+                writer.push_file(Write::new(4)).unwrap();
+            }
+            for value in 0..10 {
+                write_value(&mut writer, value);
+            }
             assert_eq!(
-                collect(s),
-                [Ok(vec![0, 1, 2, 3]), Ok(vec![4, 5, 6, 7]), Ok(vec![8, 9])]
+                close_writer(&mut writer),
+                [vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9]]
             );
+            assert_eq!(drops.get(), 10);
+            assert_eq!(budget.available_capacity(), capacity);
         }
     }
 }
-#[test]
-fn write_starts_writer_on_first_frame() {
-    use futures::StreamExt;
-    let (input, _) = frames(1);
-    let f = Write::new(4);
-    let mut scheduler_input_2 = input.chain(stream::pending());
-    let mut scheduler_files_2 = stream::iter([f.clone()]);
-    let scheduler_budget_2 = FrameBudget::new(4);
-    let mut scheduler_config_2 = config(4, 10, 2, 1);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_2,
-        &mut scheduler_files_2,
-        &scheduler_budget_2,
-        &mut scheduler_config_2,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(*f.attempts.borrow(), [vec![0]]);
-    assert_eq!(f.finalized.get(), 0);
-}
-#[test]
-fn write_does_not_open_destinations_without_frames() {
-    for retry in [0, 2] {
-        let files: Vec<_> = (0..10).map(|_| Write::new(100)).collect();
-        let mut scheduler_input_3 = stream::pending::<Frame>();
-        let mut scheduler_files_3 = stream::iter(files.clone());
-        let scheduler_budget_3 = FrameBudget::new(1000);
-        let mut scheduler_config_3 = config(100, 1000, 10, retry);
-        let mut s = WriteDriver::new(
-            &mut scheduler_input_3,
-            &mut scheduler_files_3,
-            &scheduler_budget_3,
-            &mut scheduler_config_3,
-        );
-        for _ in 0..3 {
-            assert!(poll(&mut s).is_pending());
-        }
-        assert!(files.iter().all(|f| f.opens.get() == 0));
-        assert!(files.iter().all(|f| f.opening.polls() == 0));
-    }
-}
+
 #[test]
 fn write_opens_only_used_lazy_destinations() {
     for retry in [0, 2] {
-        for n in [0, 3, 100, 101] {
-            let mut files = Vec::new();
-            let destinations = stream::iter((0..).map(|_| {
-                let file = Write::new(100);
-                files.push(file.clone());
-                file
-            }));
-            let (input, drops) = frames(n);
+        for count in [0, 3, 100, 101] {
             let budget = FrameBudget::new(1000);
-            let mut scheduler_input_4 = input;
-            let mut scheduler_files_4 = destinations;
-            let mut scheduler_config_4 = config(100, 1000, 10, retry);
-            let results = collect(WriteDriver::new(
-                &mut scheduler_input_4,
-                &mut scheduler_files_4,
-                &budget,
-                &mut scheduler_config_4,
-            ));
-            let values: Vec<_> = (0..n).collect();
+            let mut cfg = config(100, 1000, 10, retry);
+            let mut allocator = Allocator::default();
+            let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+            let files: Vec<_> = (0..10).map(|_| Write::new(100)).collect();
+            for file in &files {
+                writer.push_file(file.clone()).unwrap();
+            }
+            assert!(
+                files
+                    .iter()
+                    .all(|f| f.opens.get() == 0 && f.opening.polls() == 0)
+            );
+            for value in 0..count {
+                write_value(&mut writer, value);
+            }
+            let results = close_writer(&mut writer);
             assert_eq!(
                 results,
-                values
+                (0..count)
+                    .collect::<Vec<_>>()
                     .chunks(100)
-                    .map(|c| Ok(c.to_vec()))
+                    .map(|c| c.to_vec())
                     .collect::<Vec<_>>()
             );
-            let used = n.div_ceil(100);
-            for (i, file) in files.iter().enumerate() {
-                assert_eq!(file.opens.get(), usize::from(i < used));
-                assert_eq!(file.finalized.get(), usize::from(i < used));
+            for (index, file) in files.iter().enumerate() {
+                assert_eq!(file.opens.get(), usize::from(index < count.div_ceil(100)));
+                assert_eq!(
+                    file.finalized.get(),
+                    usize::from(index < count.div_ceil(100))
+                );
             }
-            assert_eq!(drops.get(), n);
             assert_eq!(budget.available_capacity(), 1000);
         }
     }
 }
+
 #[test]
-fn write_starts_next_writer_when_previous_file_capacity_is_reached() {
-    let a = Write::new(4);
-    a.finalizing.close();
-    let b = Write::new(4);
-    let (input, _) = frames(8);
-    let mut scheduler_input_5 = input;
-    let mut scheduler_files_5 = stream::iter([a.clone(), b.clone()]);
-    let scheduler_budget_5 = FrameBudget::new(8);
-    let mut scheduler_config_5 = config(8, 100, 2, 1);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_5,
-        &mut scheduler_files_5,
-        &scheduler_budget_5,
-        &mut scheduler_config_5,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(b.finalized.get(), 1);
-    a.finalizing.open();
-    assert_eq!(collect(s), [Ok(vec![0, 1, 2, 3]), Ok(vec![4, 5, 6, 7])]);
-}
-#[test]
-fn write_allows_multiple_concurrent_writers() {
-    let a = Write::new(2);
-    a.writing.close();
-    let b = Write::new(2);
-    let (input, _) = frames(4);
-    let mut scheduler_input_6 = input;
-    let mut scheduler_files_6 = stream::iter([a.clone(), b.clone()]);
-    let scheduler_budget_6 = FrameBudget::new(4);
-    let mut scheduler_config_6 = config(4, 10, 2, 1);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_6,
-        &mut scheduler_files_6,
-        &scheduler_budget_6,
-        &mut scheduler_config_6,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(b.finalized.get(), 1);
-    a.writing.open();
-    assert_eq!(collect(s).len(), 2);
-}
-#[test]
-fn write_retains_frames_after_successful_write() {
-    let f = Write::new(4);
-    f.finalizing.close();
-    let (input, drops) = frames(4);
-    let mut scheduler_input_7 = input;
-    let mut scheduler_files_7 = stream::iter([f.clone()]);
-    let scheduler_budget_7 = FrameBudget::new(4);
-    let mut scheduler_config_7 = config(4, 10, 1, 1);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_7,
-        &mut scheduler_files_7,
-        &scheduler_budget_7,
-        &mut scheduler_config_7,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(drops.get(), 0);
-    assert_eq!(s.retained_frames(), 4);
-    f.finalizing.open();
-    assert_eq!(collect(s), [Ok(vec![0, 1, 2, 3])]);
-    assert_eq!(drops.get(), 4);
-}
-#[test]
-fn write_releases_frames_only_after_finalize() {
-    write_retains_frames_after_successful_write();
-}
-#[test]
-fn zero_retry_drops_each_successful_write_before_finalize() {
-    let f = Write::new(100);
-    f.finalizing.close();
-    let (input, drops) = frames(100);
-    let mut scheduler_input_8 = input;
-    let mut scheduler_files_8 = stream::iter([f.clone()]);
-    let scheduler_budget_8 = FrameBudget::new(2);
-    let mut scheduler_config_8 = config(2, 100, 1, 0);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_8,
-        &mut scheduler_files_8,
-        &scheduler_budget_8,
-        &mut scheduler_config_8,
-    );
-    for _ in 0..10 {
-        assert!(poll(&mut s).is_pending());
-        if drops.get() == 100 {
-            break;
+fn write_allows_concurrent_files_and_returns_results_in_fifo_order() {
+    for retry in [0, 1] {
+        let budget = FrameBudget::new(4);
+        let mut cfg = config(4, 10, 2, retry);
+        let mut allocator = Allocator::default();
+        let drops = allocator.drops.clone();
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+        let first = Write::new(2);
+        first.finalizing.close();
+        let second = Write::new(2);
+        writer.push_file(first.clone()).unwrap();
+        writer.push_file(second.clone()).unwrap();
+        for value in 0..4 {
+            write_value(&mut writer, value);
         }
+        let (_, waker) = context_waker();
+        let cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
+        assert_eq!(second.finalized.get(), 1);
+        assert!(writer.pop_file().unwrap().is_none());
+        assert_eq!(writer.retained_frames(), if retry == 0 { 0 } else { 2 });
+        assert_eq!(drops.get(), if retry == 0 { 4 } else { 2 });
+        assert_eq!(budget.available_capacity(), if retry == 0 { 4 } else { 2 });
+        first.finalizing.open();
+        assert_eq!(close_writer(&mut writer), [vec![0, 1], vec![2, 3]]);
     }
-    assert_eq!(drops.get(), 100);
-    assert_eq!(s.retained_frames(), 0);
-    assert_eq!(f.finalized.get(), 0);
-    f.finalizing.open();
-    assert_eq!(collect(s), [Ok((0..100).collect())]);
-}
-#[test]
-fn zero_retry_preserves_pending_frames() {
-    let f = Write::new(100);
-    f.writing.close();
-    let (input, drops) = frames(100);
-    let mut scheduler_input_9 = input;
-    let mut scheduler_files_9 = stream::iter([f.clone()]);
-    let scheduler_budget_9 = FrameBudget::new(2);
-    let mut scheduler_config_9 = config(2, 100, 1, 0);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_9,
-        &mut scheduler_files_9,
-        &scheduler_budget_9,
-        &mut scheduler_config_9,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(s.retained_frames(), 2);
-    assert_eq!(drops.get(), 0);
-    f.writing.open();
-    assert_eq!(collect(s), [Ok((0..100).collect())]);
-    assert_eq!(drops.get(), 100);
-}
-#[test]
-fn write_retries_from_first_frame_after_write_error() {
-    let f = Write::new(4);
-    f.write_failures.set(1);
-    let (input, drops) = frames(4);
-    let mut scheduler_input_10 = input;
-    let mut scheduler_files_10 = stream::iter([f.clone()]);
-    let scheduler_budget_10 = FrameBudget::new(4);
-    let mut scheduler_config_10 = config(2, 10, 1, 1);
-    let s = WriteDriver::new(
-        &mut scheduler_input_10,
-        &mut scheduler_files_10,
-        &scheduler_budget_10,
-        &mut scheduler_config_10,
-    );
-    assert_eq!(collect(s), [Ok(vec![0, 1, 2, 3])]);
-    assert_eq!(*f.attempts.borrow(), [vec![0], vec![0, 1, 2, 3]]);
-    assert_eq!(drops.get(), 4);
-}
-#[test]
-fn write_retries_from_first_frame_after_finalize_error() {
-    let f = Write::new(4);
-    f.finalize_failures.set(1);
-    let (input, _) = frames(4);
-    let mut scheduler_input_11 = input;
-    let mut scheduler_files_11 = stream::iter([f.clone()]);
-    let scheduler_budget_11 = FrameBudget::new(4);
-    let mut scheduler_config_11 = config(2, 10, 1, 1);
-    let s = WriteDriver::new(
-        &mut scheduler_input_11,
-        &mut scheduler_files_11,
-        &scheduler_budget_11,
-        &mut scheduler_config_11,
-    );
-    assert_eq!(collect(s), [Ok(vec![0, 1, 2, 3])]);
-    assert_eq!(*f.attempts.borrow(), [vec![0, 1, 2, 3], vec![0, 1, 2, 3]]);
-}
-#[test]
-fn write_fails_after_max_retries() {
-    let f = Write::new(2);
-    f.open_failures.set(1);
-    f.finalize_failures.set(1);
-    let (input, _) = frames(2);
-    let mut scheduler_input_12 = input;
-    let mut scheduler_files_12 = stream::iter([f]);
-    let scheduler_budget_12 = FrameBudget::new(2);
-    let mut scheduler_config_12 = config(2, 10, 1, 1);
-    let s = WriteDriver::new(
-        &mut scheduler_input_12,
-        &mut scheduler_files_12,
-        &scheduler_budget_12,
-        &mut scheduler_config_12,
-    );
-    assert_eq!(collect(s), [Err(E::Backend("finalize"))]);
-}
-#[test]
-fn write_emits_finalize_results_in_file_order() {
-    write_starts_next_writer_when_previous_file_capacity_is_reached();
-}
-#[test]
-fn write_frees_committed_future_file_before_previous_result_is_ready() {
-    let a = Write::new(4);
-    a.finalizing.close();
-    let b = Write::new(4);
-    let (input, drops) = frames(8);
-    let budget = FrameBudget::new(8);
-    let mut scheduler_input_13 = input;
-    let mut scheduler_files_13 = stream::iter([a, b]);
-    let mut scheduler_config_13 = config(8, 100, 2, 1);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_13,
-        &mut scheduler_files_13,
-        &budget,
-        &mut scheduler_config_13,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(drops.get(), 4);
-    assert_eq!(s.retained_frames(), 4);
-    assert_eq!(budget.available_capacity(), 4);
-}
-#[test]
-fn write_handles_partial_final_file() {
-    let (input, _) = frames(2);
-    let mut scheduler_input_14 = input;
-    let mut scheduler_files_14 = stream::iter([Write::new(4)]);
-    let scheduler_budget_14 = FrameBudget::new(4);
-    let mut scheduler_config_14 = config(1, 10, 1, 1);
-    assert_eq!(
-        collect(WriteDriver::new(
-            &mut scheduler_input_14,
-            &mut scheduler_files_14,
-            &scheduler_budget_14,
-            &mut scheduler_config_14,
-        )),
-        [Ok(vec![0, 1])]
-    );
-}
-#[test]
-fn write_does_not_create_empty_final_file() {
-    for n in [0, 4] {
-        let a = Write::new(4);
-        let b = Write::new(4);
-        let (input, _) = frames(n);
-        let mut scheduler_input_15 = input;
-        let mut scheduler_files_15 = stream::iter([a.clone(), b.clone()]);
-        let scheduler_budget_15 = FrameBudget::new(8);
-        let mut scheduler_config_15 = config(8, 100, 2, 1);
-        let results = collect(WriteDriver::new(
-            &mut scheduler_input_15,
-            &mut scheduler_files_15,
-            &scheduler_budget_15,
-            &mut scheduler_config_15,
-        ));
-        assert_eq!(results.len(), usize::from(n > 0));
-        assert_eq!(b.finalized.get(), 0);
-        assert_eq!(a.finalized.get(), usize::from(n > 0));
-    }
-}
-#[test]
-fn write_fails_when_write_files_run_out() {
-    for n in [0, 1, 5] {
-        let (input, _) = frames(n);
-        let files = if n == 5 { vec![Write::new(4)] } else { vec![] };
-        let mut scheduler_input_16 = input;
-        let mut scheduler_files_16 = stream::iter(files);
-        let scheduler_budget_16 = FrameBudget::new(4);
-        let mut scheduler_config_16 = config(4, 10, 2, 1);
-        let result = collect(WriteDriver::new(
-            &mut scheduler_input_16,
-            &mut scheduler_files_16,
-            &scheduler_budget_16,
-            &mut scheduler_config_16,
-        ));
-        if n == 0 {
-            assert!(result.is_empty());
-        } else {
-            assert_eq!(result.last(), Some(&Err(E::Contract(C::MissingWriteFile))));
-        }
-    }
-}
-#[test]
-fn write_rejects_file_larger_than_global_budget() {
-    let (input, _) = frames(1);
-    let mut scheduler_input_17 = input;
-    let mut scheduler_files_17 = stream::iter([Write::new(5)]);
-    let scheduler_budget_17 = FrameBudget::new(4);
-    let mut scheduler_config_17 = config(4, 10, 2, 1);
-    assert_eq!(
-        collect(WriteDriver::new(
-            &mut scheduler_input_17,
-            &mut scheduler_files_17,
-            &scheduler_budget_17,
-            &mut scheduler_config_17,
-        )),
-        [Err(E::Contract(C::FrameCapacityExceedsBudget))]
-    );
-}
-#[test]
-fn write_releases_budget_on_drop() {
-    let f = Write::new(4);
-    f.writing.close();
-    let (input, drops) = frames(4);
-    let b = FrameBudget::new(4);
-    let mut scheduler_input_18 = input;
-    let mut scheduler_files_18 = stream::iter([f]);
-    let mut scheduler_config_18 = config(4, 10, 2, 1);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_18,
-        &mut scheduler_files_18,
-        &b,
-        &mut scheduler_config_18,
-    );
-    assert!(poll(&mut s).is_pending());
-    drop(s);
-    assert_eq!(b.available_capacity(), 4);
-    assert_eq!(drops.get(), 4);
-}
-#[test]
-fn write_accepts_unpin_free_input() {
-    let (input, _) = frames(4);
-    let input = PinnedStream::new(input);
-    let files = PinnedStream::new(stream::iter([Write::new(4)]));
-    let mut scheduler_input_19 = std::pin::pin!(input);
-    let mut scheduler_files_19 = std::pin::pin!(files);
-    let scheduler_budget_19 = FrameBudget::new(4);
-    let mut scheduler_config_19 = config(4, 10, 1, 1);
-    assert_eq!(
-        collect(WriteDriver::new(
-            &mut scheduler_input_19,
-            &mut scheduler_files_19,
-            &scheduler_budget_19,
-            &mut scheduler_config_19,
-        )),
-        [Ok(vec![0, 1, 2, 3])]
-    );
-}
-#[test]
-fn write_rejects_zero_capacity() {
-    let (input, _) = frames(1);
-    let mut scheduler_input_20 = input;
-    let mut scheduler_files_20 = stream::iter([Write::new(0)]);
-    let scheduler_budget_20 = FrameBudget::new(4);
-    let mut scheduler_config_20 = config(4, 10, 1, 0);
-    assert_eq!(
-        collect(WriteDriver::new(
-            &mut scheduler_input_20,
-            &mut scheduler_files_20,
-            &scheduler_budget_20,
-            &mut scheduler_config_20,
-        )),
-        [Err(E::Contract(C::ZeroFrameCapacity))]
-    );
-}
-#[test]
-fn write_is_fused_after_failure() {
-    let (input, _) = frames(1);
-    let mut scheduler_input_21 = input;
-    let mut scheduler_files_21 = stream::empty::<Write>();
-    let scheduler_budget_21 = FrameBudget::new(4);
-    let mut scheduler_config_21 = config(4, 10, 1, 0);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_21,
-        &mut scheduler_files_21,
-        &scheduler_budget_21,
-        &mut scheduler_config_21,
-    );
-    assert_eq!(
-        poll(&mut s),
-        Poll::Ready(Some(Err(E::Contract(C::MissingWriteFile))))
-    );
-    assert_eq!(poll(&mut s), Poll::Ready(None));
 }
 
 #[test]
-fn shrinking_zero_retry_window_takes_effect_while_file_is_partial() {
-    use futures::StreamExt;
+fn replay_retains_frames_until_close_and_streaming_releases_each_success() {
+    for retry in [0, 1] {
+        let budget = FrameBudget::new(4);
+        let mut cfg = config(4, 4, 1, retry);
+        let mut allocator = Allocator::default();
+        let drops = allocator.drops.clone();
+        let file = Write::new(4);
+        file.finalizing.close();
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+        writer.push_file(file.clone()).unwrap();
+        for value in 0..4 {
+            write_value(&mut writer, value);
+        }
+        let (_, waker) = context_waker();
+        assert!(
+            Pin::new(&mut writer)
+                .poll_close(&Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(drops.get(), if retry == 0 { 4 } else { 0 });
+        assert_eq!(writer.retained_frames(), if retry == 0 { 0 } else { 4 });
+        file.finalizing.open();
+        assert_eq!(close_writer(&mut writer), [vec![0, 1, 2, 3]]);
+        assert_eq!(drops.get(), 4);
+        assert_eq!(budget.available_capacity(), 4);
+    }
+}
+
+#[test]
+fn zero_retry_buffers_only_to_capacity_and_resumes_after_backend_wake() {
+    let budget = FrameBudget::new(2);
+    let mut cfg = config(2, 100, 1, 0);
+    let mut allocator = Allocator::default();
+    let drops = allocator.drops.clone();
     let file = Write::new(100);
     file.writing.close();
-    let (input, drops) = frames(8);
-    let mut scheduler_input_22 = input.chain(stream::pending());
-    let mut scheduler_files_22 = stream::iter([file.clone()]);
-    let scheduler_budget_22 = FrameBudget::new(16);
-    let mut scheduler_config_22 = config(8, 100, 1, 0);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_22,
-        &mut scheduler_files_22,
-        &scheduler_budget_22,
-        &mut scheduler_config_22,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(s.retained_frames(), 8);
-    s.set_window(config(2, 100, 1, 0).window).unwrap();
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    writer.push_file(file.clone()).unwrap();
+    write_value(&mut writer, 0);
+    write_value(&mut writer, 1);
+    let (wakes, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer).poll_write(&cx, &2).is_pending());
+    assert_eq!(writer.retained_frames(), 2);
+    assert_eq!(drops.get(), 0);
+    let before = wakes.0.load(Ordering::Relaxed);
     file.writing.open();
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(drops.get(), 8);
-    assert_eq!(s.granted_frames(), 2);
+    assert!(wakes.0.load(Ordering::Relaxed) > before);
+    for value in 2..100 {
+        write_value(&mut writer, value);
+    }
+    assert_eq!(close_writer(&mut writer), [(0..100).collect::<Vec<_>>()]);
+    assert_eq!(drops.get(), 100);
+    assert_eq!(budget.available_capacity(), 2);
+}
+
+#[test]
+fn write_replays_from_first_frame_after_open_write_or_close_error() {
+    for failure in ["open", "write", "finalize"] {
+        let budget = FrameBudget::new(4);
+        let mut cfg = config(2, 10, 1, 1);
+        let mut allocator = Allocator::default();
+        let drops = allocator.drops.clone();
+        let file = Write::new(4);
+        match failure {
+            "open" => file.open_failures.set(1),
+            "write" => file.write_failures.set(1),
+            _ => file.finalize_failures.set(1),
+        }
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+        writer.push_file(file.clone()).unwrap();
+        for value in 0..4 {
+            write_value(&mut writer, value);
+        }
+        assert_eq!(close_writer(&mut writer), [vec![0, 1, 2, 3]]);
+        assert_eq!(file.opens.get(), 2);
+        let attempts = file.attempts.borrow();
+        match failure {
+            "open" => assert_eq!(*attempts, [vec![0, 1, 2, 3]]),
+            "write" => assert_eq!(*attempts, [vec![0], vec![0, 1, 2, 3]]),
+            _ => assert_eq!(*attempts, [vec![0, 1, 2, 3], vec![0, 1, 2, 3]]),
+        }
+        assert_eq!(drops.get(), 4);
+        assert_eq!(budget.available_capacity(), 4);
+    }
+}
+
+#[test]
+fn write_fails_after_max_retries_and_cancels_work() {
+    let budget = FrameBudget::new(2);
+    let mut cfg = config(2, 10, 1, 1);
+    let mut allocator = Allocator::default();
+    let drops = allocator.drops.clone();
+    let file = Write::new(2);
+    file.open_failures.set(1);
+    file.finalize_failures.set(1);
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    writer.push_file(file).unwrap();
+    for value in 0..2 {
+        write_value(&mut writer, value);
+    }
+    let (_, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    assert_eq!(
+        Pin::new(&mut writer).poll_close(&cx),
+        Poll::Ready(Err(E::Backend("finalize")))
+    );
+    assert_eq!(drops.get(), 2);
+    assert_eq!(budget.available_capacity(), 2);
+    assert!(!writer.accept_file());
+    assert_eq!(
+        Pin::new(&mut writer).poll_write(&cx, &2),
+        Poll::Ready(Err(E::Contract(C::InputClosed)))
+    );
+    assert_eq!(
+        Pin::new(&mut writer).poll_close(&cx),
+        Poll::Ready(Err(E::Contract(C::InputClosed)))
+    );
+}
+
+#[test]
+fn rejected_operations_preserve_accepted_work() {
+    let budget = FrameBudget::new(4);
+    let mut cfg = config(4, 10, 1, 1);
+    let mut allocator = Allocator::default();
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    for (capacity, error) in [
+        (0, C::ZeroFrameCapacity),
+        (5, C::FrameCapacityExceedsBudget),
+    ] {
+        assert_eq!(
+            writer.push_file(Write::new(capacity)),
+            Err(E::Contract(error))
+        );
+        assert!(writer.accept_file());
+    }
+    writer.push_file(Write::new(4)).unwrap();
+    assert_eq!(
+        writer.push_file(Write::new(4)),
+        Err(E::Contract(C::AdmissionNotReady))
+    );
+    assert_eq!(
+        writer.pop_swap(Write::new(4)).err(),
+        Some(E::Contract(C::AdmissionNotReady))
+    );
+    assert_eq!(writer.pop_file().err(), Some(E::Contract(C::InputClosed)));
+    assert_eq!(
+        writer.set_window(config(0, 10, 1, 0).window),
+        Err(C::InvalidWindow)
+    );
+    for value in 0..4 {
+        write_value(&mut writer, value);
+    }
+    let (_, waker) = context_waker();
+    let Poll::Ready(Ok(status)) =
+        Pin::new(&mut writer).poll_write(&Context::from_waker(&waker), &4)
+    else {
+        panic!("missing status")
+    };
+    assert_eq!(status.output, None);
+    assert_eq!(status.completed_files, 1);
+    assert_eq!(
+        writer.pop_swap(Write::new(0)).err(),
+        Some(E::Contract(C::ZeroFrameCapacity))
+    );
+    let (previous, output) = writer.pop_swap(Write::new(2)).unwrap();
+    assert_eq!(previous.capacity, 4);
+    assert_eq!(output, [0, 1, 2, 3]);
+    write_value(&mut writer, 4);
+    assert_eq!(close_writer(&mut writer), [vec![4]]);
+    assert_eq!(
+        writer.push_file(Write::new(1)),
+        Err(E::Contract(C::InputClosed))
+    );
+    assert_eq!(
+        writer.pop_swap(Write::new(1)).err(),
+        Some(E::Contract(C::InputClosed))
+    );
+}
+
+#[test]
+fn completed_heads_are_replaced_at_the_tail_before_more_input() {
+    let budget = FrameBudget::new(4);
+    let mut cfg = config(4, 8, 2, 1);
+    let mut allocator = Allocator::default();
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    writer.push_file(Write::new(1)).unwrap();
+    writer.push_file(Write::new(2)).unwrap();
+    let (_, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    let mut outputs = Vec::new();
+    for value in 0..12 {
+        loop {
+            let Poll::Ready(Ok(status)) = Pin::new(&mut writer).poll_write(&cx, &value) else {
+                panic!("stalled")
+            };
+            for _ in 0..status.completed_files {
+                outputs.push(writer.pop_swap(Write::new(2)).unwrap().1);
+            }
+            if status.output.is_some() {
+                break;
+            }
+        }
+    }
+    outputs.extend(close_writer(&mut writer));
+    assert_eq!(outputs.concat(), (0..12).collect::<Vec<_>>());
+    assert_eq!(outputs[0], [0]);
+    assert_eq!(outputs[1], [1, 2]);
+    assert_eq!(budget.available_capacity(), 4);
+}
+
+#[test]
+fn missing_descriptors_are_reported_before_input_is_consumed() {
+    let budget = FrameBudget::new(1);
+    let mut cfg = config(1, 1, 1, 0);
+    let mut allocator = Allocator::default();
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    let (_, waker) = context_waker();
+    let Poll::Ready(Ok(status)) =
+        Pin::new(&mut writer).poll_write(&Context::from_waker(&waker), &7)
+    else {
+        panic!("missing status")
+    };
+    assert_eq!(status.output, None);
+    assert_eq!(status.missing_files, 1);
+    assert_eq!(writer.granted_frames(), 0);
+    writer.push_file(Write::new(1)).unwrap();
+    write_value(&mut writer, 7);
+    assert_eq!(close_writer(&mut writer), [vec![7]]);
+}
+
+#[test]
+fn dropping_writer_cancels_pending_io_and_returns_all_capacity() {
+    for retry in [0, 1] {
+        let budget = FrameBudget::new(4);
+        let mut cfg = config(4, 4, 1, retry);
+        let mut allocator = Allocator::default();
+        let drops = allocator.drops.clone();
+        let file = Write::new(4);
+        file.writing.close();
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+        writer.push_file(file.clone()).unwrap();
+        for value in 0..4 {
+            write_value(&mut writer, value);
+        }
+        let (_, waker) = context_waker();
+        assert!(
+            Pin::new(&mut writer)
+                .poll_write(&Context::from_waker(&waker), &4)
+                .is_pending()
+        );
+        assert_eq!(drops.get(), 0);
+        drop(writer);
+        assert_eq!(drops.get(), 4);
+        assert_eq!(file.drops.get(), 1);
+        assert_eq!(budget.available_capacity(), 4);
+    }
+}
+
+#[test]
+fn shrinking_streaming_window_keeps_pending_frames_and_updates_callers_config() {
+    let budget = FrameBudget::new(16);
+    let mut cfg = config(8, 100, 1, 0);
+    let mut allocator = Allocator::default();
+    let file = Write::new(100);
+    file.writing.close();
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    writer.push_file(file.clone()).unwrap();
+    for value in 0..8 {
+        write_value(&mut writer, value);
+    }
+    let window = config(2, 100, 1, 0).window;
+    writer.set_window(window).unwrap();
+    assert_eq!(writer.retained_frames(), 8);
+    file.writing.open();
+    write_value(&mut writer, 8);
+    assert!(writer.granted_frames() <= 2);
+    assert_eq!(close_writer(&mut writer), [(0..9).collect::<Vec<_>>()]);
+    drop(writer);
+    assert_eq!(cfg.window, window);
 }
 
 #[test]
 fn future_commit_survives_an_earlier_fatal_failure() {
+    let budget = FrameBudget::new(4);
+    let mut cfg = config(4, 4, 2, 0);
+    let mut allocator = Allocator::default();
     let first = Write::new(2);
     first.finalizing.close();
     first.finalize_failures.set(1);
     let second = Write::new(2);
-    let (input, drops) = frames(4);
-    let budget = FrameBudget::new(4);
-    let mut scheduler_input_23 = input;
-    let mut scheduler_files_23 = stream::iter([first.clone(), second.clone()]);
-    let mut scheduler_config_23 = config(4, 100, 2, 0);
-    let mut s = WriteDriver::new(
-        &mut scheduler_input_23,
-        &mut scheduler_files_23,
-        &budget,
-        &mut scheduler_config_23,
-    );
-    assert!(poll(&mut s).is_pending());
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+    writer.push_file(first.clone()).unwrap();
+    writer.push_file(second.clone()).unwrap();
+    for value in 0..4 {
+        write_value(&mut writer, value);
+    }
+    let (_, waker) = context_waker();
+    let cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
     assert_eq!(second.finalized.get(), 1);
     first.finalizing.open();
-    assert_eq!(collect(s), [Err(E::Backend("finalize"))]);
+    assert_eq!(
+        Pin::new(&mut writer).poll_close(&cx),
+        Poll::Ready(Err(E::Backend("finalize")))
+    );
     assert_eq!(second.finalized.get(), 1);
-    assert_eq!(drops.get(), 4);
     assert_eq!(budget.available_capacity(), 4);
+}
+
+#[test]
+fn initial_configuration_errors_are_returned_without_allocation() {
+    for (capacity, target, error) in [(0, 1, C::ZeroBudget), (1, 0, C::InvalidWindow)] {
+        let budget = FrameBudget::new(capacity);
+        let mut cfg = config(target, 1, 1, 0);
+        let mut allocator = Allocator::default();
+        assert_eq!(
+            Writer::new(&mut allocator, &budget, &mut cfg).err(),
+            Some(error)
+        );
+        assert_eq!(budget.available_capacity(), capacity);
+    }
 }

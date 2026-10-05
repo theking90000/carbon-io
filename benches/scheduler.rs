@@ -1,14 +1,14 @@
 //! Reproducible throughput, polling and allocation measurements without a harness.
 use carbon_io::{
-    FrameBudget, FrameWriter, ReadFile, ReadScheduler, SchedulerConfig, Window, WriteEvent,
-    WriteFile, WriteScheduler,
+    AsyncFilesWrite, FrameAllocator, FrameBudget, PartialFrame, ReadFile, ReadScheduler,
+    SchedulerConfig, Window, WriteFile, WriteScheduler,
 };
 use futures::{FutureExt, Stream, StreamExt, stream, task::noop_waker};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use std::{
     alloc::System,
     cell::Cell,
-    future::{Future, Ready, ready},
+    future::{Future, ready},
     hint::black_box,
     pin::Pin,
     rc::Rc,
@@ -96,6 +96,7 @@ struct Destination {
     pending: bool,
     retry: bool,
     attempts: Cell<usize>,
+    writer: Option<Writer>,
     polls: Rc<Cell<usize>>,
 }
 struct Writer {
@@ -108,28 +109,24 @@ struct Writer {
 impl WriteFile<u64> for Destination {
     type Error = ();
     type Output = u64;
-    type Open = Ready<Result<Writer, ()>>;
-    type Writer = Writer;
     fn frame_capacity(&self) -> u32 {
         self.count
     }
-    fn open(&self) -> Self::Open {
-        let attempt = self.attempts.get();
-        self.attempts.set(attempt + 1);
-        ready(Ok(Writer {
-            sum: 0,
-            pending: self.pending,
-            waiting: self.pending,
-            fail: self.retry && attempt == 0,
-            polls: self.polls.clone(),
-        }))
-    }
-}
-impl FrameWriter<u64> for Writer {
-    type Error = ();
-    type Output = u64;
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &u64) -> Poll<Result<(), ()>> {
+    fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), ()>> {
         let this = self.get_mut();
+        let attempt = this.attempts.get();
+        this.attempts.set(attempt + 1);
+        this.writer = Some(Writer {
+            sum: 0,
+            pending: this.pending,
+            waiting: this.pending,
+            fail: this.retry && attempt == 0,
+            polls: this.polls.clone(),
+        });
+        Poll::Ready(Ok(()))
+    }
+    fn poll_write(self: Pin<&mut Self>, cx: &Context<'_>, frame: &u64) -> Poll<Result<(), ()>> {
+        let this = self.get_mut().writer.as_mut().unwrap();
         this.polls.set(this.polls.get() + 1);
         if this.waiting {
             this.waiting = false;
@@ -140,9 +137,37 @@ impl FrameWriter<u64> for Writer {
         this.waiting = this.pending;
         Poll::Ready(Ok(()))
     }
-    fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u64, ()>> {
-        self.polls.set(self.polls.get() + 1);
-        Poll::Ready(if self.fail { Err(()) } else { Ok(self.sum) })
+    fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<u64, ()>> {
+        let this = self.get_mut().writer.as_ref().unwrap();
+        this.polls.set(this.polls.get() + 1);
+        Poll::Ready(if this.fail { Err(()) } else { Ok(this.sum) })
+    }
+}
+struct Allocator;
+struct Partial(Option<u64>);
+impl FrameAllocator for Allocator {
+    type Partial = Partial;
+    fn allocate(&mut self) -> Partial {
+        Partial(None)
+    }
+}
+impl PartialFrame for Partial {
+    type Input = u64;
+    type Output = ();
+    type Frame = u64;
+    type Error = std::convert::Infallible;
+    fn poll_fill(&mut self, _: &Context<'_>, input: &u64) -> Poll<Result<(), Self::Error>> {
+        self.0 = Some(*input);
+        Poll::Ready(Ok(()))
+    }
+    fn is_complete(&self) -> bool {
+        self.0.is_some()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+    fn finish(self) -> u64 {
+        self.0.unwrap()
     }
 }
 fn config(target: usize, active: usize, retries: u32) -> SchedulerConfig {
@@ -227,45 +252,39 @@ fn read_case(name: &str, n: usize, size: u32, active: usize, pending: bool) {
         }))
     })
 }
-// Feed benchmark inputs from the calling task, including during consumer waits.
-fn feed_writer(
-    writer: &mut WriteScheduler<'_, u64, Destination>,
+// The caller owns input production, FIFO replacement, and close-result consumption.
+fn poll_writer(
+    writer: &mut WriteScheduler<'_, Allocator, Destination>,
     files: &mut impl Iterator<Item = Destination>,
     next: &mut u64,
     total: u64,
-    files_closed: &mut bool,
-    cx: &mut Context<'_>,
-) -> Result<(), carbon_io::SchedulerError<()>> {
-    for turn in 0..64 {
-        let mut advanced = false;
-        if !*files_closed && Pin::new(&mut *writer).poll_file_ready(cx)?.is_ready() {
-            match files.next() {
-                Some(file) => Pin::new(&mut *writer).enqueue_file(file)?,
-                None => {
-                    Pin::new(&mut *writer).close_files()?;
-                    *files_closed = true;
-                }
-            }
-            advanced = true;
+    batch: usize,
+    cx: &Context<'_>,
+) -> Poll<Option<Result<u64, carbon_io::WriteError<std::convert::Infallible, ()>>>> {
+    while writer.accept_file() {
+        writer.push_file(files.next().unwrap())?;
+    }
+    for _ in 0..batch {
+        if *next == total {
+            return match Pin::new(&mut *writer).poll_close(cx)? {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(0) => Poll::Ready(None),
+                Poll::Ready(_) => Poll::Ready(Some(Ok(writer.pop_file()?.unwrap().1))),
+            };
         }
-        if *next < total && Pin::new(&mut *writer).poll_frame_ready(cx)?.is_ready() {
-            Pin::new(&mut *writer).enqueue_frame(*next)?;
+        let status = match Pin::new(&mut *writer).poll_write(cx, &black_box(*next))? {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(status) => status,
+        };
+        if status.output.is_some() {
             *next += 1;
-            advanced = true;
-            if *next == total {
-                Pin::new(&mut *writer).close_frames()?;
-                Pin::new(&mut *writer).close_files()?;
-                *files_closed = true;
-            }
         }
-        if !advanced {
-            break;
-        }
-        if turn == 63 {
-            cx.waker().wake_by_ref();
+        if status.completed_files > 0 {
+            return Poll::Ready(Some(Ok(writer.pop_swap(files.next().unwrap())?.1)));
         }
     }
-    Ok(())
+    cx.waker().wake_by_ref();
+    Poll::Pending
 }
 
 fn write_case(name: &str, n: usize, size: u32, active: usize, pending: bool, retry: bool) {
@@ -274,75 +293,45 @@ fn write_case(name: &str, n: usize, size: u32, active: usize, pending: bool, ret
     let target = (active * size as usize).clamp(1, 4096);
     let budget = target.max(if retry { size as usize } else { 1 });
     measure(name, count, n, polls.clone(), || {
-        let mut files = (0..n).map(|_| Destination {
+        let mut files = (0..).map(|_| Destination {
             count: size,
             pending,
             retry,
             attempts: Cell::new(0),
+            writer: None,
             polls: polls.clone(),
         });
         let scheduler_budget_2 = FrameBudget::new(budget);
         let mut scheduler_config_2 = config(target, active, u32::from(retry));
-        let mut writer = WriteScheduler::new(&scheduler_budget_2, &mut scheduler_config_2);
+        let mut allocator = Allocator;
+        let mut writer =
+            WriteScheduler::new(&mut allocator, &scheduler_budget_2, &mut scheduler_config_2)
+                .unwrap();
         let mut next = 0;
-        let mut files_closed = false;
         consume(stream::poll_fn(|cx| {
-            if let Err(error) = feed_writer(
-                &mut writer,
-                &mut files,
-                &mut next,
-                count as u64,
-                &mut files_closed,
-                cx,
-            ) {
-                return Poll::Ready(Some(Err(error)));
-            }
-            Pin::new(&mut writer).poll_next(cx)
+            poll_writer(&mut writer, &mut files, &mut next, count as u64, 64, cx)
         }))
     })
 }
-fn write_event_case(name: &str, count: usize, batch: usize) {
+fn write_poll_case(name: &str, count: usize, batch: usize) {
     let polls = Rc::new(Cell::new(0));
     measure(name, count, 1, polls.clone(), || {
         let budget = FrameBudget::new(64);
         let mut cfg = config(64, 1, 0);
-        let mut writer = WriteScheduler::new(&budget, &mut cfg);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let mut allocator = Allocator;
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
+        let mut files = (0..).map(|_| Destination {
+            count: count as u32,
+            pending: false,
+            retry: false,
+            attempts: Cell::new(0),
+            polls: polls.clone(),
+            writer: None,
+        });
         let mut next = 0;
-        let mut sum = 0;
-        loop {
-            match writer.poll(&mut cx) {
-                Poll::Ready(Ok(Some(WriteEvent::FileReady))) => {
-                    writer
-                        .enqueue_file(Destination {
-                            count: count as u32,
-                            pending: false,
-                            retry: false,
-                            attempts: Cell::new(0),
-                            polls: polls.clone(),
-                        })
-                        .unwrap();
-                    writer.close_files().unwrap();
-                }
-                Poll::Ready(Ok(Some(WriteEvent::FrameReady))) => {
-                    for _ in 0..batch {
-                        if next == count || !writer.accept_frame() {
-                            break;
-                        }
-                        writer.enqueue_frame(black_box(next as u64)).unwrap();
-                        next += 1;
-                    }
-                    if next == count {
-                        writer.close_frames().unwrap();
-                    }
-                }
-                Poll::Ready(Ok(Some(WriteEvent::File(result)))) => sum += black_box(result),
-                Poll::Ready(Ok(None)) => return sum,
-                Poll::Ready(Err(error)) => panic!("{error:?}"),
-                Poll::Pending => {}
-            }
-        }
+        consume(stream::poll_fn(|cx| {
+            poll_writer(&mut writer, &mut files, &mut next, count as u64, batch, cx)
+        }))
     });
 }
 
@@ -443,31 +432,29 @@ fn write_consumer_case(name: &str, files: usize, drive: bool) {
     let count = files * 4;
     measure(name, count, files, polls.clone(), || {
         futures::executor::block_on(async {
-            let mut destinations = (0..files).map(|_| Destination {
+            let mut destinations = (0..).map(|_| Destination {
                 count: 4,
                 pending: true,
                 retry: false,
                 attempts: Cell::new(0),
                 polls: polls.clone(),
+                writer: None,
             });
-            let scheduler_budget_4 = FrameBudget::new(64);
-            let mut scheduler_config_4 = config(64, 16, 0);
-            let mut writer = WriteScheduler::new(&scheduler_budget_4, &mut scheduler_config_4);
+            let budget = FrameBudget::new(64);
+            let mut cfg = config(64, 16, 0);
+            let mut allocator = Allocator;
+            let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
             let mut next = 0;
-            let mut files_closed = false;
             let mut sum = 0;
             while let Some(result) = std::future::poll_fn(|cx| {
-                if let Err(error) = feed_writer(
+                poll_writer(
                     &mut writer,
                     &mut destinations,
                     &mut next,
                     count as u64,
-                    &mut files_closed,
+                    64,
                     cx,
-                ) {
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Pin::new(&mut writer).poll_next(cx)
+                )
             })
             .await
             {
@@ -475,15 +462,10 @@ fn write_consumer_case(name: &str, files: usize, drive: bool) {
                 if drive {
                     futures::select_biased! {
                         _ = std::future::poll_fn(|cx| {
-                            feed_writer(
-                                &mut writer,
-                                &mut destinations,
-                                &mut next,
-                                count as u64,
-                                &mut files_closed,
-                                cx,
-                            ).unwrap();
-                            writer.poll_progress(cx);
+                            if let Poll::Ready(Some(result)) = poll_writer(&mut writer,&mut destinations,&mut next,count as u64,64,cx) {
+                                sum += black_box(result.unwrap());
+                                cx.waker().wake_by_ref();
+                            }
                             Poll::<()>::Pending
                         }).fuse() => unreachable!(),
                         _ = consumer_wait().fuse() => {},
@@ -543,8 +525,8 @@ fn main() {
     write_case("write_multiple_active", 100 * scale, 1024, 32, false, false);
     write_case("write_backpressure", 50 * scale, 256, 16, true, false);
     write_case("write_finalize_retry", 100 * scale, 1024, 32, false, true);
-    write_event_case("write_event_per_frame", 100_000 * scale, 1);
-    write_event_case("write_event_batched", 100_000 * scale, usize::MAX);
+    write_poll_case("write_poll_per_frame", 100_000 * scale, 1);
+    write_poll_case("write_poll_batched", 100_000 * scale, usize::MAX);
     shared_case(25_000 * scale);
     // Initialize the executor outside allocation measurements for both variants.
     futures::executor::block_on(ready(()));

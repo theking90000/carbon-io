@@ -14,19 +14,17 @@ Each file contains frames of your chosen Rust type. CARBON schedules reads and
 writes across files, limits buffering, and delivers results in order.
 
 - `ReadScheduler` reads files into a stream of frames in file order.
-- `WriteScheduler` distributes admitted frames across destinations and returns
-  their finalization results in destination order.
+- `WriteScheduler` fills frames from borrowed input, writes them to destinations,
+  and returns close results in destination order.
 
-Consuming the stream drives I/O. CARBON starts no background tasks.
+Polling drives I/O. CARBON starts no background tasks.
 
 Schedulers borrow a shared `&FrameBudget` and a mutable `&mut SchedulerConfig`.
-Files are supplied with `file_ready().await` followed by `enqueue_file()`;
-`WriteScheduler` also accepts owned frames with `frame_ready().await` followed by
-`enqueue_frame()`. `next_event().await` combines readiness and output in one borrow.
-After a readiness event, `accept_file()` and `accept_frame()` reserve further
-admissions without polling I/O again. The producer retains its sources and drives
-admission and output in the same task. Dropping a scheduler cancels its operations and releases its
-budget. `set_window()` updates the caller's configuration.
+Reads admit files after `file_ready().await`. Writes also borrow a frame allocator;
+`poll_write()` fills its partial frame and reports completed files to replace.
+The producer retains its sources and drives input and output in the same task.
+Dropping a scheduler cancels its operations and releases its budget.
+`set_window()` updates the caller's configuration.
 
 See the [detailed guide](docs/guide.md) for more on scheduling, buffering,
 backpressure, and backend integration.
@@ -173,72 +171,40 @@ turn, so a successful admission does not cancel a partially completed TCP write.
 
 ## Writing files
 
-Implement `WriteFile<T>` to describe a destination and `FrameWriter<T>` to write
-its frames. A destination declares its frame capacity. Its writer accepts frames
-by reference and returns a result after finalization.
+Implement `WriteFile<T>` for a destination that opens, writes borrowed frames,
+and closes on the same object. A `FrameAllocator` creates empty partial frames;
+`PartialFrame` fills them from borrowed input. `BytesFrameAllocator` provides
+fixed-size byte frames.
 
-```text
-                         poll_file_ready(cx)
-                                   │ Ready(Ok(()))
-                             enqueue_file(F)
-                                   │
-                                   ▼
-                         ┌──────────────────┐
-enqueue_frame(T) ─────────►│  WriteScheduler  │ ── next().await ──► FileResult
-                         │     (Stream)     │
-                         └──────────────────┘
-      ▲
-      │ Ready(Ok(()))
-poll_frame_ready(cx)
-```
-
-Files and frames are injected independently using the Sink pattern. Each
-successful readiness poll reserves one admission; the corresponding `enqueue_*`
-call transfers ownership to the scheduler. On `Pending`, the producer keeps the
-item and waits for a wakeup. Close each input with `close_files()` or
-`close_frames()` when its producer finishes. `WriteScheduler` implements `Stream`;
-`next().await` yields finalization results or errors in destination order, and
-returns `None` after all results have drained.
+Fill the destination window with `push_file()`. Each `poll_write()` reports input
+consumption, completed files at the head, and missing descriptors. Replace
+completed heads with `pop_swap()` to recover their descriptors and close results
+while appending new destinations. When input ends, use `poll_close()` and
+`pop_file()` to drain the remaining results without supplying replacements.
 
 ```rust
-use std::{
-    collections::VecDeque,
-    convert::Infallible,
-    error::Error,
-    future::{Ready, ready},
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{convert::Infallible, error::Error, future::poll_fn, pin::Pin, task::{Context, Poll}};
 use futures::executor::block_on;
-use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteEvent, WriteFile, WriteScheduler};
+use carbon_io::{AsyncFilesWrite, BytesFrameAllocator, FrameBudget, SchedulerConfig, WriteFile, WriteScheduler};
 
-struct File;
-struct Writer(u32);
-
-impl WriteFile<u32> for File {
+#[derive(Default)]
+struct File(Vec<u8>);
+impl WriteFile<Vec<u8>> for File {
     type Error = Infallible;
-    type Output = u32;
-    type Open = Ready<Result<Writer, Infallible>>;
-    type Writer = Writer;
-
-    fn frame_capacity(&self) -> u32 { 3 }
-    fn open(&self) -> Self::Open { ready(Ok(Writer(0))) }
-}
-
-impl FrameWriter<u32> for Writer {
-    type Error = Infallible;
-    type Output = u32;
-
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &u32)
-        -> Poll<Result<(), Infallible>>
-    {
-        self.get_mut().0 += frame;
+    type Output = Vec<u8>;
+    fn frame_capacity(&self) -> u32 { 2 }
+    fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Infallible>> {
+        self.get_mut().0.clear();
         Poll::Ready(Ok(()))
     }
-    fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>)
-        -> Poll<Result<u32, Infallible>>
+    fn poll_write(self: Pin<&mut Self>, _: &Context<'_>, frame: &Vec<u8>)
+        -> Poll<Result<(), Infallible>>
     {
-        Poll::Ready(Ok(self.0))
+        self.get_mut().0.extend_from_slice(frame);
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<Vec<u8>, Infallible>> {
+        Poll::Ready(Ok(std::mem::take(&mut self.get_mut().0)))
     }
 }
 
@@ -246,82 +212,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
         let budget = FrameBudget::new(64);
         let mut config = SchedulerConfig::default();
-        let mut writer = WriteScheduler::new(&budget, &mut config);
-        let mut files = VecDeque::from([File, File]);
-        let mut frames = VecDeque::from([1, 2, 3, 4]);
+        config.window.max_active_files = 1;
+        let mut allocator = BytesFrameAllocator::new(3)?;
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config)?;
+        writer.push_file(File::default())?;
+        let mut input = &b"abcdefg"[..];
         let mut results = Vec::new();
-
-        while let Some(event) = writer.next_event().await? {
-            match event {
-                WriteEvent::FileReady => {
-                    while !files.is_empty() && writer.accept_file() {
-                        writer.enqueue_file(files.pop_front().unwrap())?;
-                    }
-                    if files.is_empty() {
-                        writer.close_files()?;
-                    }
-                }
-                WriteEvent::FrameReady => {
-                    while !frames.is_empty() && writer.accept_frame() {
-                        writer.enqueue_frame(frames.pop_front().unwrap())?;
-                    }
-                    if frames.is_empty() {
-                        writer.close_frames()?;
-                        writer.close_files()?;
-                    }
-                }
-                WriteEvent::File(result) => results.push(result),
+        while !input.is_empty() {
+            let status = poll_fn(|cx| Pin::new(&mut writer).poll_write(cx, input)).await?;
+            for _ in 0..status.completed_files {
+                let (_, result) = writer.pop_swap(File::default())?;
+                results.push(result);
+            }
+            if let Some(consumed) = status.output { input = &input[consumed..]; }
+        }
+        loop {
+            let completed = poll_fn(|cx| Pin::new(&mut writer).poll_close(cx)).await?;
+            if completed == 0 { break; }
+            for _ in 0..completed {
+                results.push(writer.pop_file()?.unwrap().1);
             }
         }
-        assert_eq!(results, [6, 4]);
+        assert_eq!(results, [b"abcdef".to_vec(), b"g".to_vec()]);
         Ok(())
     })
 }
 ```
 
 Input frames fill destinations in order, up to each destination's capacity.
-Destinations open only after receiving a frame. The last file may be partial;
-an empty input opens no file.
-
-`accept_frame()` reserves budget capacity before `enqueue_frame()` takes the
-frame. It returns `false` when the budget or current destination is unavailable.
-Each successful enqueue consumes its reservation; the next call checks the
-limits again. Calling `accept_file()` or `accept_frame()` repeatedly without an
-enqueue preserves the same reservation. Neither method polls backend I/O.
-
-Readiness is reported while its reservation remains available. If a producer
-temporarily has no item, exclude that admission from the requested events:
-
-```ignore
-let interest = if frames.is_empty() {
-    Interest::FILES | Interest::RESULTS
-} else {
-    Interest::ALL
-};
-let event = writer.next_event_with_interest(interest).await?;
-```
-
-`Interest::FILES` requests file admission, `FRAMES` requests write-frame
-admission, and `RESULTS` requests ordered outputs. For reads, `RESULTS` yields
-frames. Excluding an interest preserves its existing reservation and prevents
-readiness from being returned repeatedly in a busy loop. Errors and EOF remain
-visible with any mask. An exhausted producer closes its input; a temporarily
-empty producer can be polled alongside this future in `select!`.
-
-Enqueueing after a ready event does not wake the task again. If the last poll
-returned `Pending`, the first enqueue or closure wakes the waiting task; further
-mutations before its next poll share that notification. Backend and budget
-wakers continue notifying the registered task independently.
-
-When handling `WriteEvent::File(result)`, poll `progress()` while processing the
-result to keep accepted files writing and finalizing:
-
-```ignore
-tokio::select! {
-    outcome = process_result(result) => outcome?,
-    _ = writer.progress() => unreachable!("progress never completes"),
-}
-```
+Destinations open only after receiving a frame. Closing flushes a nonempty
+partial frame; empty input opens no file. If `poll_write()` returns `Pending`,
+input remains unconsumed and the supplied waker signals when polling can resume.
 
 ## Choosing the window and budget
 
@@ -347,7 +268,7 @@ Allocated buffer storage does not shrink.
 
 Frame counts, destination capacities, the global budget, `target_frames`, and
 `max_active_files` must be nonzero. Invalid configurations and file contracts
-are reported through the scheduler's output stream.
+are reported by scheduler operations.
 
 ## Retries, errors, and cancellation
 
@@ -363,13 +284,13 @@ Write retries change how long frames must be retained:
 | `max_retries == 0` | Drop each frame after a successful `poll_write` | A file may exceed the global frame budget |
 | `max_retries > 0` | Retain the whole file until successful finalization | Reserve the whole file before accepting its first frame; it must fit the global budget |
 
-A write retry drops the failed attempt, reopens the file, and replays from the
+A write retry reopens the same file object and replays from the
 first retained frame. Reservations may exceed `target_frames` to fit one file.
 There is no global rollback if an earlier file fails.
 
-A fatal error releases scheduler resources immediately. `next()` emits the
-error once, then returns EOF. If `progress()` discovers the error, it saves it
-for the next `next()`.
+A fatal error releases scheduler resources immediately. Reads emit the error
+once, then return EOF. Writes return the error from the current poll and reject
+later operations with `InputClosed`.
 
 Dropping a pending `next()` or a `progress()` future preserves the scheduler's
 state. Dropping the scheduler abandons its operations and releases its resources.
@@ -377,32 +298,34 @@ It does not undo writes. Backends must clean up abandoned attempts.
 
 ## Integrating a backend or custom stream
 
-Both schedulers implement `Stream`.
+`ReadScheduler` implements `Stream`. Its entry points are:
 
 | Entry point | Behavior |
 | --- | --- |
 | `next().await` / `poll_next(cx)` | Remove the next ordered output, advancing I/O if needed |
 | `next_event().await` / `poll(cx)` | Return input readiness or the next ordered output with one mutable borrow |
 | `next_event_with_interest(interest).await` / `poll_with_interest(cx, interest)` | Return only requested event kinds, errors or EOF |
-| `file_ready().await` / `frame_ready().await` | Reserve one input admission without consuming output |
-| `accept_file()` / `accept_frame()` | Reserve one admission synchronously, returning a bool without taking an item or polling backend I/O |
-| `enqueue_file(file)` / `enqueue_frame(frame)` | Transfer ownership into a reserved admission |
+| `file_ready().await` | Reserve one input admission without consuming output |
+| `accept_file()` | Reserve one admission synchronously, returning a bool without taking an item or polling backend I/O |
+| `enqueue_file(file)` | Transfer ownership into a reserved admission |
 | `progress()` | Keep advancing I/O without consuming output; never completes |
 | `poll_progress(cx)` | Advance at most 256 work items from a custom future or stream |
 
 Backends must follow these rules:
 
 - Register the supplied waker before returning `Pending`.
-- Make every `open()` an independent attempt that can be abandoned by dropping it.
+- For reads, make every `open()` an independent attempt that can be abandoned by dropping it.
+- For writes, reopen the same file object after an error and cancel its previous attempt.
 - A pending `poll_write` receives the same logical frame on its next poll, but
   its address may change. Do not retain the borrowed `&T` after returning.
 - Finalize only after all assigned writes succeed.
 
-Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Input streams, opening
-futures, readers, and writers may also be `!Unpin`. The crate contains no unsafe
-code.
+Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Read opening futures and
+readers may be `!Unpin`. Write files must be `Unpin` or supplied through a pinned
+pointer. Partial frames and borrowed write input need neither `Clone` nor `Unpin`.
+The crate contains no unsafe code.
 
-Invalid admissions return contract errors and release scheduler resources.
+Rejected admissions return contract errors; rejected write calls preserve accepted work.
 `FramePermit::poll_grow` returns `Poll<Result<(), ContractError>>`; an invalid
 growth request returns `InvalidBudgetRequest` and preserves existing grants or
 waits.
@@ -413,8 +336,8 @@ Each example is an independent crate with its own dependencies and lockfile.
 See the [examples guide](examples/README.md) for the memory, TCP/file, Reqwest,
 and Pingora uploads and their launch commands.
 
-The [memory example](https://github.com/theking90000/carbon-io/blob/main/examples/memory/src/main.rs) puts both schedulers together using
-`futures::select_biased!`:
+The [memory example](https://github.com/theking90000/carbon-io/blob/main/examples/memory/src/main.rs)
+reads frames, then writes them and collects file close results:
 
 ```sh
 cargo run --locked --manifest-path examples/memory/Cargo.toml

@@ -156,6 +156,15 @@ pub struct WriteStatus<O> {
     pub missing_files: usize,
 }
 
+/// A completed file and its close output, or no completed head yet.
+pub type FileCloseResult<W> = Result<
+    Option<(
+        <W as AsyncFilesWrite>::File,
+        <W as AsyncFilesWrite>::FileOutput,
+    )>,
+    <W as AsyncFilesWrite>::Error,
+>;
+
 /// Poll-driven file streaming with mandatory replacement while writing.
 pub trait AsyncFilesWrite {
     /// Borrowed input used to fill a partial frame.
@@ -185,7 +194,7 @@ pub trait AsyncFilesWrite {
     /// A positive count requires `pop_file`; zero means closing is complete.
     fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>>;
     /// Remove one completed head during close, without accepting a replacement.
-    fn pop_file(&mut self) -> Result<Option<(Self::File, Self::FileOutput)>, Self::Error>;
+    fn pop_file(&mut self) -> FileCloseResult<Self>;
 }
 
 enum FileState<R> {
@@ -252,6 +261,7 @@ type Frame<A> = <Partial<A> as PartialFrame>::Frame;
 /// Error type of a scheduler with allocator `A` and destination `F`.
 pub type FilesWriteError<A, F> =
     WriteError<<Partial<A> as PartialFrame>::Error, <F as WriteFile<Frame<A>>>::Error>;
+type ClosedSlot<A, F> = (Slot<Frame<A>, F>, <F as WriteFile<Frame<A>>>::Output);
 
 struct Slot<T, F: WriteFile<T> + Unpin> {
     file: F,
@@ -505,6 +515,13 @@ impl<'a, A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> WriteScheduler<'a, A
                         self.used = self.used.saturating_sub(released);
                         if changed && slot.done() {
                             self.permit.shrink_to(self.used);
+                        } else if released > 0 {
+                            let desired = if self.phase == Phase::Closing {
+                                self.used
+                            } else {
+                                self.config.window.target_frames.max(self.used)
+                            };
+                            self.permit.shrink_to(self.permit.capacity().min(desired));
                         }
                         if changed {
                             progressed = true;
@@ -582,7 +599,7 @@ impl<'a, A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> WriteScheduler<'a, A
         }
     }
 
-    fn take_head(&mut self) -> Option<(Slot<Frame<A>, F>, F::Output)> {
+    fn take_head(&mut self) -> Option<ClosedSlot<A, F>> {
         if !self.files.front()?.done() {
             return None;
         }
