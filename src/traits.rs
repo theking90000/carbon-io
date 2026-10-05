@@ -42,100 +42,98 @@ pub trait ReadFile<T> {
     fn open(&self) -> Self::Open;
 }
 
-/// An opaque destination. Reopening must start an independent complete attempt.
-/// Descriptors may be discovered ahead of time; defer resource creation to `open`.
+/// A destination that opens, accepts frames, and closes on the same object.
 ///
-/// # Examples
+/// Resource creation starts only when `poll_open` is first called. Each `Pending`
+/// poll registers the supplied waker and continues the same operation on the next
+/// poll. A pending write receives the same logical frame, whose address may change;
+/// the frame reference must never be retained after returning.
 ///
-/// ```
-/// use std::{convert::Infallible, future::{ready, Ready}};
-/// use carbon_io::{FrameWriter, WriteFile};
+/// After any operation returns an error, the next `poll_open` must cancel the old
+/// attempt and open a fresh destination for replay from the first frame. Repeated
+/// pending open polls continue that new attempt. Dropping the file cancels its I/O.
+/// Closing succeeds only after all accepted frames have been committed.
 ///
-/// struct MemFile;
-/// # struct MemWriter;
-/// # impl FrameWriter<u32> for MemWriter {
-/// #     type Error = Infallible;
-/// #     type Output = u32;
-/// #     fn poll_write(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>, _: &u32) -> std::task::Poll<Result<(), Infallible>> { std::task::Poll::Ready(Ok(())) }
-/// #     fn poll_finalize(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<u32, Infallible>> { std::task::Poll::Ready(Ok(0)) }
-/// # }
-///
-/// impl WriteFile<u32> for MemFile {
-///     type Error = Infallible;
-///     type Output = u32;
-///     type Open = Ready<Result<MemWriter, Infallible>>;
-///     type Writer = MemWriter;
-///
-///     fn frame_capacity(&self) -> u32 { 10 }
-///     fn open(&self) -> Self::Open { ready(Ok(MemWriter)) }
-/// }
-/// ```
-pub trait WriteFile<T> {
-    /// Backend failure.
-    type Error;
-    /// Successful finalization result.
-    type Output;
-    /// Asynchronous open operation. May be `!Unpin`.
-    type Open: Future<Output = Result<Self::Writer, Self::Error>>;
-    /// Writer for one attempt. May be `!Unpin`.
-    type Writer: FrameWriter<T, Error = Self::Error, Output = Self::Output>;
-    /// Nonzero maximum number of frames in this destination.
-    fn frame_capacity(&self) -> u32;
-    /// Open a new attempt. Dropping an old attempt must cancel its work.
-    /// Called only after the scheduler has assigned at least one frame to this file.
-    fn open(&self) -> Self::Open;
-}
-
-/// Borrowing writer which never owns the scheduler's frames.
-///
-/// On `Pending`, register the supplied waker. The next call receives the same
-/// logical frame until success, but its address may change. Do not retain the
-/// borrow after returning. Finalization may begin only after all writes succeed.
+/// Files stored directly in the scheduler must be `Unpin`. A `!Unpin` file can
+/// instead be supplied as `Pin<Box<F>>` or `Pin<&mut F>`; both forward this trait.
 ///
 /// # Examples
 ///
 /// ```
 /// use std::{convert::Infallible, pin::Pin, task::{Context, Poll}};
-/// use carbon_io::FrameWriter;
+/// use carbon_io::WriteFile;
 ///
-/// struct SumWriter(u32);
-///
-/// impl FrameWriter<u32> for SumWriter {
+/// struct SumFile(u32);
+/// impl WriteFile<u32> for SumFile {
 ///     type Error = Infallible;
 ///     type Output = u32;
 ///
-///     fn poll_write(
-///         self: Pin<&mut Self>,
-///         _: &mut Context<'_>,
-///         frame: &u32,
-///     ) -> Poll<Result<(), Infallible>> {
+///     fn frame_capacity(&self) -> u32 { 10 }
+///     fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Infallible>> {
+///         self.get_mut().0 = 0;
+///         Poll::Ready(Ok(()))
+///     }
+///     fn poll_write(self: Pin<&mut Self>, _: &Context<'_>, frame: &u32)
+///         -> Poll<Result<(), Infallible>>
+///     {
 ///         self.get_mut().0 += *frame;
 ///         Poll::Ready(Ok(()))
 ///     }
-///
-///     fn poll_finalize(
-///         self: Pin<&mut Self>,
-///         _: &mut Context<'_>,
-///     ) -> Poll<Result<u32, Infallible>> {
-///         Poll::Ready(Ok(self.0))
+///     fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<u32, Infallible>> {
+///         Poll::Ready(Ok(self.get_mut().0))
 ///     }
 /// }
 /// ```
-pub trait FrameWriter<T> {
+pub trait WriteFile<T> {
     /// Backend failure.
     type Error;
-    /// Successful finalization result.
+    /// Successful close result.
     type Output;
-    /// Accept one frame, or arrange a wakeup when progress becomes possible.
+    /// Nonzero maximum number of frames in this destination.
+    fn frame_capacity(&self) -> u32;
+    /// Open the first attempt, or restart after an error, without replacing this file.
+    fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>>;
+    /// Accept one borrowed frame, or register a wakeup when writing can continue.
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &Context<'_>,
         frame: &T,
     ) -> Poll<Result<(), Self::Error>>;
-    /// Finish the file. Success makes previously accepted frames disposable.
-    /// With retries disabled, acceptance by `poll_write` already releases them.
-    fn poll_finalize(
+    /// Commit accepted frames and finish this file.
+    fn poll_close(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        cx: &Context<'_>,
     ) -> Poll<Result<Self::Output, Self::Error>>;
+}
+
+impl<T, P> WriteFile<T> for Pin<P>
+where
+    P: std::ops::DerefMut + Unpin,
+    P::Target: WriteFile<T>,
+{
+    type Error = <P::Target as WriteFile<T>>::Error;
+    type Output = <P::Target as WriteFile<T>>::Output;
+
+    fn frame_capacity(&self) -> u32 {
+        self.as_ref().get_ref().frame_capacity()
+    }
+
+    fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut().as_mut().poll_open(cx)
+    }
+
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &Context<'_>,
+        frame: &T,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.get_mut().as_mut().poll_write(cx, frame)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &Context<'_>,
+    ) -> Poll<Result<Self::Output, Self::Error>> {
+        self.get_mut().as_mut().poll_close(cx)
+    }
 }

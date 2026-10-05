@@ -1,47 +1,207 @@
 use crate::{
-    ContractError, EventPoll, FrameBudget, FramePermit, FrameWriter, Interest, MAX_POLL_OPS,
-    SchedulerConfig, SchedulerError, Window, WriteFile, ready::ReadyQueue,
+    ContractError, FrameBudget, FramePermit, MAX_POLL_OPS, SchedulerConfig, Window, WriteFile,
 };
-use futures_core::{Stream, stream::FusedStream};
-use pin_project_lite::pin_project;
 use std::{
     collections::VecDeque,
+    error::Error,
     fmt,
-    future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
 
-const BUDGET: usize = 0;
-const FIRST_SLOT: usize = 1;
-
-/// Input admission or an ordered finalization result from a [`WriteScheduler`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum WriteEvent<R> {
-    /// Destination admission is available. Use `accept_file` and `enqueue_file`
-    /// to fill the window. The first admission remains reserved until consumed.
-    FileReady,
-    /// Frame admission is available. Use `accept_frame` and `enqueue_frame` to
-    /// fill the budget. The first admission remains reserved until consumed.
-    FrameReady,
-    /// The next destination's finalization result, transferred to the caller.
-    File(R),
+/// A frame built incrementally from borrowed input.
+///
+/// `Pending` must register the waker and leave the input unconsumed. Each
+/// successful fill reports its consumption through `Output`. The caller decides
+/// when input ends by polling the scheduler's `poll_close`.
+/// Partial frames are movable; neither frames nor inputs need `Clone` or `Unpin`.
+pub trait PartialFrame {
+    /// Borrowed source, such as a byte slice or a reader with interior mutability.
+    type Input: ?Sized;
+    /// Result of one successful fill, such as a consumed byte count.
+    type Output;
+    /// Finished frame accepted by the file backend.
+    type Frame;
+    /// Input failure.
+    type Error;
+    /// Fill this frame without retaining the input reference.
+    fn poll_fill(
+        &mut self,
+        cx: &Context<'_>,
+        input: &Self::Input,
+    ) -> Poll<Result<Self::Output, Self::Error>>;
+    /// Whether this frame is ready to be sent to its destination.
+    fn is_complete(&self) -> bool;
+    /// Whether closing should discard this frame instead of sending it.
+    fn is_empty(&self) -> bool;
+    /// Finish a complete frame, or a nonempty partial frame during close.
+    fn finish(self) -> Self::Frame;
 }
 
-pin_project! {
-    #[project = WriteIoProj]
-    enum WriteIo<O, W, R> {
-        Opening { #[pin] future: O },
-        Ready { #[pin] writer: W },
-        Done { result: Option<R> },
-        Idle,
+/// Allocates empty, incomplete frames only after capacity has been reserved.
+pub trait FrameAllocator {
+    /// Incremental frame representation.
+    type Partial: PartialFrame;
+    /// Allocate one empty frame.
+    fn allocate(&mut self) -> Self::Partial;
+}
+
+/// Builds owned byte frames of a fixed maximum size.
+#[derive(Debug)]
+pub struct BytesFrameAllocator {
+    frame_size: usize,
+}
+
+impl BytesFrameAllocator {
+    /// Reject a zero frame size.
+    pub fn new(frame_size: usize) -> Result<Self, ContractError> {
+        if frame_size == 0 {
+            return Err(ContractError::InvalidPartialFrame);
+        }
+        Ok(Self { frame_size })
     }
 }
 
-enum Frames<T> {
-    Replay(Vec<T>),
-    Streaming(VecDeque<T>),
+/// Byte buffer being filled by [`BytesFrameAllocator`].
+#[derive(Debug)]
+pub struct BytesPartialFrame {
+    bytes: Vec<u8>,
+    frame_size: usize,
 }
+
+impl FrameAllocator for BytesFrameAllocator {
+    type Partial = BytesPartialFrame;
+
+    fn allocate(&mut self) -> Self::Partial {
+        BytesPartialFrame {
+            bytes: Vec::with_capacity(self.frame_size),
+            frame_size: self.frame_size,
+        }
+    }
+}
+
+impl PartialFrame for BytesPartialFrame {
+    type Input = [u8];
+    type Output = usize;
+    type Frame = Vec<u8>;
+    type Error = std::convert::Infallible;
+
+    fn poll_fill(&mut self, _: &Context<'_>, input: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let count = self
+            .frame_size
+            .saturating_sub(self.bytes.len())
+            .min(input.len());
+        self.bytes.extend(input.iter().take(count).copied());
+        Poll::Ready(Ok(count))
+    }
+
+    fn is_complete(&self) -> bool {
+        self.bytes.len() == self.frame_size
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Input, destination, or scheduler-contract failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteError<I, F> {
+    /// Failed to fill a partial frame.
+    Input(I),
+    /// Failed to open, write, or close a destination after all retries.
+    Backend(F),
+    /// Invalid configuration or operation.
+    Contract(ContractError),
+}
+
+impl<I: fmt::Display, F: fmt::Display> fmt::Display for WriteError<I, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(error) => write!(f, "input: {error}"),
+            Self::Backend(error) => write!(f, "backend: {error}"),
+            Self::Contract(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<I: Error + 'static, F: Error + 'static> Error for WriteError<I, F> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(match self {
+            Self::Input(error) => error,
+            Self::Backend(error) => error,
+            Self::Contract(error) => error,
+        })
+    }
+}
+
+impl<I, F> From<ContractError> for WriteError<I, F> {
+    fn from(error: ContractError) -> Self {
+        Self::Contract(error)
+    }
+}
+
+/// Consumption and FIFO maintenance reported by one write poll.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WriteStatus<O> {
+    /// `None` means no input was consumed; handle the file counts before polling again.
+    pub output: Option<O>,
+    /// Completed files at the head, available through `pop_swap`.
+    pub completed_files: usize,
+    /// Free destination slots, available through `push_file`.
+    pub missing_files: usize,
+}
+
+/// Poll-driven file streaming with mandatory replacement while writing.
+pub trait AsyncFilesWrite {
+    /// Borrowed input used to fill a partial frame.
+    type Input: ?Sized;
+    /// Result of one fill.
+    type Output;
+    /// Unopened destination descriptor.
+    type File;
+    /// Successful file close result.
+    type FileOutput;
+    /// Input, backend, or contract error.
+    type Error;
+    /// Whether another unopened descriptor fits in the window.
+    fn accept_file(&self) -> bool;
+    /// Append an unopened descriptor to the FIFO.
+    fn push_file(&mut self, file: Self::File) -> Result<(), Self::Error>;
+    /// Drive I/O and fill at most one partial frame from borrowed input.
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &Context<'_>,
+        input: &Self::Input,
+    ) -> Poll<Result<WriteStatus<Self::Output>, Self::Error>>;
+    /// Replace one completed head with an unopened tail, returning its descriptor and result.
+    fn pop_swap(&mut self, file: Self::File)
+    -> Result<(Self::File, Self::FileOutput), Self::Error>;
+    /// Stop accepting input, flush the partial frame, and finalize all used files.
+    /// A positive count requires `pop_file`; zero means closing is complete.
+    fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>>;
+    /// Remove one completed head during close, without accepting a replacement.
+    fn pop_file(&mut self) -> Result<Option<(Self::File, Self::FileOutput)>, Self::Error>;
+}
+
+enum FileState<R> {
+    Idle,
+    Opening,
+    Writing,
+    Closing,
+    Closed(R),
+}
+
+// Streaming releases accepted frames; replay retains the complete attempt.
+enum Frames<T> {
+    Streaming(VecDeque<T>),
+    Replay(Vec<T>),
+}
+
 impl<T> Frames<T> {
     fn new(replay: bool) -> Self {
         if replay {
@@ -50,1638 +210,969 @@ impl<T> Frames<T> {
             Self::Streaming(VecDeque::new())
         }
     }
+
     fn push(&mut self, frame: T) {
         match self {
-            Self::Replay(v) => v.push(frame),
-            Self::Streaming(v) => v.push_back(frame),
+            Self::Streaming(frames) => frames.push_back(frame),
+            Self::Replay(frames) => frames.push(frame),
         }
     }
+
     fn next(&self, written: u32) -> Option<&T> {
         match self {
-            Self::Replay(v) => v.get(written as usize),
-            Self::Streaming(v) => v.front(),
+            Self::Streaming(frames) => frames.front(),
+            Self::Replay(frames) => frames.get(written as usize),
         }
     }
-    fn accepted(&mut self) {
-        if let Self::Streaming(v) = self {
-            v.pop_front();
+
+    fn accepted(&mut self) -> usize {
+        match self {
+            Self::Streaming(frames) => usize::from(frames.pop_front().is_some()),
+            Self::Replay(_) => 0,
         }
     }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Streaming(frames) => frames.len(),
+            Self::Replay(frames) => frames.len(),
+        }
+    }
+
     fn clear(&mut self) {
         match self {
-            Self::Replay(v) => v.clear(),
-            Self::Streaming(v) => v.clear(),
+            Self::Streaming(frames) => frames.clear(),
+            Self::Replay(frames) => frames.clear(),
         }
     }
 }
-type FileIo<T, F> =
-    WriteIo<<F as WriteFile<T>>::Open, <F as WriteFile<T>>::Writer, <F as WriteFile<T>>::Output>;
 
-struct Slot<T, F: WriteFile<T>> {
-    file: Option<F>,
-    io: Pin<Box<FileIo<T, F>>>,
+type Partial<A> = <A as FrameAllocator>::Partial;
+type Frame<A> = <Partial<A> as PartialFrame>::Frame;
+/// Error type of a scheduler with allocator `A` and destination `F`.
+pub type FilesWriteError<A, F> =
+    WriteError<<Partial<A> as PartialFrame>::Error, <F as WriteFile<Frame<A>>>::Error>;
+
+struct Slot<T, F: WriteFile<T> + Unpin> {
+    file: F,
+    state: FileState<F::Output>,
     frames: Frames<T>,
     capacity: u32,
     assigned: u32,
     written: u32,
     retries: u32,
-    pending: bool,
 }
 
-/// Push destinations and owned frames, then pull ordered destination results.
-///
-/// Each input has a readiness/admission pair. Poll readiness before transferring
-/// ownership with `enqueue_file` or `enqueue_frame`. A successful readiness poll
-/// reserves one admission until its corresponding enqueue call, explicit input
-/// closure, or a terminal error. Repeated readiness polls reuse that reservation.
-/// All polling interfaces drive the same I/O engine without consuming results.
-///
-/// Destinations open only after their first frame. With retries disabled, a
-/// successful backend write releases its frame. Otherwise the scheduler reserves
-/// the whole destination and retains its frames until successful finalization.
-/// Neither frames nor destination descriptors need `Clone` or `Unpin`.
-///
-/// Close both inputs to end the result stream. Closing frames finalizes the last
-/// used partial destination and drops unused descriptors without opening them.
-/// Results must be consumed to advance the file discovery horizon. Fatal errors
-/// release resources and are reported once by the next fallible operation or
-/// stream poll. Dropping the scheduler cancels I/O and returns all permits.
-///
-/// # Examples
-///
-/// ```
-/// use std::{convert::Infallible, future::ready, pin::Pin, task::{Context, Poll}};
-/// use futures::{executor::block_on, StreamExt};
-/// use carbon_io::{FrameBudget, FrameWriter, SchedulerConfig, WriteFile, WriteScheduler};
-///
-/// struct MemFile;
-/// struct MemWriter(u32);
-/// impl WriteFile<u32> for MemFile {
-///     type Error = Infallible;
-///     type Output = u32;
-///     type Open = std::future::Ready<Result<MemWriter, Infallible>>;
-///     type Writer = MemWriter;
-///     fn frame_capacity(&self) -> u32 { 2 }
-///     fn open(&self) -> Self::Open { ready(Ok(MemWriter(0))) }
-/// }
-/// impl FrameWriter<u32> for MemWriter {
-///     type Error = Infallible;
-///     type Output = u32;
-///     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &u32) -> Poll<Result<(), Infallible>> {
-///         self.get_mut().0 += *frame;
-///         Poll::Ready(Ok(()))
-///     }
-///     fn poll_finalize(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Infallible>> {
-///         Poll::Ready(Ok(self.0))
-///     }
-/// }
-///
-/// block_on(async {
-///     let budget = FrameBudget::new(16);
-///     let mut config = SchedulerConfig::default();
-///     let mut scheduler = WriteScheduler::new(&budget, &mut config);
-///     scheduler.file_ready().await.unwrap();
-///     scheduler.enqueue_file(MemFile).unwrap();
-///     scheduler.close_files().unwrap();
-///     for frame in [10, 20] {
-///         scheduler.frame_ready().await.unwrap();
-///         scheduler.enqueue_frame(frame).unwrap();
-///     }
-///     scheduler.close_frames().unwrap();
-///     assert_eq!(scheduler.next().await.unwrap().unwrap(), 30);
-///     assert!(scheduler.next().await.is_none());
-/// });
-/// ```
-pub struct WriteScheduler<'a, T, F: WriteFile<T>> {
-    slots: Vec<Slot<T, F>>,
-    order: VecDeque<usize>,
-    free: Vec<usize>,
-    fill_index: usize,
-    ready: ReadyQueue,
-    waker: Option<Waker>,
-    wake_armed: bool,
-    permit: FramePermit<'a>,
-    config: &'a mut SchedulerConfig,
-    active: usize,
-    horizon: usize,
-    reserved: usize,
-    retained: usize,
-    // Replay capacity for the destination currently being filled.
-    fill_reserved: bool,
-    // Outstanding admissions survive progress, finalization and window changes.
-    file_ready: bool,
-    frame_ready: Option<usize>,
-    event_cursor: usize,
-    frames_closed: bool,
-    files_closed: bool,
-    budget_waiting: bool,
-    error: Option<SchedulerError<F::Error>>,
-    terminated: bool,
-}
-
-impl<T, F: WriteFile<T>> fmt::Debug for WriteScheduler<'_, T, F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WriteScheduler")
-            .field("window", &self.config.window)
-            .field("max_retries", &self.config.max_retries)
-            .field("granted_frames", &self.granted_frames())
-            .field("retained_frames", &self.retained_frames())
-            .field("active_files", &self.active)
-            .field("horizon", &self.horizon)
-            .field("file_ready", &self.file_ready)
-            .field("frame_ready", &self.frame_ready.is_some())
-            .field("files_closed", &self.files_closed)
-            .field("frames_closed", &self.frames_closed)
-            .field("terminated", &self.terminated)
-            .finish()
-    }
-}
-
-// Only the boxed I/O states are structurally pinned. T and F remain movable.
-impl<T, F: WriteFile<T>> Unpin for WriteScheduler<'_, T, F> {}
-
-impl<'a, T, F: WriteFile<T>> WriteScheduler<'a, T, F> {
-    /// Borrow the shared budget and mutable configuration, without input streams.
-    /// Initial configuration errors are reported by the first fallible operation
-    /// or stream poll. `set_window` updates the borrowed configuration.
-    pub fn new(budget: &'a FrameBudget, config: &'a mut SchedulerConfig) -> Self {
-        let mut ready = ReadyQueue::new();
-        ready.add();
-        let error = config
-            .window
-            .validate()
-            .err()
-            .or_else(|| (budget.total_capacity() == 0).then_some(ContractError::ZeroBudget))
-            .map(Into::into);
-        Self {
-            slots: Vec::new(),
-            order: VecDeque::new(),
-            free: Vec::new(),
-            fill_index: 0,
-            ready,
-            waker: None,
-            wake_armed: false,
-            permit: budget.permit(),
-            config,
-            active: 0,
-            horizon: 0,
-            reserved: 0,
-            retained: 0,
-            fill_reserved: false,
-            file_ready: false,
-            frame_ready: None,
-            event_cursor: 0,
-            frames_closed: false,
-            files_closed: false,
-            budget_waiting: false,
-            error,
-            terminated: false,
-        }
-    }
-
-    /// Drive I/O and reserve one destination admission.
-    /// The next file may extend beyond the horizon if its beginning is inside it.
-    /// An existing admission survives subsequent window reductions.
-    /// Closed admission returns a terminal `InputClosed` error.
-    pub fn poll_file_ready(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), SchedulerError<F::Error>>> {
-        let this = self;
-        this.drive(cx);
-        if let Some(error) = this.error.take() {
-            return Poll::Ready(Err(error));
-        }
-        if this.terminated || this.files_closed || this.frames_closed {
-            return Poll::Ready(Err(this.reject(ContractError::InputClosed)));
-        }
-        let result = this.reserve_file().map(Ok);
-        if result.is_pending() {
-            this.wait();
-        }
-        result
-    }
-
-    fn reserve_file(&mut self) -> Poll<()> {
-        if self.file_ready {
-            return Poll::Ready(());
-        }
-        if self.active >= self.config.window.max_active_files
-            || self.horizon >= self.config.window.horizon()
-        {
-            return Poll::Pending;
-        }
-        self.file_ready = true;
-        Poll::Ready(())
-    }
-
-    /// Wait for and reserve one file admission, driving I/O while pending.
-    /// Dropping this future preserves the scheduler and any granted admission.
-    pub async fn file_ready(&mut self) -> Result<(), SchedulerError<F::Error>> {
-        std::future::poll_fn(|cx| self.poll_file_ready(cx)).await
-    }
-
-    /// Reserve one destination admission without polling backend I/O.
-    /// Returns `false` on backpressure, closure or terminal failure. Errors remain
-    /// available through the next fallible operation. Repeated calls preserve the
-    /// same admission until `enqueue_file` consumes it or admission closes.
-    pub fn accept_file(&mut self) -> bool {
-        !self.terminated
-            && self.error.is_none()
-            && !self.files_closed
-            && !self.frames_closed
-            && self.reserve_file().is_ready()
-    }
-
-    /// Transfer a destination reserved by `accept_file`, a readiness poll
-    /// or a `FileReady` event.
-    /// Invalid capacities are terminal contract errors. The destination remains
-    /// unopened until its first frame arrives.
-    /// Missing readiness or closed admission returns a terminal
-    /// `AdmissionNotReady` or `InputClosed` error.
-    pub fn enqueue_file(&mut self, file: F) -> Result<(), SchedulerError<F::Error>> {
-        let this = self;
-        this.check_error()?;
-        if this.files_closed || this.frames_closed {
-            return Err(this.reject(ContractError::InputClosed));
-        }
-        if !this.file_ready {
-            return Err(this.reject(ContractError::AdmissionNotReady));
-        }
-        this.file_ready = false;
+impl<T, F: WriteFile<T> + Unpin> Slot<T, F> {
+    fn new(file: F, replay: bool) -> Self {
         let capacity = file.frame_capacity();
-        let error = if capacity == 0 {
-            Some(ContractError::ZeroFrameCapacity)
-        } else if this.replay() && capacity as usize > this.permit.total_capacity() {
-            Some(ContractError::FrameCapacityExceedsBudget)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            this.finish();
-            this.wake();
-            return Err(error.into());
+        Self {
+            file,
+            state: FileState::Idle,
+            frames: Frames::new(replay),
+            capacity,
+            assigned: 0,
+            written: 0,
+            retries: 0,
         }
-        let id = if let Some(id) = this.free.pop() {
-            let slot = &mut this.slots[id];
-            slot.file = Some(file);
-            slot.io.set(WriteIo::Idle);
-            slot.frames.clear();
-            slot.capacity = capacity;
-            slot.assigned = 0;
-            slot.written = 0;
-            slot.retries = 0;
-            slot.pending = false;
-            id
-        } else {
-            let id = this.slots.len();
-            this.slots.push(Slot {
-                file: Some(file),
-                io: Box::pin(WriteIo::Idle),
-                frames: Frames::new(this.replay()),
-                capacity,
-                assigned: 0,
-                written: 0,
-                retries: 0,
-                pending: false,
-            });
-            this.ready.add();
-            id
-        };
-        this.horizon = this.horizon.saturating_add(capacity as usize);
-        this.active += 1;
-        this.order.push_back(id);
-        this.wake();
-        Ok(())
     }
 
-    /// Drive I/O and reserve one frame admission, without receiving a frame.
-    /// No destination returns `Pending` while files remain open, or a terminal
-    /// `MissingWriteFile` error after files close. The reservation survives other
-    /// polls and window changes until `enqueue_frame`, closure or terminal failure.
-    /// With retries enabled, the first admission reserves the whole destination.
-    /// Closed frame admission returns a terminal `InputClosed` error.
-    pub fn poll_frame_ready(
+    fn done(&self) -> bool {
+        matches!(self.state, FileState::Closed(_))
+    }
+
+    // One state transition or backend poll, plus the capacity it releases.
+    fn poll(
         &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), SchedulerError<F::Error>>> {
-        let this = self;
-        this.drive(cx);
-        if let Some(error) = this.error.take() {
-            return Poll::Ready(Err(error));
-        }
-        if this.terminated || this.frames_closed {
-            return Poll::Ready(Err(this.reject(ContractError::InputClosed)));
-        }
-        let result = this.reserve_frame();
-        if result.is_pending() {
-            this.wait();
-        }
-        result
-    }
-
-    fn reserve_frame(&mut self) -> Poll<Result<(), SchedulerError<F::Error>>> {
-        let this = self;
-        if this.frame_ready.is_some() {
-            return Poll::Ready(Ok(()));
-        }
-        let Some(&id) = this.order.get(this.fill_index) else {
-            if this.files_closed {
-                this.finish();
-                this.wake();
-                return Poll::Ready(Err(ContractError::MissingWriteFile.into()));
-            }
-            return Poll::Pending;
-        };
-        if this.replay() {
-            if !this.fill_reserved {
-                let capacity = this.slots[id].capacity as usize;
-                if capacity > this.permit.total_capacity() - this.reserved
-                    || !this.ensure_capacity(this.reserved + capacity)?
-                {
-                    return Poll::Pending;
+        cx: &Context<'_>,
+        closing: bool,
+        max_retries: u32,
+    ) -> Result<(bool, usize), F::Error> {
+        let error = match self.state {
+            FileState::Opening => match Pin::new(&mut self.file).poll_open(cx) {
+                Poll::Pending => return Ok((false, 0)),
+                Poll::Ready(Ok(())) => {
+                    self.state = FileState::Writing;
+                    return Ok((true, 0));
                 }
-                this.reserved += capacity;
-                this.fill_reserved = true;
-            }
-        } else {
-            if this.retained >= this.config.window.target_frames
-                || !this.ensure_capacity(this.retained + 1)?
-            {
-                return Poll::Pending;
-            }
-        }
-        this.frame_ready = Some(id);
-        Poll::Ready(Ok(()))
-    }
-
-    /// Wait for and reserve one frame admission, driving I/O while pending.
-    /// Dropping this future preserves the scheduler and budget reservations.
-    pub async fn frame_ready(&mut self) -> Result<(), SchedulerError<F::Error>> {
-        std::future::poll_fn(|cx| self.poll_frame_ready(cx)).await
-    }
-
-    /// Reserve one frame admission without polling backend I/O.
-    /// Returns `false` when no destination or budget capacity is available, or
-    /// after closure or terminal failure. Errors remain available through the
-    /// next fallible operation. Repeated calls preserve the same reservation
-    /// until `enqueue_frame` consumes it or frame admission closes.
-    pub fn accept_frame(&mut self) -> bool {
-        if self.terminated
-            || self.error.is_some()
-            || self.frames_closed
-            || (self.frame_ready.is_none() && self.order.get(self.fill_index).is_none())
-        {
-            return false;
-        }
-        match self.reserve_frame() {
-            Poll::Ready(Ok(())) => true,
-            Poll::Pending => false,
-            Poll::Ready(Err(error)) => {
-                self.error = Some(error);
-                false
-            }
-        }
-    }
-
-    /// Drive I/O and return an input admission or an ordered finalization result.
-    /// Rotates file, frame and output priority when multiple events are ready.
-    /// Handle readiness with the matching `enqueue_*` or `close_*` call. Close an
-    /// input as soon as its producer ends, without waiting for another admission.
-    /// Returns `None` after both inputs close and results drain, or an error once.
-    pub fn poll(&mut self, cx: &mut Context<'_>) -> EventPoll<WriteEvent<F::Output>, F::Error> {
-        self.poll_with_interest(cx, Interest::ALL)
-    }
-
-    /// Drive I/O and return only requested events, errors or EOF.
-    /// Exclude admission interests when their producer has no item available.
-    /// This avoids repeatedly receiving readiness instead of waiting for I/O.
-    /// Existing grants persist and the remaining ready events keep rotating.
-    pub fn poll_with_interest(
-        &mut self,
-        cx: &mut Context<'_>,
-        interest: Interest,
-    ) -> EventPoll<WriteEvent<F::Output>, F::Error> {
-        self.drive(cx);
-        if let Some(error) = self.error.take() {
-            return Poll::Ready(Err(error));
-        }
-        if self.terminated {
-            return Poll::Ready(Ok(None));
-        }
-        for offset in 0..3 {
-            match (self.event_cursor + offset) % 3 {
-                0 if interest.contains(Interest::FILES)
-                    && !self.files_closed
-                    && !self.frames_closed
-                    && self.reserve_file().is_ready() =>
-                {
-                    self.event_cursor = 1;
-                    return Poll::Ready(Ok(Some(WriteEvent::FileReady)));
-                }
-                1 if interest.contains(Interest::FRAMES)
-                    && !self.frames_closed
-                    && (self.frame_ready.is_some()
-                        || self.order.get(self.fill_index).is_some()) =>
-                {
-                    match self.reserve_frame() {
+                Poll::Ready(Err(error)) => error,
+            },
+            FileState::Writing => {
+                if let Some(frame) = self.frames.next(self.written) {
+                    match Pin::new(&mut self.file).poll_write(cx, frame) {
+                        Poll::Pending => return Ok((false, 0)),
                         Poll::Ready(Ok(())) => {
-                            self.event_cursor = 2;
-                            return Poll::Ready(Ok(Some(WriteEvent::FrameReady)));
+                            self.written += 1;
+                            return Ok((true, self.frames.accepted()));
                         }
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                        Poll::Pending => {}
+                        Poll::Ready(Err(error)) => error,
                     }
+                } else if self.assigned == self.capacity || closing {
+                    self.state = FileState::Closing;
+                    return Ok((true, 0));
+                } else {
+                    return Ok((false, 0));
                 }
-                2 if interest.contains(Interest::RESULTS) => {
-                    if let Some(result) = self.take_result() {
-                        self.event_cursor = 0;
-                        return Poll::Ready(Ok(Some(WriteEvent::File(result))));
-                    }
-                }
-                _ => {}
             }
-        }
-        self.wait();
-        Poll::Pending
-    }
-
-    /// Wait for input readiness, a finalization result, error or EOF with one borrow.
-    /// Dropping a pending future preserves the scheduler and outstanding admissions.
-    pub async fn next_event(
-        &mut self,
-    ) -> Result<Option<WriteEvent<F::Output>>, SchedulerError<F::Error>> {
-        std::future::poll_fn(|cx| self.poll(cx)).await
-    }
-
-    /// Wait for requested events, errors or EOF using one mutable borrow.
-    pub async fn next_event_with_interest(
-        &mut self,
-        interest: Interest,
-    ) -> Result<Option<WriteEvent<F::Output>>, SchedulerError<F::Error>> {
-        std::future::poll_fn(|cx| self.poll_with_interest(cx, interest)).await
-    }
-
-    /// Transfer one owned frame into an admission reserved by `accept_frame`,
-    /// a readiness poll or a `FrameReady` event.
-    /// Success means the scheduler owns the frame, not that backend I/O finished.
-    /// Missing readiness or closed admission returns a terminal
-    /// `AdmissionNotReady` or `InputClosed` error.
-    pub fn enqueue_frame(&mut self, frame: T) -> Result<(), SchedulerError<F::Error>> {
-        let this = self;
-        this.check_error()?;
-        if this.frames_closed {
-            return Err(this.reject(ContractError::InputClosed));
-        }
-        let Some(id) = this.frame_ready.take() else {
-            return Err(this.reject(ContractError::AdmissionNotReady));
+            FileState::Closing => match Pin::new(&mut self.file).poll_close(cx) {
+                Poll::Pending => return Ok((false, 0)),
+                Poll::Ready(Ok(output)) => {
+                    self.state = FileState::Closed(output);
+                    self.frames.clear();
+                    let released = if max_retries > 0 {
+                        self.capacity as usize
+                    } else {
+                        0
+                    };
+                    return Ok((true, released));
+                }
+                Poll::Ready(Err(error)) => error,
+            },
+            FileState::Idle | FileState::Closed(_) => return Ok((false, 0)),
         };
-        let Some(slot) = this.slots.get_mut(id) else {
-            return Err(this.reject(ContractError::AdmissionNotReady));
-        };
-        slot.frames.push(frame);
-        slot.assigned += 1;
-        this.retained += 1;
-        if slot.assigned == 1 {
-            let Some(file) = slot.file.as_ref() else {
-                this.finish();
-                this.wake();
-                return Err(ContractError::MissingWriteFile.into());
-            };
-            slot.io.set(WriteIo::Opening {
-                future: file.open(),
-            });
-        }
-        if slot.assigned == slot.capacity {
-            this.fill_index += 1;
-            this.fill_reserved = false;
-        }
-        this.schedule_slot(id);
-        this.wake();
-        Ok(())
-    }
-
-    /// Close destination admission and cancel its outstanding readiness grant.
-    /// Already announced destinations remain available to frame admission.
-    /// Closure is idempotent and does not close frames.
-    pub fn close_files(&mut self) -> Result<(), SchedulerError<F::Error>> {
-        let this = self;
-        if let Some(error) = this.error.take() {
-            this.finish();
-            this.wake();
+        if self.retries == max_retries {
             return Err(error);
         }
-        this.files_closed = true;
-        this.file_ready = false;
-        this.wake();
-        Ok(())
+        self.retries += 1;
+        self.written = 0;
+        self.state = FileState::Opening;
+        Ok((true, 0))
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Phase {
+    Writing,
+    Closing,
+    Failed,
+}
+
+/// FIFO destinations and a single partial frame, driven only by write/close polls.
+///
+/// Fill the initial window with `while writer.accept_file() { writer.push_file(file)?; }`.
+/// `poll_write` consumes borrowed input and reports completed heads and missing
+/// descriptors. Replace every completed head with `pop_swap(file)`. `poll_close`
+/// stops input permanently, sends a nonempty partial frame, and drops unused
+/// descriptors without opening them. During close, remove completed heads with
+/// `pop_file` until `poll_close` returns zero.
+///
+/// The allocator, shared budget, and configuration belong to the caller. Only
+/// budget growth and release access shared state; backend polling uses the task's
+/// waker directly, with no ready queue, additional locks, or spawned tasks.
+/// Retries reserve an entire destination before allocating its first frame;
+/// without retries, each successful backend write releases one frame immediately.
+/// I/O errors cancel remaining work. Rejected API calls leave accepted work intact.
+pub struct WriteScheduler<'a, A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> {
+    allocator: &'a mut A,
+    config: &'a mut SchedulerConfig,
+    files: VecDeque<Slot<Frame<A>, F>>,
+    partial: Option<Partial<A>>,
+    permit: FramePermit<'a>,
+    used: usize,
+    fill_index: usize,
+    poll_cursor: usize,
+    phase: Phase,
+    waker: Option<Waker>,
+}
+
+// Files are movable or supplied through a forwarding pinned pointer.
+impl<A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> Unpin for WriteScheduler<'_, A, F> {}
+
+impl<'a, A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> WriteScheduler<'a, A, F> {
+    /// Borrow the allocator, shared frame budget, and configuration.
+    pub fn new(
+        allocator: &'a mut A,
+        budget: &'a FrameBudget,
+        config: &'a mut SchedulerConfig,
+    ) -> Result<Self, ContractError> {
+        config.window.validate()?;
+        if budget.total_capacity() == 0 {
+            return Err(ContractError::ZeroBudget);
+        }
+        Ok(Self {
+            allocator,
+            config,
+            files: VecDeque::new(),
+            partial: None,
+            permit: budget.permit(),
+            used: 0,
+            fill_index: 0,
+            poll_cursor: 0,
+            phase: Phase::Writing,
+            waker: None,
+        })
     }
 
-    /// Close frame admission and cancel its outstanding readiness grant.
-    /// Finalize the last used partial destination and discard unused descriptors.
-    /// Closure is idempotent; close files separately to end the result stream.
-    pub fn close_frames(&mut self) -> Result<(), SchedulerError<F::Error>> {
-        let this = self;
-        if let Some(error) = this.error.take() {
-            this.finish();
-            this.wake();
-            return Err(error);
-        }
-        if this.frames_closed {
-            return Ok(());
-        }
-        this.frames_closed = true;
-        this.frame_ready = None;
-        this.file_ready = false;
-        if let Some(&id) = this.order.get(this.fill_index) {
-            if this.slots[id].assigned > 0 {
-                this.schedule_slot(id);
-            } else if this.fill_reserved {
-                this.reserved -= this.slots[id].capacity as usize;
-            }
-        }
-        this.fill_reserved = false;
-        while let Some(&id) = this.order.back() {
-            if this.slots[id].assigned > 0 {
-                break;
-            }
-            this.slots[id].io.set(WriteIo::Idle);
-            this.slots[id].file = None;
-            this.active -= 1;
-            this.horizon -= this.slots[id].capacity as usize;
-            this.order.pop_back();
-            this.free.push(id);
-        }
-        this.permit.shrink_to(this.engaged());
-        this.budget_waiting = false;
-        this.wake();
-        Ok(())
-    }
-
-    /// Replace the window while preserving accepted frames and ready admissions.
-    /// Returns `InvalidWindow` for zero target frames or zero active-file limit.
+    /// Change the window without discarding accepted descriptors or frames.
+    /// Writes use `target_frames` and `max_active_files`; discovery is descriptor-only.
     pub fn set_window(&mut self, window: Window) -> Result<(), ContractError> {
         window.validate()?;
         self.config.window = window;
         self.permit.shrink_to(
             self.permit
                 .capacity()
-                .min(window.target_frames.max(self.engaged())),
+                .min(window.target_frames.max(self.used)),
         );
-        self.budget_waiting = false;
         self.wake();
         Ok(())
     }
 
-    /// Current window configuration.
+    /// Current window.
     pub fn window(&self) -> Window {
         self.config.window
     }
-    /// Locally granted capacity, including outstanding admissions and replay.
+
+    /// Retained complete frames plus the current partial frame.
+    pub fn retained_frames(&self) -> usize {
+        self.files
+            .iter()
+            .map(|slot| slot.frames.len())
+            .sum::<usize>()
+            + usize::from(self.partial.is_some())
+    }
+
+    /// Local capacity occupied or reserved for replay.
+    pub fn reserved_frames(&self) -> usize {
+        self.used
+    }
+
+    /// Current grant from the shared frame budget.
     pub fn granted_frames(&self) -> usize {
         self.permit.capacity()
     }
-    /// Number of frames currently owned by the scheduler, excluding ready grants.
-    pub fn retained_frames(&self) -> usize {
-        self.retained
-    }
-    fn replay(&self) -> bool {
-        self.config.max_retries > 0
-    }
-    fn engaged(&self) -> usize {
-        if self.replay() {
-            self.reserved
-        } else {
-            self.retained + usize::from(self.frame_ready.is_some())
+
+    fn validate_file(&self, file: &F) -> Result<(), FilesWriteError<A, F>> {
+        let capacity = file.frame_capacity();
+        if capacity == 0 {
+            return Err(ContractError::ZeroFrameCapacity.into());
         }
-    }
-    // Mutations notify only a task that last returned Pending, once per poll.
-    fn wake(&mut self) {
-        if !std::mem::take(&mut self.wake_armed) {
-            return;
-        }
-        if let Some(waker) = &self.waker {
-            waker.wake_by_ref();
-        }
-    }
-    fn wait(&mut self) {
-        if !self.terminated {
-            self.wake_armed = true;
-            if self.ready.has_work() {
-                self.wake();
-            }
-        }
-    }
-    fn check_error(&mut self) -> Result<(), SchedulerError<F::Error>> {
-        if let Some(error) = self.error.take() {
-            self.finish();
-            return Err(error);
-        }
-        if self.terminated {
-            return Err(ContractError::InputClosed.into());
+        if self.config.max_retries > 0 && capacity as usize > self.permit.total_capacity() {
+            return Err(ContractError::FrameCapacityExceedsBudget.into());
         }
         Ok(())
     }
-    fn reject(&mut self, error: ContractError) -> SchedulerError<F::Error> {
-        self.finish();
-        self.wake();
-        error.into()
-    }
-    fn schedule_slot(&mut self, id: usize) {
-        if !self.slots[id].pending {
-            self.ready.schedule(id + FIRST_SLOT);
+
+    fn status(
+        &self,
+        output: Option<<Partial<A> as PartialFrame>::Output>,
+    ) -> WriteStatus<<Partial<A> as PartialFrame>::Output> {
+        WriteStatus {
+            output,
+            completed_files: self.files.iter().take_while(|slot| slot.done()).count(),
+            missing_files: self
+                .config
+                .window
+                .max_active_files
+                .saturating_sub(self.files.len()),
         }
     }
-    fn ensure_capacity(&mut self, minimum: usize) -> Result<bool, SchedulerError<F::Error>> {
+
+    fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn wait(&mut self, cx: &Context<'_>) {
+        self.waker = Some(cx.waker().clone());
+    }
+
+    fn fail(&mut self) {
+        self.phase = Phase::Failed;
+        self.files.clear();
+        self.partial = None;
+        self.used = 0;
+        self.permit.shrink_to(0);
+        self.wake();
+    }
+
+    fn drive(&mut self, cx: &Context<'_>) -> Result<(), FilesWriteError<A, F>> {
+        let count = self.files.len();
+        if count == 0 {
+            return Ok(());
+        }
+        let mut remaining = MAX_POLL_OPS;
+        loop {
+            let mut progressed = false;
+            for _ in 0..count {
+                let index = self.poll_cursor % count;
+                self.poll_cursor = (index + 1) % count;
+                let Some(slot) = self.files.get_mut(index) else {
+                    return Err(ContractError::MissingWriteFile.into());
+                };
+                match slot.poll(cx, self.phase == Phase::Closing, self.config.max_retries) {
+                    Ok((changed, released)) => {
+                        self.used = self.used.saturating_sub(released);
+                        if changed && slot.done() {
+                            self.permit.shrink_to(self.used);
+                        }
+                        if changed {
+                            progressed = true;
+                            remaining -= 1;
+                            if remaining == 0 {
+                                cx.waker().wake_by_ref();
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.fail();
+                        return Err(WriteError::Backend(error));
+                    }
+                }
+            }
+            if !progressed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn flush_partial(&mut self) -> Result<(), FilesWriteError<A, F>> {
+        let Some(partial) = self.partial.take() else {
+            return Ok(());
+        };
+        let Some(slot) = self.files.get_mut(self.fill_index) else {
+            return Err(ContractError::MissingWriteFile.into());
+        };
+        if partial.is_empty() {
+            let released = if self.config.max_retries == 0 {
+                1
+            } else if slot.assigned == 0 {
+                slot.capacity as usize
+            } else {
+                0
+            };
+            self.used = self.used.saturating_sub(released);
+            return Ok(());
+        }
+        slot.frames.push(partial.finish());
+        slot.assigned += 1;
+        if slot.assigned == 1 {
+            slot.state = FileState::Opening;
+        }
+        if slot.assigned == slot.capacity {
+            self.fill_index += 1;
+        }
+        Ok(())
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        cx: &Context<'_>,
+        minimum: usize,
+    ) -> Result<bool, FilesWriteError<A, F>> {
         if self.permit.capacity() >= minimum {
             return Ok(true);
         }
-        if self.budget_waiting {
-            return Ok(false);
+        // Return unused fragments before waiting for a complete replay reservation.
+        if self.permit.capacity() > self.used {
+            self.permit.shrink_to(self.used);
         }
-        // Return unused fragments before waiting for an entire replay file.
-        let engaged = self.engaged();
-        if self.permit.capacity() > engaged {
-            self.permit.shrink_to(engaged);
-        }
-        let target = self
+        let desired = self
             .config
             .window
             .target_frames
             .max(minimum)
             .min(self.permit.total_capacity());
-        let minimum = if self.replay() {
-            minimum
-        } else {
-            (engaged + target.min(32)).min(target).max(minimum)
-        };
-        let waker = self.ready.waker(BUDGET);
-        let mut cx = Context::from_waker(&waker);
-        self.budget_waiting = match self.permit.poll_grow(&mut cx, minimum, target) {
-            Poll::Ready(Ok(())) => false,
-            Poll::Pending => true,
-            Poll::Ready(Err(error)) => return Err(self.reject(error)),
-        };
-        Ok(!self.budget_waiting)
-    }
-    fn poll_slot(
-        &mut self,
-        id: usize,
-        cx: &mut Context<'_>,
-    ) -> Result<(), SchedulerError<F::Error>> {
-        let replay = self.replay();
-        let slot = &mut self.slots[id];
-        if slot.file.is_none() {
-            return Ok(());
+        let mut budget_cx = Context::from_waker(cx.waker());
+        match self.permit.poll_grow(&mut budget_cx, minimum, desired) {
+            Poll::Ready(Ok(())) => Ok(true),
+            Poll::Ready(Err(error)) => Err(error.into()),
+            Poll::Pending => Ok(false),
         }
-        slot.pending = false;
-        let error = match slot.io.as_mut().project() {
-            WriteIoProj::Opening { future } => match future.poll(cx) {
-                Poll::Pending => {
-                    slot.pending = true;
-                    None
-                }
-                Poll::Ready(Ok(writer)) => {
-                    slot.io.set(WriteIo::Ready { writer });
-                    self.ready.schedule(id + FIRST_SLOT);
-                    None
-                }
-                Poll::Ready(Err(error)) => Some(error),
-            },
-            WriteIoProj::Ready { writer } => {
-                if let Some(frame) = slot.frames.next(slot.written) {
-                    match writer.poll_write(cx, frame) {
-                        Poll::Pending => {
-                            slot.pending = true;
-                            None
-                        }
-                        Poll::Ready(Err(error)) => Some(error),
-                        Poll::Ready(Ok(())) => {
-                            slot.written += 1;
-                            slot.frames.accepted();
-                            if !replay {
-                                self.retained -= 1;
-                                let keep = self.config.window.target_frames.max(self.engaged());
-                                let excess = self.permit.capacity().saturating_sub(keep);
-                                if excess >= 32
-                                    || (excess > 0
-                                        && self.retained <= self.config.window.target_frames)
-                                {
-                                    self.permit.shrink_to(keep);
-                                }
-                            }
-                            self.ready.schedule(id + FIRST_SLOT);
-                            self.wake();
-                            None
-                        }
-                    }
-                } else if slot.assigned == slot.capacity
-                    || (self.frames_closed && slot.assigned > 0)
-                {
-                    match writer.poll_finalize(cx) {
-                        Poll::Pending => {
-                            slot.pending = true;
-                            None
-                        }
-                        Poll::Ready(Err(error)) => Some(error),
-                        Poll::Ready(Ok(result)) => {
-                            slot.io.set(WriteIo::Done {
-                                result: Some(result),
-                            });
-                            if replay {
-                                self.retained -= slot.assigned as usize;
-                                self.reserved -= slot.capacity as usize;
-                            }
-                            slot.frames.clear();
-                            self.active -= 1;
-                            // Finalization is a file boundary, so returning unused
-                            // capacity here never puts a global lock on each frame.
-                            self.permit.shrink_to(self.engaged());
-                            self.budget_waiting = false;
-                            self.wake();
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-            WriteIoProj::Done { .. } | WriteIoProj::Idle => None,
-        };
-        if let Some(error) = error {
-            let slot = &mut self.slots[id];
-            slot.io.set(WriteIo::Idle);
-            if slot.retries == self.config.max_retries {
-                return Err(SchedulerError::Backend(error));
-            }
-            slot.retries += 1;
-            slot.written = 0;
-            let Some(file) = slot.file.as_ref() else {
-                return Err(ContractError::MissingWriteFile.into());
-            };
-            slot.io.set(WriteIo::Opening {
-                future: file.open(),
-            });
-            self.ready.schedule(id + FIRST_SLOT);
-        }
-        Ok(())
     }
-    fn take_result(&mut self) -> Option<F::Output> {
-        let &id = self.order.front()?;
-        let slot = &mut self.slots[id];
-        let WriteIoProj::Done { result } = slot.io.as_mut().project() else {
+
+    fn take_head(&mut self) -> Option<(Slot<Frame<A>, F>, F::Output)> {
+        if !self.files.front()?.done() {
+            return None;
+        }
+        let mut slot = self.files.pop_front()?;
+        let FileState::Closed(output) = std::mem::replace(&mut slot.state, FileState::Idle) else {
             return None;
         };
-        let result = result.take();
-        self.horizon -= slot.capacity as usize;
-        slot.io.set(WriteIo::Idle);
-        slot.file = None;
-        self.order.pop_front();
-        self.free.push(id);
         self.fill_index = self.fill_index.saturating_sub(1);
+        self.poll_cursor = self.poll_cursor.saturating_sub(1);
+        Some((slot, output))
+    }
+}
+
+impl<A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> AsyncFilesWrite
+    for WriteScheduler<'_, A, F>
+{
+    type Input = <Partial<A> as PartialFrame>::Input;
+    type Output = <Partial<A> as PartialFrame>::Output;
+    type File = F;
+    type FileOutput = F::Output;
+    type Error = FilesWriteError<A, F>;
+
+    fn accept_file(&self) -> bool {
+        self.phase == Phase::Writing && self.files.len() < self.config.window.max_active_files
+    }
+
+    fn push_file(&mut self, file: F) -> Result<(), Self::Error> {
+        if self.phase != Phase::Writing {
+            return Err(ContractError::InputClosed.into());
+        }
+        if !self.accept_file() {
+            return Err(ContractError::AdmissionNotReady.into());
+        }
+        self.validate_file(&file)?;
+        self.files
+            .push_back(Slot::new(file, self.config.max_retries > 0));
         self.wake();
-        result
-    }
-
-    /// Advance at most 256 work items without consuming a result or any input.
-    /// Backend and budget wakeups schedule another poll. Fatal errors release
-    /// resources and remain available to the next fallible operation or stream poll.
-    pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
-        self.drive(cx);
-        self.wait();
-    }
-
-    /// Keep I/O progressing without providing input or consuming results.
-    /// This future never completes and creates no task or channel. Dropping it
-    /// preserves scheduler state; dropping the scheduler itself cancels all I/O.
-    pub async fn progress(&mut self) {
-        std::future::poll_fn(|cx| {
-            self.poll_progress(cx);
-            Poll::<()>::Pending
-        })
-        .await
-    }
-
-    fn drive(&mut self, cx: &mut Context<'_>) {
-        self.wake_armed = false;
-        if self.terminated {
-            return;
-        }
-        if self
-            .waker
-            .as_ref()
-            .is_none_or(|old| !old.will_wake(cx.waker()))
-        {
-            self.waker = Some(cx.waker().clone());
-        }
-        if self.error.is_some() {
-            self.finish();
-            return;
-        }
-        if let Err(error) = self.poll_work(cx) {
-            self.finish();
-            self.error = Some(error);
-            self.wake();
-            return;
-        }
-        if self.frames_closed && self.files_closed && self.order.is_empty() {
-            self.finish();
-        }
-    }
-
-    #[inline]
-    fn poll_work(&mut self, cx: &mut Context<'_>) -> Result<(), SchedulerError<F::Error>> {
-        self.ready.register(cx.waker());
-        for _ in 0..MAX_POLL_OPS {
-            let Some(id) = self.ready.pop() else { break };
-            if id == BUDGET {
-                self.budget_waiting = false;
-            } else {
-                let waker = self.ready.waker(id);
-                let mut child = Context::from_waker(&waker);
-                self.poll_slot(id - FIRST_SLOT, &mut child)?;
-            }
-        }
         Ok(())
     }
 
-    fn finish(&mut self) {
-        self.frames_closed = true;
-        self.files_closed = true;
-        self.file_ready = false;
-        self.frame_ready = None;
-        self.fill_reserved = false;
-        self.slots.clear();
-        self.order.clear();
-        self.free.clear();
-        self.permit.shrink_to(0);
-        self.retained = 0;
-        self.reserved = 0;
-        self.active = 0;
-        self.horizon = 0;
-        self.fill_index = 0;
-        self.budget_waiting = false;
-        self.terminated = true;
-    }
-}
-
-impl<T, F: WriteFile<T>> Stream for WriteScheduler<'_, T, F> {
-    type Item = Result<F::Output, SchedulerError<F::Error>>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &Context<'_>,
+        input: &Self::Input,
+    ) -> Poll<Result<WriteStatus<Self::Output>, Self::Error>> {
         let this = self.get_mut();
-        this.drive(cx);
-        if let Some(error) = this.error.take() {
-            return Poll::Ready(Some(Err(error)));
+        this.waker = None;
+        if this.phase != Phase::Writing {
+            return Poll::Ready(Err(ContractError::InputClosed.into()));
         }
-        if this.terminated {
-            return Poll::Ready(None);
+        this.drive(cx)?;
+        if this.partial.is_none() {
+            if let Some(slot) = this.files.get(this.fill_index) {
+                let needed = if this.config.max_retries == 0 {
+                    1
+                } else if slot.assigned == 0 {
+                    slot.capacity as usize
+                } else {
+                    0
+                };
+                let limit = if this.config.max_retries == 0 {
+                    this.permit
+                        .total_capacity()
+                        .min(this.config.window.target_frames)
+                } else {
+                    this.permit.total_capacity()
+                };
+                if needed <= limit.saturating_sub(this.used)
+                    && this.ensure_capacity(cx, this.used + needed)?
+                {
+                    this.used += needed;
+                    let partial = this.allocator.allocate();
+                    if !partial.is_empty() || partial.is_complete() {
+                        this.fail();
+                        return Poll::Ready(Err(ContractError::InvalidPartialFrame.into()));
+                    }
+                    this.partial = Some(partial);
+                }
+            }
         }
-        if let Some(result) = this.take_result() {
-            return Poll::Ready(Some(Ok(result)));
+        if let Some(partial) = &mut this.partial {
+            match partial.poll_fill(cx, input) {
+                Poll::Ready(Err(error)) => {
+                    this.fail();
+                    return Poll::Ready(Err(WriteError::Input(error)));
+                }
+                Poll::Ready(Ok(output)) => {
+                    if partial.is_complete() {
+                        if partial.is_empty() {
+                            this.fail();
+                            return Poll::Ready(Err(ContractError::InvalidPartialFrame.into()));
+                        }
+                        this.flush_partial()?;
+                    }
+                    // Return consumption before polling fallible backend work again.
+                    return Poll::Ready(Ok(this.status(Some(output))));
+                }
+                Poll::Pending => {}
+            }
         }
-        this.wait();
-        Poll::Pending
+        let status = this.status(None);
+        if status.completed_files > 0 || status.missing_files > 0 {
+            Poll::Ready(Ok(status))
+        } else {
+            this.wait(cx);
+            Poll::Pending
+        }
     }
-}
 
-impl<T, F: WriteFile<T>> FusedStream for WriteScheduler<'_, T, F> {
-    fn is_terminated(&self) -> bool {
-        self.terminated && self.error.is_none()
+    fn pop_swap(&mut self, file: F) -> Result<(F, F::Output), Self::Error> {
+        if self.phase != Phase::Writing {
+            return Err(ContractError::InputClosed.into());
+        }
+        self.validate_file(&file)?;
+        if !self.files.front().is_some_and(|slot| slot.done()) {
+            return Err(ContractError::AdmissionNotReady.into());
+        }
+        let (mut slot, output) = self.take_head().ok_or(ContractError::AdmissionNotReady)?;
+        let previous = std::mem::replace(&mut slot.file, file);
+        slot.capacity = slot.file.frame_capacity();
+        slot.assigned = 0;
+        slot.written = 0;
+        slot.retries = 0;
+        slot.state = FileState::Idle;
+        // ponytail: reuse the slot and replay buffer at every file boundary.
+        self.files.push_back(slot);
+        self.wake();
+        Ok((previous, output))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>> {
+        let this = self.get_mut();
+        this.waker = None;
+        if this.phase == Phase::Failed {
+            return Poll::Ready(Err(ContractError::InputClosed.into()));
+        }
+        if this.phase == Phase::Writing {
+            this.phase = Phase::Closing;
+            this.flush_partial()?;
+            while this.files.back().is_some_and(|slot| slot.assigned == 0) {
+                this.files.pop_back();
+            }
+            this.permit.shrink_to(this.used);
+        }
+        this.drive(cx)?;
+        let completed = this.files.iter().take_while(|slot| slot.done()).count();
+        if completed > 0 || this.files.is_empty() {
+            Poll::Ready(Ok(completed))
+        } else {
+            this.wait(cx);
+            Poll::Pending
+        }
+    }
+
+    fn pop_file(&mut self) -> Result<Option<(F, F::Output)>, Self::Error> {
+        if self.phase != Phase::Closing {
+            return Err(ContractError::InputClosed.into());
+        }
+        let result = self.take_head().map(|(slot, output)| (slot.file, output));
+        if result.is_some() {
+            self.wake();
+        }
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{StreamExt, executor::block_on};
+    use futures::task::noop_waker;
     use std::{
         cell::{Cell, RefCell},
-        future::{Ready, ready},
         marker::PhantomPinned,
         rc::Rc,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        task::Wake,
     };
-
-    struct Frame {
-        value: u32,
-        drops: Rc<Cell<usize>>,
-        _pin: PhantomPinned,
-    }
-    impl Frame {
-        fn new(value: u32, drops: &Rc<Cell<usize>>) -> Self {
-            Self {
-                value,
-                drops: drops.clone(),
-                _pin: PhantomPinned,
-            }
-        }
-    }
-    impl Drop for Frame {
-        fn drop(&mut self) {
-            self.drops.set(self.drops.get() + 1);
-        }
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    enum Failure {
-        Open,
-        Write,
-        Finalize,
-    }
-
-    #[derive(Clone, Default)]
-    struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-    impl Gate {
-        fn close(&self) {
-            self.0.borrow_mut().0 = true;
-        }
-        fn open(&self) {
-            let waker = {
-                let mut state = self.0.borrow_mut();
-                state.0 = false;
-                state.1.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
-        fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                state.1 = Some(cx.waker().clone());
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        }
-    }
 
     #[derive(Clone)]
     struct File {
         capacity: u32,
         opens: Rc<Cell<usize>>,
-        finalized: Rc<Cell<usize>>,
-        writing: Gate,
-        finalizing: Gate,
-        open_failures: Rc<Cell<usize>>,
-        write_failures: Rc<Cell<usize>>,
-        finalize_failures: Rc<Cell<usize>>,
-        _pin: PhantomPinned,
+        blocked: Rc<Cell<bool>>,
+        waker: Rc<RefCell<Option<Waker>>>,
+        failures: Rc<Cell<u32>>,
+        attempts: Rc<RefCell<Vec<Vec<Vec<u8>>>>>,
+        frames: Vec<Vec<u8>>,
     }
+
     impl File {
         fn new(capacity: u32) -> Self {
             Self {
                 capacity,
-                opens: Rc::new(Cell::new(0)),
-                finalized: Rc::new(Cell::new(0)),
-                writing: Gate::default(),
-                finalizing: Gate::default(),
-                open_failures: Rc::new(Cell::new(0)),
-                write_failures: Rc::new(Cell::new(0)),
-                finalize_failures: Rc::new(Cell::new(0)),
-                _pin: PhantomPinned,
+                opens: Rc::default(),
+                blocked: Rc::default(),
+                waker: Rc::default(),
+                failures: Rc::default(),
+                attempts: Rc::default(),
+                frames: Vec::new(),
+            }
+        }
+
+        fn unblock(&self) {
+            self.blocked.set(false);
+            if let Some(waker) = self.waker.borrow_mut().take() {
+                waker.wake();
             }
         }
     }
-    struct Writer {
-        file: File,
-        values: Vec<u32>,
-    }
-    // The descriptor is deliberately !Unpin, but is never structurally pinned.
-    impl Unpin for Writer {}
-    impl WriteFile<Frame> for File {
-        type Error = Failure;
-        type Output = Vec<u32>;
-        type Open = Ready<Result<Writer, Failure>>;
-        type Writer = Writer;
+
+    impl WriteFile<Vec<u8>> for File {
+        type Error = &'static str;
+        type Output = Vec<Vec<u8>>;
 
         fn frame_capacity(&self) -> u32 {
             self.capacity
         }
-        fn open(&self) -> Self::Open {
-            self.opens.set(self.opens.get() + 1);
-            if self.open_failures.get() > 0 {
-                self.open_failures.set(self.open_failures.get() - 1);
-                return ready(Err(Failure::Open));
-            }
-            ready(Ok(Writer {
-                file: self.clone(),
-                values: Vec::new(),
-            }))
+
+        fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+            let this = self.get_mut();
+            this.opens.set(this.opens.get() + 1);
+            this.attempts.borrow_mut().push(Vec::new());
+            this.frames.clear();
+            Poll::Ready(Ok(()))
         }
-    }
-    impl FrameWriter<Frame> for Writer {
-        type Error = Failure;
-        type Output = Vec<u32>;
 
         fn poll_write(
             self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            frame: &Frame,
-        ) -> Poll<Result<(), Failure>> {
+            cx: &Context<'_>,
+            frame: &Vec<u8>,
+        ) -> Poll<Result<(), Self::Error>> {
             let this = self.get_mut();
-            if this.file.writing.poll(cx).is_pending() {
+            if this.blocked.get() {
+                *this.waker.borrow_mut() = Some(cx.waker().clone());
                 return Poll::Pending;
             }
-            if this.file.write_failures.get() > 0 {
-                this.file
-                    .write_failures
-                    .set(this.file.write_failures.get() - 1);
-                return Poll::Ready(Err(Failure::Write));
+            this.frames.push(frame.clone());
+            if let Some(attempt) = this.attempts.borrow_mut().last_mut() {
+                attempt.push(frame.clone());
             }
-            this.values.push(frame.value);
             Poll::Ready(Ok(()))
         }
-        fn poll_finalize(
+
+        fn poll_close(
             self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Result<Vec<u32>, Failure>> {
+            _: &Context<'_>,
+        ) -> Poll<Result<Self::Output, Self::Error>> {
             let this = self.get_mut();
-            if this.file.finalizing.poll(cx).is_pending() {
-                return Poll::Pending;
+            if this.failures.get() > 0 {
+                this.failures.set(this.failures.get() - 1);
+                return Poll::Ready(Err("close"));
             }
-            if this.file.finalize_failures.get() > 0 {
-                this.file
-                    .finalize_failures
-                    .set(this.file.finalize_failures.get() - 1);
-                return Poll::Ready(Err(Failure::Finalize));
-            }
-            this.file.finalized.set(this.file.finalized.get() + 1);
-            Poll::Ready(Ok(std::mem::take(&mut this.values)))
+            Poll::Ready(Ok(std::mem::take(&mut this.frames)))
         }
     }
 
-    type Scheduler<'a> = WriteScheduler<'a, Frame, File>;
-
-    fn config(target: usize, horizon: usize, active: usize, retries: u32) -> SchedulerConfig {
-        SchedulerConfig::new(Window::new(target, horizon, active).unwrap(), retries)
-    }
-    fn file(s: &mut Scheduler<'_>, cx: &mut Context<'_>, file: File) {
-        assert!(matches!(
-            Pin::new(&mut *s).poll_file_ready(cx),
-            Poll::Ready(Ok(()))
-        ));
-        Pin::new(s).enqueue_file(file).unwrap();
-    }
-    fn frame(s: &mut Scheduler<'_>, cx: &mut Context<'_>, value: u32, drops: &Rc<Cell<usize>>) {
-        assert!(matches!(
-            Pin::new(&mut *s).poll_frame_ready(cx),
-            Poll::Ready(Ok(()))
-        ));
-        Pin::new(s).enqueue_frame(Frame::new(value, drops)).unwrap();
-    }
-    fn close(s: &mut Scheduler<'_>) {
-        Pin::new(&mut *s).close_files().unwrap();
-        Pin::new(s).close_frames().unwrap();
-    }
-    fn results(s: &mut Scheduler<'_>) -> Vec<Vec<u32>> {
-        block_on(s.map(Result::unwrap).collect())
+    fn config(files: usize, retries: u32) -> SchedulerConfig {
+        SchedulerConfig::new(Window::new(8, 8, files).unwrap(), retries)
     }
 
-    #[test]
-    fn frame_admission_waits_for_a_destination() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(4, 8, 2, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut s).poll_frame_ready(&mut cx).is_pending());
-        assert_eq!(budget.available_capacity(), 4);
-        file(&mut s, &mut cx, File::new(2));
-        assert!(matches!(
-            Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(s.retained_frames(), 0);
-        close(&mut s);
-        assert_eq!(budget.available_capacity(), 4);
-        assert!(results(&mut s).is_empty());
+    struct PinnedFile {
+        opens: Cell<usize>,
+        writes: Cell<usize>,
+        closes: Cell<usize>,
+        _pin: PhantomPinned,
     }
 
-    #[test]
-    fn budget_waiter_wakes_and_reserves_before_ownership_transfer() {
-        struct Counter(AtomicUsize);
-        impl Wake for Counter {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
+    impl WriteFile<Vec<u8>> for PinnedFile {
+        type Error = std::convert::Infallible;
+        type Output = usize;
+
+        fn frame_capacity(&self) -> u32 {
+            1
         }
-        let counter = Arc::new(Counter(AtomicUsize::new(0)));
-        let waker = Waker::from(counter.clone());
-        let mut cx = Context::from_waker(&waker);
-        let budget = FrameBudget::new(1);
-        let mut held = budget.permit();
-        assert!(held.poll_grow(&mut cx, 1, 1).is_ready());
-        let mut config = config(1, 8, 2, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        file(&mut s, &mut cx, File::new(1));
-        assert!(Pin::new(&mut s).poll_frame_ready(&mut cx).is_pending());
-        let wakes = counter.0.load(Ordering::Relaxed);
-        held.shrink_to(0);
-        assert!(counter.0.load(Ordering::Relaxed) > wakes);
-        assert!(matches!(
-            Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(s.granted_frames(), 1);
-        assert_eq!(budget.available_capacity(), 0);
-        let drops = Rc::new(Cell::new(0));
-        Pin::new(&mut s)
-            .enqueue_frame(Frame::new(7, &drops))
-            .unwrap();
-        assert_eq!(s.retained_frames(), 1);
-        assert_eq!(drops.get(), 0);
-        close(&mut s);
-        assert_eq!(results(&mut s), [vec![7]]);
-        assert_eq!(drops.get(), 1);
-        assert_eq!(budget.available_capacity(), 1);
-    }
 
-    #[test]
-    fn pending_write_keeps_ownership_and_applies_backpressure() {
-        let budget = FrameBudget::new(1);
-        let mut config = config(1, 8, 2, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let file_a = File::new(2);
-        file_a.writing.close();
-        let drops = Rc::new(Cell::new(0));
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        file(&mut s, &mut cx, file_a.clone());
-        frame(&mut s, &mut cx, 1, &drops);
-        assert!(Pin::new(&mut s).poll_frame_ready(&mut cx).is_pending());
-        assert_eq!(s.retained_frames(), 1);
-        assert_eq!(drops.get(), 0);
-        file_a.writing.open();
-        assert!(matches!(
-            Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(drops.get(), 1);
-        Pin::new(&mut s)
-            .enqueue_frame(Frame::new(2, &drops))
-            .unwrap();
-        close(&mut s);
-        assert_eq!(results(&mut s), [vec![1, 2]]);
-        assert_eq!(drops.get(), 2);
-    }
-
-    #[test]
-    fn ready_frame_survives_progress_finalization_and_window_reduction() {
-        for retries in [0, 1] {
-            let budget = FrameBudget::new(8);
-            let mut config = config(8, 16, 2, retries);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let file_a = File::new(1);
-            file_a.finalizing.close();
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let drops = Rc::new(Cell::new(0));
-            file(&mut s, &mut cx, file_a.clone());
-            file(&mut s, &mut cx, File::new(2));
-            frame(&mut s, &mut cx, 1, &drops);
-            assert!(matches!(
-                Pin::new(&mut s).poll_frame_ready(&mut cx),
-                Poll::Ready(Ok(()))
-            ));
-            file_a.finalizing.open();
-            s.poll_progress(&mut cx);
-            s.set_window(Window::new(1, 1, 1).unwrap()).unwrap();
-            assert!(s.granted_frames() >= 1);
-            assert_eq!(
-                Pin::new(&mut s).poll_next(&mut cx),
-                Poll::Ready(Some(Ok(vec![1])))
-            );
-            assert!(matches!(
-                Pin::new(&mut s).poll_frame_ready(&mut cx),
-                Poll::Ready(Ok(()))
-            ));
-            Pin::new(&mut s)
-                .enqueue_frame(Frame::new(2, &drops))
-                .unwrap();
-            close(&mut s);
-            assert_eq!(results(&mut s), [vec![2]]);
-            assert_eq!(drops.get(), 2);
-        }
-    }
-
-    #[test]
-    fn ready_file_survives_window_reduction() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(4, 8, 2, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        file(&mut s, &mut cx, File::new(2));
-        assert!(matches!(
-            Pin::new(&mut s).poll_file_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        s.set_window(Window::new(1, 1, 1).unwrap()).unwrap();
-        s.poll_progress(&mut cx);
-        Pin::new(&mut s).enqueue_file(File::new(2)).unwrap();
-        assert_eq!(s.active, 2);
-        assert!(Pin::new(&mut s).poll_file_ready(&mut cx).is_pending());
-        close(&mut s);
-        assert!(results(&mut s).is_empty());
-    }
-
-    #[test]
-    fn variable_capacity_files_can_extend_beyond_the_horizon() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(2, 4, 4, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        file(&mut s, &mut cx, File::new(3));
-        file(&mut s, &mut cx, File::new(5));
-        assert_eq!(s.horizon, 8);
-        assert!(Pin::new(&mut s).poll_file_ready(&mut cx).is_pending());
-        let drops = Rc::new(Cell::new(0));
-        for value in 0..3 {
-            frame(&mut s, &mut cx, value, &drops);
-        }
-        assert_eq!(
-            Pin::new(&mut s).poll_next(&mut cx),
-            Poll::Ready(Some(Ok(vec![0, 1, 2])))
-        );
-        assert!(Pin::new(&mut s).poll_file_ready(&mut cx).is_pending());
-        for value in 3..8 {
-            frame(&mut s, &mut cx, value, &drops);
-        }
-        assert_eq!(
-            Pin::new(&mut s).poll_next(&mut cx),
-            Poll::Ready(Some(Ok(vec![3, 4, 5, 6, 7])))
-        );
-        assert!(matches!(
-            Pin::new(&mut s).poll_file_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        close(&mut s);
-        assert!(results(&mut s).is_empty());
-        assert_eq!(drops.get(), 8);
-    }
-
-    #[test]
-    fn active_file_limit_waits_for_finalization() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(4, 16, 1, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let file_a = File::new(1);
-        file_a.finalizing.close();
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let drops = Rc::new(Cell::new(0));
-        file(&mut s, &mut cx, file_a.clone());
-        frame(&mut s, &mut cx, 1, &drops);
-        assert!(Pin::new(&mut s).poll_file_ready(&mut cx).is_pending());
-        file_a.finalizing.open();
-        assert!(matches!(
-            Pin::new(&mut s).poll_file_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        Pin::new(&mut s).enqueue_file(File::new(1)).unwrap();
-        close(&mut s);
-        assert_eq!(results(&mut s), [vec![1]]);
-    }
-
-    #[test]
-    fn concurrent_finalization_still_emits_results_in_order() {
-        for retries in [0, 1] {
-            let budget = FrameBudget::new(8);
-            let mut config = config(8, 16, 2, retries);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let file_a = File::new(2);
-            file_a.finalizing.close();
-            let file_b = File::new(3);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let drops = Rc::new(Cell::new(0));
-            file(&mut s, &mut cx, file_a.clone());
-            file(&mut s, &mut cx, file_b.clone());
-            for value in 0..5 {
-                frame(&mut s, &mut cx, value, &drops);
-            }
-            close(&mut s);
-            s.poll_progress(&mut cx);
-            assert_eq!(file_b.finalized.get(), 1);
-            assert_eq!(file_a.finalized.get(), 0);
-            assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
-            file_a.finalizing.open();
-            assert_eq!(results(&mut s), [vec![0, 1], vec![2, 3, 4]]);
-            assert_eq!(drops.get(), 5);
-        }
-    }
-
-    #[test]
-    fn replay_retains_frames_and_reserves_the_entire_destination() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(1, 8, 2, 1);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let file_a = File::new(4);
-        file_a.finalizing.close();
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let drops = Rc::new(Cell::new(0));
-        file(&mut s, &mut cx, file_a.clone());
-        assert!(matches!(
-            Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(s.granted_frames(), 4);
-        assert_eq!(budget.available_capacity(), 0);
-        Pin::new(&mut s)
-            .enqueue_frame(Frame::new(9, &drops))
-            .unwrap();
-        s.poll_progress(&mut cx);
-        assert_eq!(drops.get(), 0);
-        assert_eq!(s.retained_frames(), 1);
-        close(&mut s);
-        s.poll_progress(&mut cx);
-        assert_eq!(drops.get(), 0);
-        file_a.finalizing.open();
-        assert_eq!(results(&mut s), [vec![9]]);
-        assert_eq!(drops.get(), 1);
-    }
-
-    #[test]
-    fn retries_replay_without_clone_for_open_write_and_finalize_errors() {
-        for stage in 0..3 {
-            let budget = FrameBudget::new(4);
-            let mut config = config(4, 8, 1, 1);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let file_a = File::new(3);
-            match stage {
-                0 => file_a.open_failures.set(1),
-                1 => file_a.write_failures.set(1),
-                _ => file_a.finalize_failures.set(1),
-            }
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let drops = Rc::new(Cell::new(0));
-            file(&mut s, &mut cx, file_a.clone());
-            for value in 0..3 {
-                frame(&mut s, &mut cx, value, &drops);
-            }
-            close(&mut s);
-            assert_eq!(results(&mut s), [vec![0, 1, 2]]);
-            assert_eq!(file_a.opens.get(), 2);
-            assert_eq!(drops.get(), 3);
-            assert_eq!(budget.available_capacity(), 4);
-        }
-    }
-
-    #[test]
-    fn closing_empty_inputs_in_either_order_is_idempotent() {
-        for frames_first in [false, true] {
-            let budget = FrameBudget::new(4);
-            let mut config = config(4, 8, 2, 1);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            if frames_first {
-                Pin::new(&mut s).close_frames().unwrap();
+        fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+            let this = self.as_ref().get_ref();
+            this.opens.set(this.opens.get() + 1);
+            if this.opens.get() == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
             } else {
-                Pin::new(&mut s).close_files().unwrap();
-            }
-            assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
-            assert!(!s.is_terminated());
-            close(&mut s);
-            close(&mut s);
-            assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
-            assert!(s.is_terminated());
-        }
-    }
-
-    #[test]
-    fn closing_partial_input_discards_unused_files_unopened() {
-        for frames_first in [false, true] {
-            for retries in [0, 1] {
-                let budget = FrameBudget::new(8);
-                let mut config = config(8, 16, 2, retries);
-                let mut s = Scheduler::new(&budget, &mut config);
-                let used = File::new(4);
-                let unused = File::new(4);
-                let waker = futures::task::noop_waker();
-                let mut cx = Context::from_waker(&waker);
-                let drops = Rc::new(Cell::new(0));
-                file(&mut s, &mut cx, used.clone());
-                file(&mut s, &mut cx, unused.clone());
-                frame(&mut s, &mut cx, 5, &drops);
-                if frames_first {
-                    Pin::new(&mut s).close_frames().unwrap();
-                    assert_eq!(
-                        Pin::new(&mut s).poll_next(&mut cx),
-                        Poll::Ready(Some(Ok(vec![5])))
-                    );
-                    assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
-                    Pin::new(&mut s).close_files().unwrap();
-                    assert!(results(&mut s).is_empty());
-                } else {
-                    Pin::new(&mut s).close_files().unwrap();
-                    Pin::new(&mut s).close_frames().unwrap();
-                    assert_eq!(results(&mut s), [vec![5]]);
-                }
-                assert_eq!(used.opens.get(), 1);
-                assert_eq!(unused.opens.get(), 0);
-                assert_eq!(drops.get(), 1);
-                assert_eq!(budget.available_capacity(), 8);
-            }
-        }
-    }
-
-    #[test]
-    fn closing_cancels_an_unused_frame_reservation() {
-        for retries in [0, 1] {
-            let budget = FrameBudget::new(4);
-            let mut config = config(4, 8, 1, retries);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let unused = File::new(4);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            file(&mut s, &mut cx, unused.clone());
-            assert!(matches!(
-                Pin::new(&mut s).poll_frame_ready(&mut cx),
                 Poll::Ready(Ok(()))
-            ));
+            }
+        }
+
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &Context<'_>,
+            _: &Vec<u8>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let this = self.as_ref().get_ref();
+            this.writes.set(this.writes.get() + 1);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>> {
+            let this = self.as_ref().get_ref();
+            this.closes.set(this.closes.get() + 1);
+            if this.closes.get() == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(this.writes.get()))
+            }
+        }
+    }
+
+    #[test]
+    fn one_pinned_file_survives_every_state_and_pending_poll() {
+        let file = Box::pin(PinnedFile {
+            opens: Cell::new(0),
+            writes: Cell::new(0),
+            closes: Cell::new(0),
+            _pin: PhantomPinned,
+        });
+        let address = file.as_ref().get_ref() as *const PinnedFile;
+        let mut slot = Slot::<Vec<u8>, _>::new(file, false);
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
+
+        assert!(matches!(slot.state, FileState::Idle));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert_eq!(slot.file.as_ref().get_ref().opens.get(), 0);
+        slot.frames.push(vec![1]);
+        slot.assigned = 1;
+        slot.state = FileState::Opening;
+        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert!(matches!(slot.state, FileState::Opening));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 0)));
+        assert!(matches!(slot.state, FileState::Writing));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 1)));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 0)));
+        assert!(matches!(slot.state, FileState::Closing));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert!(matches!(slot.state, FileState::Closing));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 0)));
+        assert!(matches!(slot.state, FileState::Closed(1)));
+        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert_eq!(slot.file.as_ref().get_ref().closes.get(), 2);
+        assert_eq!(slot.file.as_ref().get_ref() as *const PinnedFile, address);
+    }
+
+    #[test]
+    fn partial_frame_and_fifo_replacement_then_close() {
+        let budget = FrameBudget::new(2);
+        let mut allocator = BytesFrameAllocator::new(3).unwrap();
+        let mut config = config(2, 0);
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+        let first = File::new(1);
+        let spare = File::new(1);
+        writer.push_file(first.clone()).unwrap();
+        writer.push_file(spare.clone()).unwrap();
+        assert!(!writer.accept_file());
+        assert_eq!(first.opens.get(), 0);
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
+        assert_eq!(
+            Pin::new(&mut writer).poll_write(&cx, b"ab"),
+            Poll::Ready(Ok(WriteStatus {
+                output: Some(2),
+                completed_files: 0,
+                missing_files: 0
+            }))
+        );
+        assert_eq!(first.opens.get(), 0);
+        assert_eq!(writer.retained_frames(), 1);
+        assert_eq!(
+            Pin::new(&mut writer).poll_write(&cx, b"cd"),
+            Poll::Ready(Ok(WriteStatus {
+                output: Some(1),
+                completed_files: 0,
+                missing_files: 0
+            }))
+        );
+        // The next call drains the first file and starts a partial frame in the second.
+        assert_eq!(
+            Pin::new(&mut writer).poll_write(&cx, b"d"),
+            Poll::Ready(Ok(WriteStatus {
+                output: Some(1),
+                completed_files: 1,
+                missing_files: 0
+            }))
+        );
+        let replacement = File::new(1);
+        let (_, output) = writer.pop_swap(replacement.clone()).unwrap();
+        assert_eq!(output, [b"abc".to_vec()]);
+        assert!(matches!(
+            writer.pop_file(),
+            Err(WriteError::Contract(ContractError::InputClosed))
+        ));
+        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(1)));
+        assert_eq!(writer.pop_file().unwrap().unwrap().1, [b"d".to_vec()]);
+        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+        assert_eq!(replacement.opens.get(), 0);
+        assert_eq!(budget.available_capacity(), 2);
+        assert!(!writer.accept_file());
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&cx, b"x"),
+            Poll::Ready(Err(WriteError::Contract(ContractError::InputClosed)))
+        ));
+    }
+
+    #[test]
+    fn later_files_finish_without_passing_a_blocked_head() {
+        let budget = FrameBudget::new(2);
+        let mut allocator = BytesFrameAllocator::new(1).unwrap();
+        let mut config = config(2, 0);
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+        let first = File::new(1);
+        first.blocked.set(true);
+        let second = File::new(1);
+        writer.push_file(first.clone()).unwrap();
+        writer.push_file(second.clone()).unwrap();
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut writer).poll_write(&cx, b"a").is_ready());
+        assert!(Pin::new(&mut writer).poll_write(&cx, b"b").is_ready());
+        assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
+        assert!(writer.pop_file().unwrap().is_none());
+        assert_eq!(*second.attempts.borrow(), [vec![b"b".to_vec()]]);
+        assert_eq!(writer.retained_frames(), 1);
+        first.unblock();
+        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(2)));
+        assert_eq!(writer.pop_file().unwrap().unwrap().1, [b"a".to_vec()]);
+        assert_eq!(writer.pop_file().unwrap().unwrap().1, [b"b".to_vec()]);
+        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+    }
+
+    #[test]
+    fn retries_replay_the_file_and_share_the_budget() {
+        let budget = FrameBudget::new(2);
+        let mut other = budget.permit();
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
+        let mut budget_cx = Context::from_waker(&waker);
+        assert_eq!(other.poll_grow(&mut budget_cx, 1, 1), Poll::Ready(Ok(())));
+        let mut allocator = BytesFrameAllocator::new(2).unwrap();
+        let mut config = config(1, 1);
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+        let file = File::new(2);
+        file.failures.set(1);
+        writer.push_file(file.clone()).unwrap();
+        assert!(Pin::new(&mut writer).poll_write(&cx, b"ab").is_pending());
+        assert_eq!(writer.retained_frames(), 0);
+        assert_eq!(file.opens.get(), 0);
+        other.shrink_to(0);
+        assert!(Pin::new(&mut writer).poll_write(&cx, b"ab").is_ready());
+        assert_eq!(writer.reserved_frames(), 2);
+        assert!(Pin::new(&mut writer).poll_write(&cx, b"cd").is_ready());
+        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(1)));
+        let expected = vec![b"ab".to_vec(), b"cd".to_vec()];
+        assert_eq!(
+            *file.attempts.borrow(),
+            [expected.clone(), expected.clone()]
+        );
+        assert_eq!(writer.pop_file().unwrap().unwrap().1, expected);
+        assert_eq!(budget.available_capacity(), 2);
+    }
+
+    #[test]
+    fn missing_files_and_invalid_replacement_preserve_the_head() {
+        let budget = FrameBudget::new(1);
+        let mut allocator = BytesFrameAllocator::new(1).unwrap();
+        let mut config = config(1, 0);
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
+        assert_eq!(
+            Pin::new(&mut writer).poll_write(&cx, b"a"),
+            Poll::Ready(Ok(WriteStatus {
+                output: None,
+                completed_files: 0,
+                missing_files: 1
+            }))
+        );
+        writer.push_file(File::new(1)).unwrap();
+        assert!(Pin::new(&mut writer).poll_write(&cx, b"a").is_ready());
+        assert_eq!(
+            Pin::new(&mut writer).poll_write(&cx, b"b"),
+            Poll::Ready(Ok(WriteStatus {
+                output: None,
+                completed_files: 1,
+                missing_files: 0
+            }))
+        );
+        assert!(matches!(
+            writer.pop_swap(File::new(0)),
+            Err(WriteError::Contract(ContractError::ZeroFrameCapacity))
+        ));
+        assert_eq!(writer.pop_swap(File::new(1)).unwrap().1, [b"a".to_vec()]);
+    }
+
+    #[test]
+    fn closing_empty_input_never_opens_a_destination_and_drop_releases_partial_budget() {
+        let budget = FrameBudget::new(1);
+        let mut allocator = BytesFrameAllocator::new(4).unwrap();
+        let mut config = config(1, 0);
+        let file = File::new(4);
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
+        {
+            let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+            writer.push_file(file.clone()).unwrap();
+            assert!(Pin::new(&mut writer).poll_write(&cx, b"").is_ready());
+            assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+            assert_eq!(file.opens.get(), 0);
+        }
+        {
+            let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+            writer.push_file(file.clone()).unwrap();
+            assert!(Pin::new(&mut writer).poll_write(&cx, b"a").is_ready());
             assert_eq!(budget.available_capacity(), 0);
-            close(&mut s);
-            assert!(results(&mut s).is_empty());
-            assert_eq!(unused.opens.get(), 0);
-            assert_eq!(budget.available_capacity(), 4);
+        }
+        assert_eq!(budget.available_capacity(), 1);
+        assert_eq!(file.opens.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use futures::task::noop_waker;
+    use std::marker::PhantomPinned;
+
+    struct FailingPartial(PhantomPinned);
+    struct Allocator;
+    struct File;
+
+    impl PartialFrame for FailingPartial {
+        type Input = [u8];
+        type Output = usize;
+        type Frame = FailingPartial;
+        type Error = &'static str;
+
+        fn poll_fill(&mut self, _: &Context<'_>, _: &[u8]) -> Poll<Result<usize, Self::Error>> {
+            Poll::Ready(Err("input"))
+        }
+        fn is_complete(&self) -> bool {
+            false
+        }
+        fn is_empty(&self) -> bool {
+            true
+        }
+        fn finish(self) -> Self::Frame {
+            self
+        }
+    }
+
+    impl FrameAllocator for Allocator {
+        type Partial = FailingPartial;
+        fn allocate(&mut self) -> Self::Partial {
+            FailingPartial(PhantomPinned)
+        }
+    }
+
+    impl WriteFile<FailingPartial> for File {
+        type Error = &'static str;
+        type Output = ();
+        fn frame_capacity(&self) -> u32 {
+            1
+        }
+        fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err("must stay unopened"))
+        }
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &Context<'_>,
+            _: &FailingPartial,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err("must stay unopened"))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err("must stay unopened"))
         }
     }
 
     #[test]
-    fn terminal_errors_release_frames_and_are_reported_once() {
-        for via_stream in [false, true] {
-            let budget = FrameBudget::new(4);
-            let mut config = config(4, 8, 1, 0);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let failed = File::new(2);
-            failed.write_failures.set(1);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let drops = Rc::new(Cell::new(0));
-            file(&mut s, &mut cx, failed);
-            frame(&mut s, &mut cx, 0, &drops);
-            s.poll_progress(&mut cx);
-            assert_eq!(drops.get(), 1);
-            assert_eq!(budget.available_capacity(), 4);
-            if via_stream {
-                assert_eq!(
-                    Pin::new(&mut s).poll_next(&mut cx),
-                    Poll::Ready(Some(Err(SchedulerError::Backend(Failure::Write))))
-                );
-            } else {
-                assert_eq!(
-                    Pin::new(&mut s).poll_frame_ready(&mut cx),
-                    Poll::Ready(Err(SchedulerError::Backend(Failure::Write)))
-                );
-            }
-            assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
-            assert!(s.is_terminated());
-        }
-    }
-
-    #[test]
-    fn closed_files_without_a_destination_fail_frame_admission() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(4, 8, 1, 0);
-        let mut s = Scheduler::new(&budget, &mut config);
-        Pin::new(&mut s).close_files().unwrap();
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
+    fn input_failure_cancels_work_and_returns_the_budget_without_unpin_or_clone() {
+        let budget = FrameBudget::new(1);
+        let mut config = SchedulerConfig::default();
+        let mut allocator = Allocator;
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
+        writer.push_file(File).unwrap();
+        let waker = noop_waker();
+        let cx = Context::from_waker(&waker);
         assert_eq!(
-            Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Err(SchedulerError::Contract(
-                ContractError::MissingWriteFile
-            )))
+            Pin::new(&mut writer).poll_write(&cx, b"a"),
+            Poll::Ready(Err(WriteError::Input("input")))
         );
-        assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
-    }
-
-    #[test]
-    fn invalid_file_capacities_are_terminal() {
-        for capacity in [0, 5] {
-            let budget = FrameBudget::new(4);
-            let mut config = config(4, 8, 1, 1);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            assert!(matches!(
-                Pin::new(&mut s).poll_file_ready(&mut cx),
-                Poll::Ready(Ok(()))
-            ));
-            let expected = if capacity == 0 {
-                ContractError::ZeroFrameCapacity
-            } else {
-                ContractError::FrameCapacityExceedsBudget
-            };
-            assert_eq!(
-                Pin::new(&mut s).enqueue_file(File::new(capacity)),
-                Err(expected.into())
-            );
-            assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
-            assert_eq!(budget.available_capacity(), 4);
-        }
-    }
-
-    #[test]
-    fn dropping_the_scheduler_releases_owned_frames_and_reservations() {
-        let budget = FrameBudget::new(4);
-        let mut config = config(4, 8, 1, 1);
-        let mut s = Scheduler::new(&budget, &mut config);
-        let file_a = File::new(4);
-        file_a.writing.close();
-        let drops = Rc::new(Cell::new(0));
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        file(&mut s, &mut cx, file_a);
-        frame(&mut s, &mut cx, 0, &drops);
-        assert!(matches!(
-            Pin::new(&mut s).poll_frame_ready(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        drop(s);
-        assert_eq!(drops.get(), 1);
-        assert_eq!(budget.available_capacity(), 4);
-    }
-
-    #[test]
-    fn repeated_ready_polls_reuse_the_same_frame_reservation() {
-        for retries in [0, 1] {
-            let budget = FrameBudget::new(4);
-            let mut config = config(4, 8, 1, retries);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            file(&mut s, &mut cx, File::new(4));
-            assert!(matches!(
-                Pin::new(&mut s).poll_frame_ready(&mut cx),
-                Poll::Ready(Ok(()))
-            ));
-            let granted = s.granted_frames();
-            let reserved = s.reserved;
-            for _ in 0..3 {
-                assert!(matches!(
-                    Pin::new(&mut s).poll_frame_ready(&mut cx),
-                    Poll::Ready(Ok(()))
-                ));
-                assert_eq!(s.granted_frames(), granted);
-                assert_eq!(s.reserved, reserved);
-                assert_eq!(s.retained_frames(), 0);
-            }
-            close(&mut s);
-            assert!(results(&mut s).is_empty());
-            assert_eq!(budget.available_capacity(), 4);
-        }
-    }
-
-    #[test]
-    fn closing_cancels_pending_budget_waits() {
-        let budget = FrameBudget::new(4);
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut held = budget.permit();
-        assert!(held.poll_grow(&mut cx, 4, 4).is_ready());
-        let mut config = config(4, 8, 1, 1);
-        let mut s = Scheduler::new(&budget, &mut config);
-        file(&mut s, &mut cx, File::new(4));
-        assert!(Pin::new(&mut s).poll_frame_ready(&mut cx).is_pending());
-        close(&mut s);
-        held.shrink_to(0);
-        assert_eq!(budget.available_capacity(), 4);
-        assert!(results(&mut s).is_empty());
-    }
-
-    #[test]
-    fn initial_configuration_errors_are_reported_once() {
-        for zero_budget in [false, true] {
-            let budget = FrameBudget::new(if zero_budget { 0 } else { 4 });
-            let window = Window::default().with_target_frames(if zero_budget { 4 } else { 0 });
-            let mut config = SchedulerConfig::new(window, 0);
-            let mut s = Scheduler::new(&budget, &mut config);
-            let waker = futures::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let expected = if zero_budget {
-                ContractError::ZeroBudget
-            } else {
-                ContractError::InvalidWindow
-            };
-            assert_eq!(
-                Pin::new(&mut s).poll_file_ready(&mut cx),
-                Poll::Ready(Err(expected.into()))
-            );
-            assert_eq!(Pin::new(&mut s).poll_next(&mut cx), Poll::Ready(None));
-        }
+        assert_eq!(budget.available_capacity(), 1);
+        assert_eq!(writer.retained_frames(), 0);
+        assert!(!writer.accept_file());
     }
 }

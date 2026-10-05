@@ -37,6 +37,8 @@ pub enum ContractError {
     InputClosed,
     /// An item was supplied without a successful readiness reservation.
     AdmissionNotReady,
+    /// An allocator returned a nonempty or complete frame, or an empty frame completed.
+    InvalidPartialFrame,
 }
 
 impl fmt::Display for ContractError {
@@ -56,6 +58,9 @@ impl fmt::Display for ContractError {
             Self::InvalidFramePosition => "frame position is outside the available read buffer",
             Self::InputClosed => "scheduler input is closed",
             Self::AdmissionNotReady => "admission requires a readiness reservation",
+            Self::InvalidPartialFrame => {
+                "partial frame must start empty and incomplete and complete nonempty"
+            }
         })
     }
 }

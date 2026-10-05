@@ -12,8 +12,11 @@ pub use budget::{FrameBudget, FramePermit};
 pub use config::{SchedulerConfig, Window};
 pub use error::{ContractError, SchedulerError};
 pub use read::{ReadEvent, ReadScheduler};
-pub use traits::{FrameWriter, ReadFile, WriteFile};
-pub use write::{WriteEvent, WriteScheduler};
+pub use traits::{ReadFile, WriteFile};
+pub use write::{
+    AsyncFilesWrite, BytesFrameAllocator, BytesPartialFrame, FilesWriteError, FrameAllocator,
+    PartialFrame, WriteError, WriteScheduler, WriteStatus,
+};
 
 /// A pending event, an available event, EOF or a scheduler error.
 pub type EventPoll<T, E> = std::task::Poll<Result<Option<T>, SchedulerError<E>>>;
@@ -29,7 +32,7 @@ impl Interest {
     pub const NONE: Self = Self(0);
     /// File admission for either scheduler.
     pub const FILES: Self = Self(1);
-    /// Frame admission for `WriteScheduler`; ignored by `ReadScheduler`.
+    /// Reserved for frame admission; ignored by `ReadScheduler`.
     pub const FRAMES: Self = Self(2);
     /// Ordered read frames or write finalization results.
     pub const RESULTS: Self = Self(4);
