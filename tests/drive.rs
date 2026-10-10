@@ -193,10 +193,10 @@ fn write_poll_yields_after_bounded_backend_work_and_resumes() {
     }
     file.writing.open();
     let (wakes, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&waker);
     let before_polls = file.writing.polls();
     let before_wakes = wakes.0.load(Ordering::Relaxed);
-    assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
+    assert!(Pin::new(&mut writer).poll_close(&mut cx).is_pending());
     let polls = file.writing.polls() - before_polls;
     assert!(polls > 0 && polls <= 256);
     assert!(wakes.0.load(Ordering::Relaxed) > before_wakes);

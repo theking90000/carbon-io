@@ -157,12 +157,12 @@ fn pending_fill_keeps_input_unconsumed_and_wakes_without_opening_file() {
     let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
     writer.push_file(file.clone()).unwrap();
     let (wakes, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut writer).poll_write(&cx, &7).is_pending());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer).poll_write(&mut cx, &7).is_pending());
     let before = wakes.0.load(Ordering::Relaxed);
     assert_eq!(file.opens.get(), 0);
     for _ in 0..3 {
-        assert!(Pin::new(&mut writer).poll_write(&cx, &7).is_pending());
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, &7).is_pending());
     }
     assert_eq!(wakes.0.load(Ordering::Relaxed), before);
     filling.open();
@@ -185,13 +185,13 @@ fn cancelled_write_wait_preserves_attempt_and_replaces_backend_waker() {
     let (old, old_waker) = context_waker();
     assert!(
         Pin::new(&mut writer)
-            .poll_write(&Context::from_waker(&old_waker), &1)
+            .poll_write(&mut Context::from_waker(&old_waker), &1)
             .is_pending()
     );
     let (new, new_waker) = context_waker();
     assert!(
         Pin::new(&mut writer)
-            .poll_write(&Context::from_waker(&new_waker), &1)
+            .poll_write(&mut Context::from_waker(&new_waker), &1)
             .is_pending()
     );
     let before = old.0.load(Ordering::Relaxed);

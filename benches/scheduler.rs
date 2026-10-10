@@ -112,7 +112,7 @@ impl WriteFile<u64> for Destination {
     fn frame_capacity(&self) -> u32 {
         self.count
     }
-    fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), ()>> {
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let this = self.get_mut();
         let attempt = this.attempts.get();
         this.attempts.set(attempt + 1);
@@ -125,7 +125,7 @@ impl WriteFile<u64> for Destination {
         });
         Poll::Ready(Ok(()))
     }
-    fn poll_write(self: Pin<&mut Self>, cx: &Context<'_>, frame: &u64) -> Poll<Result<(), ()>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &u64) -> Poll<Result<(), ()>> {
         let this = self.get_mut().writer.as_mut().unwrap();
         this.polls.set(this.polls.get() + 1);
         if this.waiting {
@@ -137,7 +137,7 @@ impl WriteFile<u64> for Destination {
         this.waiting = this.pending;
         Poll::Ready(Ok(()))
     }
-    fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<u64, ()>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u64, ()>> {
         let this = self.get_mut().writer.as_ref().unwrap();
         this.polls.set(this.polls.get() + 1);
         Poll::Ready(if this.fail { Err(()) } else { Ok(this.sum) })
@@ -259,7 +259,7 @@ fn poll_writer(
     next: &mut u64,
     total: u64,
     batch: usize,
-    cx: &Context<'_>,
+    cx: &mut Context<'_>,
 ) -> Poll<Option<Result<u64, carbon_io::WriteError<std::convert::Infallible, ()>>>> {
     while writer.accept_file() {
         writer.push_file(files.next().unwrap())?;

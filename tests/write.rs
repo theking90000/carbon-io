@@ -93,8 +93,8 @@ fn write_allows_concurrent_files_and_returns_results_in_fifo_order() {
             write_value(&mut writer, value);
         }
         let (_, waker) = context_waker();
-        let cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut writer).poll_close(&mut cx).is_pending());
         assert_eq!(second.finalized.get(), 1);
         assert!(writer.pop_file().unwrap().is_none());
         assert_eq!(writer.retained_frames(), if retry == 0 { 0 } else { 2 });
@@ -122,7 +122,7 @@ fn replay_retains_frames_until_close_and_streaming_releases_each_success() {
         let (_, waker) = context_waker();
         assert!(
             Pin::new(&mut writer)
-                .poll_close(&Context::from_waker(&waker))
+                .poll_close(&mut Context::from_waker(&waker))
                 .is_pending()
         );
         assert_eq!(drops.get(), if retry == 0 { 4 } else { 0 });
@@ -147,8 +147,8 @@ fn zero_retry_buffers_only_to_capacity_and_resumes_after_backend_wake() {
     write_value(&mut writer, 0);
     write_value(&mut writer, 1);
     let (wakes, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut writer).poll_write(&cx, &2).is_pending());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer).poll_write(&mut cx, &2).is_pending());
     assert_eq!(writer.retained_frames(), 2);
     assert_eq!(drops.get(), 0);
     let before = wakes.0.load(Ordering::Relaxed);
@@ -208,20 +208,20 @@ fn write_fails_after_max_retries_and_cancels_work() {
         write_value(&mut writer, value);
     }
     let (_, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&waker);
     assert_eq!(
-        Pin::new(&mut writer).poll_close(&cx),
+        Pin::new(&mut writer).poll_close(&mut cx),
         Poll::Ready(Err(E::Backend("finalize")))
     );
     assert_eq!(drops.get(), 2);
     assert_eq!(budget.available_capacity(), 2);
     assert!(!writer.accept_file());
     assert_eq!(
-        Pin::new(&mut writer).poll_write(&cx, &2),
+        Pin::new(&mut writer).poll_write(&mut cx, &2),
         Poll::Ready(Err(E::Contract(C::InputClosed)))
     );
     assert_eq!(
-        Pin::new(&mut writer).poll_close(&cx),
+        Pin::new(&mut writer).poll_close(&mut cx),
         Poll::Ready(Err(E::Contract(C::InputClosed)))
     );
 }
@@ -261,7 +261,7 @@ fn rejected_operations_preserve_accepted_work() {
     }
     let (_, waker) = context_waker();
     let Poll::Ready(Ok(status)) =
-        Pin::new(&mut writer).poll_write(&Context::from_waker(&waker), &4)
+        Pin::new(&mut writer).poll_write(&mut Context::from_waker(&waker), &4)
     else {
         panic!("missing status")
     };
@@ -295,11 +295,11 @@ fn completed_heads_are_replaced_at_the_tail_before_more_input() {
     writer.push_file(Write::new(1)).unwrap();
     writer.push_file(Write::new(2)).unwrap();
     let (_, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&waker);
     let mut outputs = Vec::new();
     for value in 0..12 {
         loop {
-            let Poll::Ready(Ok(status)) = Pin::new(&mut writer).poll_write(&cx, &value) else {
+            let Poll::Ready(Ok(status)) = Pin::new(&mut writer).poll_write(&mut cx, &value) else {
                 panic!("stalled")
             };
             for _ in 0..status.completed_files {
@@ -325,7 +325,7 @@ fn missing_descriptors_are_reported_before_input_is_consumed() {
     let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
     let (_, waker) = context_waker();
     let Poll::Ready(Ok(status)) =
-        Pin::new(&mut writer).poll_write(&Context::from_waker(&waker), &7)
+        Pin::new(&mut writer).poll_write(&mut Context::from_waker(&waker), &7)
     else {
         panic!("missing status")
     };
@@ -354,7 +354,7 @@ fn dropping_writer_cancels_pending_io_and_returns_all_capacity() {
         let (_, waker) = context_waker();
         assert!(
             Pin::new(&mut writer)
-                .poll_write(&Context::from_waker(&waker), &4)
+                .poll_write(&mut Context::from_waker(&waker), &4)
                 .is_pending()
         );
         assert_eq!(drops.get(), 0);
@@ -404,12 +404,12 @@ fn future_commit_survives_an_earlier_fatal_failure() {
         write_value(&mut writer, value);
     }
     let (_, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer).poll_close(&mut cx).is_pending());
     assert_eq!(second.finalized.get(), 1);
     first.finalizing.open();
     assert_eq!(
-        Pin::new(&mut writer).poll_close(&cx),
+        Pin::new(&mut writer).poll_close(&mut cx),
         Poll::Ready(Err(E::Backend("finalize")))
     );
     assert_eq!(second.finalized.get(), 1);

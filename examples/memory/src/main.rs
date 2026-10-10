@@ -92,13 +92,13 @@ impl WriteFile<u32> for Destination {
     fn frame_capacity(&self) -> u32 {
         self.capacity
     }
-    fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Infallible>> {
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
         self.get_mut().sum = 0;
         Poll::Ready(Ok(()))
     }
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         frame: &u32,
     ) -> Poll<Result<(), Infallible>> {
         let this = self.get_mut();
@@ -111,7 +111,7 @@ impl WriteFile<u32> for Destination {
         this.sum += frame;
         Poll::Ready(Ok(()))
     }
-    fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<u32, Infallible>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Infallible>> {
         Poll::Ready(Ok(self.sum))
     }
 }

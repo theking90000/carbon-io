@@ -193,17 +193,17 @@ impl WriteFile<Vec<u8>> for File {
     type Error = Infallible;
     type Output = Vec<u8>;
     fn frame_capacity(&self) -> u32 { 2 }
-    fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Infallible>> {
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
         self.get_mut().0.clear();
         Poll::Ready(Ok(()))
     }
-    fn poll_write(self: Pin<&mut Self>, _: &Context<'_>, frame: &Vec<u8>)
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &Vec<u8>)
         -> Poll<Result<(), Infallible>>
     {
         self.get_mut().0.extend_from_slice(frame);
         Poll::Ready(Ok(()))
     }
-    fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<Vec<u8>, Infallible>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<Vec<u8>, Infallible>> {
         Poll::Ready(Ok(std::mem::take(&mut self.get_mut().0)))
     }
 }

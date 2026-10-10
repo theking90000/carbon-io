@@ -44,19 +44,19 @@ impl WriteFile<Frame> for File {
     fn frame_capacity(&self) -> u32 {
         4
     }
-    fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Infallible>> {
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
         self.get_mut().0 = 0;
         Poll::Ready(Ok(()))
     }
     fn poll_write(
         self: Pin<&mut Self>,
-        _: &Context<'_>,
+        _: &mut Context<'_>,
         frame: &Frame,
     ) -> Poll<Result<(), Infallible>> {
         self.get_mut().0 += frame.0;
         Poll::Ready(Ok(()))
     }
-    fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<u32, Infallible>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Infallible>> {
         Poll::Ready(Ok(self.0))
     }
 }
@@ -69,16 +69,22 @@ fn neither_clone_nor_unpin_is_required_on_frames_partial_frames_or_input() {
         let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).unwrap();
         writer.push_file(File(0)).unwrap();
         let waker = futures::task::noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         for input in [Frame(2, PhantomPinned), Frame(3, PhantomPinned)] {
-            let Poll::Ready(Ok(status)) = Pin::new(&mut writer).poll_write(&cx, &input) else {
+            let Poll::Ready(Ok(status)) = Pin::new(&mut writer).poll_write(&mut cx, &input) else {
                 panic!("not consumed")
             };
             assert_eq!(status.output, Some(()));
         }
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(1)));
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(1))
+        );
         assert_eq!(writer.pop_file().unwrap().unwrap().1, 5);
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(0))
+        );
         assert_eq!(budget.available_capacity(), 4);
     }
 }

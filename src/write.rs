@@ -184,7 +184,7 @@ pub trait AsyncFilesWrite {
     /// Drive I/O and fill at most one partial frame from borrowed input.
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         input: &Self::Input,
     ) -> Poll<Result<WriteStatus<Self::Output>, Self::Error>>;
     /// Replace one completed head with an unopened tail, returning its descriptor and result.
@@ -192,7 +192,7 @@ pub trait AsyncFilesWrite {
     -> Result<(Self::File, Self::FileOutput), Self::Error>;
     /// Stop accepting input, flush the partial frame, and finalize all used files.
     /// A positive count requires `pop_file`; zero means closing is complete.
-    fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>>;
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<usize, Self::Error>>;
     /// Remove one completed head during close, without accepting a replacement.
     fn pop_file(&mut self) -> FileCloseResult<Self>;
 }
@@ -294,7 +294,7 @@ impl<T, F: WriteFile<T> + Unpin> Slot<T, F> {
     // One state transition or backend poll, plus the capacity it releases.
     fn poll(
         &mut self,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         closing: bool,
         max_retries: u32,
     ) -> Result<(bool, usize), F::Error> {
@@ -496,7 +496,7 @@ impl<'a, A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> WriteScheduler<'a, A
         self.wake();
     }
 
-    fn drive(&mut self, cx: &Context<'_>) -> Result<(), FilesWriteError<A, F>> {
+    fn drive(&mut self, cx: &mut Context<'_>) -> Result<(), FilesWriteError<A, F>> {
         let count = self.files.len();
         if count == 0 {
             return Ok(());
@@ -642,7 +642,7 @@ impl<A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> AsyncFilesWrite
 
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         input: &Self::Input,
     ) -> Poll<Result<WriteStatus<Self::Output>, Self::Error>> {
         let this = self.get_mut();
@@ -730,7 +730,7 @@ impl<A: FrameAllocator, F: WriteFile<Frame<A>> + Unpin> AsyncFilesWrite
         Ok((previous, output))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<usize, Self::Error>> {
         let this = self.get_mut();
         this.waker = None;
         if this.phase == Phase::Failed {
@@ -816,7 +816,7 @@ mod tests {
             self.capacity
         }
 
-        fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             let this = self.get_mut();
             this.opens.set(this.opens.get() + 1);
             this.attempts.borrow_mut().push(Vec::new());
@@ -826,7 +826,7 @@ mod tests {
 
         fn poll_write(
             self: Pin<&mut Self>,
-            cx: &Context<'_>,
+            cx: &mut Context<'_>,
             frame: &Vec<u8>,
         ) -> Poll<Result<(), Self::Error>> {
             let this = self.get_mut();
@@ -843,7 +843,7 @@ mod tests {
 
         fn poll_close(
             self: Pin<&mut Self>,
-            _: &Context<'_>,
+            _: &mut Context<'_>,
         ) -> Poll<Result<Self::Output, Self::Error>> {
             let this = self.get_mut();
             if this.failures.get() > 0 {
@@ -873,7 +873,7 @@ mod tests {
             1
         }
 
-        fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             let this = self.as_ref().get_ref();
             this.opens.set(this.opens.get() + 1);
             if this.opens.get() == 1 {
@@ -886,7 +886,7 @@ mod tests {
 
         fn poll_write(
             self: Pin<&mut Self>,
-            _: &Context<'_>,
+            _: &mut Context<'_>,
             _: &Vec<u8>,
         ) -> Poll<Result<(), Self::Error>> {
             let this = self.as_ref().get_ref();
@@ -894,7 +894,10 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<usize, Self::Error>> {
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<usize, Self::Error>> {
             let this = self.as_ref().get_ref();
             this.closes.set(this.closes.get() + 1);
             if this.closes.get() == 1 {
@@ -917,26 +920,26 @@ mod tests {
         let address = file.as_ref().get_ref() as *const PinnedFile;
         let mut slot = Slot::<Vec<u8>, _>::new(file, false);
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
 
         assert!(matches!(slot.state, FileState::Idle));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((false, 0)));
         assert_eq!(slot.file.as_ref().get_ref().opens.get(), 0);
         slot.frames.push(vec![1]);
         slot.assigned = 1;
         slot.state = FileState::Opening;
-        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((false, 0)));
         assert!(matches!(slot.state, FileState::Opening));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((true, 0)));
         assert!(matches!(slot.state, FileState::Writing));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 1)));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((true, 1)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((true, 0)));
         assert!(matches!(slot.state, FileState::Closing));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((false, 0)));
         assert!(matches!(slot.state, FileState::Closing));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((true, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((true, 0)));
         assert!(matches!(slot.state, FileState::Closed(1)));
-        assert_eq!(slot.poll(&cx, false, 0), Ok((false, 0)));
+        assert_eq!(slot.poll(&mut cx, false, 0), Ok((false, 0)));
         assert_eq!(slot.file.as_ref().get_ref().closes.get(), 2);
         assert_eq!(slot.file.as_ref().get_ref() as *const PinnedFile, address);
     }
@@ -954,9 +957,9 @@ mod tests {
         assert!(!writer.accept_file());
         assert_eq!(first.opens.get(), 0);
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         assert_eq!(
-            Pin::new(&mut writer).poll_write(&cx, b"ab"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"ab"),
             Poll::Ready(Ok(WriteStatus {
                 output: Some(2),
                 completed_files: 0,
@@ -966,7 +969,7 @@ mod tests {
         assert_eq!(first.opens.get(), 0);
         assert_eq!(writer.retained_frames(), 1);
         assert_eq!(
-            Pin::new(&mut writer).poll_write(&cx, b"cd"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"cd"),
             Poll::Ready(Ok(WriteStatus {
                 output: Some(1),
                 completed_files: 0,
@@ -975,7 +978,7 @@ mod tests {
         );
         // The next call drains the first file and starts a partial frame in the second.
         assert_eq!(
-            Pin::new(&mut writer).poll_write(&cx, b"d"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"d"),
             Poll::Ready(Ok(WriteStatus {
                 output: Some(1),
                 completed_files: 1,
@@ -989,14 +992,20 @@ mod tests {
             writer.pop_file(),
             Err(WriteError::Contract(ContractError::InputClosed))
         ));
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(1)));
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(1))
+        );
         assert_eq!(writer.pop_file().unwrap().unwrap().1, [b"d".to_vec()]);
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(0))
+        );
         assert_eq!(replacement.opens.get(), 0);
         assert_eq!(budget.available_capacity(), 2);
         assert!(!writer.accept_file());
         assert!(matches!(
-            Pin::new(&mut writer).poll_write(&cx, b"x"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"x"),
             Poll::Ready(Err(WriteError::Contract(ContractError::InputClosed)))
         ));
     }
@@ -1013,18 +1022,24 @@ mod tests {
         writer.push_file(first.clone()).unwrap();
         writer.push_file(second.clone()).unwrap();
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut writer).poll_write(&cx, b"a").is_ready());
-        assert!(Pin::new(&mut writer).poll_write(&cx, b"b").is_ready());
-        assert!(Pin::new(&mut writer).poll_close(&cx).is_pending());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"a").is_ready());
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"b").is_ready());
+        assert!(Pin::new(&mut writer).poll_close(&mut cx).is_pending());
         assert!(writer.pop_file().unwrap().is_none());
         assert_eq!(*second.attempts.borrow(), [vec![b"b".to_vec()]]);
         assert_eq!(writer.retained_frames(), 1);
         first.unblock();
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(2)));
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(2))
+        );
         assert_eq!(writer.pop_file().unwrap().unwrap().1, [b"a".to_vec()]);
         assert_eq!(writer.pop_file().unwrap().unwrap().1, [b"b".to_vec()]);
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(0))
+        );
     }
 
     #[test]
@@ -1032,7 +1047,7 @@ mod tests {
         let budget = FrameBudget::new(2);
         let mut other = budget.permit();
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         let mut budget_cx = Context::from_waker(&waker);
         assert_eq!(other.poll_grow(&mut budget_cx, 1, 1), Poll::Ready(Ok(())));
         let mut allocator = BytesFrameAllocator::new(2).unwrap();
@@ -1041,14 +1056,21 @@ mod tests {
         let file = File::new(2);
         file.failures.set(1);
         writer.push_file(file.clone()).unwrap();
-        assert!(Pin::new(&mut writer).poll_write(&cx, b"ab").is_pending());
+        assert!(
+            Pin::new(&mut writer)
+                .poll_write(&mut cx, b"ab")
+                .is_pending()
+        );
         assert_eq!(writer.retained_frames(), 0);
         assert_eq!(file.opens.get(), 0);
         other.shrink_to(0);
-        assert!(Pin::new(&mut writer).poll_write(&cx, b"ab").is_ready());
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"ab").is_ready());
         assert_eq!(writer.reserved_frames(), 2);
-        assert!(Pin::new(&mut writer).poll_write(&cx, b"cd").is_ready());
-        assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(1)));
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"cd").is_ready());
+        assert_eq!(
+            Pin::new(&mut writer).poll_close(&mut cx),
+            Poll::Ready(Ok(1))
+        );
         let expected = vec![b"ab".to_vec(), b"cd".to_vec()];
         assert_eq!(
             *file.attempts.borrow(),
@@ -1065,9 +1087,9 @@ mod tests {
         let mut config = config(1, 0);
         let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         assert_eq!(
-            Pin::new(&mut writer).poll_write(&cx, b"a"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"a"),
             Poll::Ready(Ok(WriteStatus {
                 output: None,
                 completed_files: 0,
@@ -1075,9 +1097,9 @@ mod tests {
             }))
         );
         writer.push_file(File::new(1)).unwrap();
-        assert!(Pin::new(&mut writer).poll_write(&cx, b"a").is_ready());
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"a").is_ready());
         assert_eq!(
-            Pin::new(&mut writer).poll_write(&cx, b"b"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"b"),
             Poll::Ready(Ok(WriteStatus {
                 output: None,
                 completed_files: 1,
@@ -1098,18 +1120,21 @@ mod tests {
         let mut config = config(1, 0);
         let file = File::new(4);
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         {
             let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
             writer.push_file(file.clone()).unwrap();
-            assert!(Pin::new(&mut writer).poll_write(&cx, b"").is_ready());
-            assert_eq!(Pin::new(&mut writer).poll_close(&cx), Poll::Ready(Ok(0)));
+            assert!(Pin::new(&mut writer).poll_write(&mut cx, b"").is_ready());
+            assert_eq!(
+                Pin::new(&mut writer).poll_close(&mut cx),
+                Poll::Ready(Ok(0))
+            );
             assert_eq!(file.opens.get(), 0);
         }
         {
             let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
             writer.push_file(file.clone()).unwrap();
-            assert!(Pin::new(&mut writer).poll_write(&cx, b"a").is_ready());
+            assert!(Pin::new(&mut writer).poll_write(&mut cx, b"a").is_ready());
             assert_eq!(budget.available_capacity(), 0);
         }
         assert_eq!(budget.available_capacity(), 1);
@@ -1160,17 +1185,17 @@ mod failure_tests {
         fn frame_capacity(&self) -> u32 {
             1
         }
-        fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Err("must stay unopened"))
         }
         fn poll_write(
             self: Pin<&mut Self>,
-            _: &Context<'_>,
+            _: &mut Context<'_>,
             _: &FailingPartial,
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Err("must stay unopened"))
         }
-        fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Err("must stay unopened"))
         }
     }
@@ -1183,9 +1208,9 @@ mod failure_tests {
         let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
         writer.push_file(File).unwrap();
         let waker = noop_waker();
-        let cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&waker);
         assert_eq!(
-            Pin::new(&mut writer).poll_write(&cx, b"a"),
+            Pin::new(&mut writer).poll_write(&mut cx, b"a"),
             Poll::Ready(Err(WriteError::Input("input")))
         );
         assert_eq!(budget.available_capacity(), 1);

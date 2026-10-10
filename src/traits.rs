@@ -69,17 +69,17 @@ pub trait ReadFile<T> {
 ///     type Output = u32;
 ///
 ///     fn frame_capacity(&self) -> u32 { 10 }
-///     fn poll_open(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<(), Infallible>> {
+///     fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
 ///         self.get_mut().0 = 0;
 ///         Poll::Ready(Ok(()))
 ///     }
-///     fn poll_write(self: Pin<&mut Self>, _: &Context<'_>, frame: &u32)
+///     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &u32)
 ///         -> Poll<Result<(), Infallible>>
 ///     {
 ///         self.get_mut().0 += *frame;
 ///         Poll::Ready(Ok(()))
 ///     }
-///     fn poll_close(self: Pin<&mut Self>, _: &Context<'_>) -> Poll<Result<u32, Infallible>> {
+///     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Infallible>> {
 ///         Poll::Ready(Ok(self.get_mut().0))
 ///     }
 /// }
@@ -92,17 +92,17 @@ pub trait WriteFile<T> {
     /// Nonzero maximum number of frames in this destination.
     fn frame_capacity(&self) -> u32;
     /// Open the first attempt, or restart after an error, without replacing this file.
-    fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
     /// Accept one borrowed frame, or register a wakeup when writing can continue.
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         frame: &T,
     ) -> Poll<Result<(), Self::Error>>;
     /// Commit accepted frames and finish this file.
     fn poll_close(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Output, Self::Error>>;
 }
 
@@ -118,13 +118,13 @@ where
         self.as_ref().get_ref().frame_capacity()
     }
 
-    fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.get_mut().as_mut().poll_open(cx)
     }
 
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         frame: &T,
     ) -> Poll<Result<(), Self::Error>> {
         self.get_mut().as_mut().poll_write(cx, frame)
@@ -132,7 +132,7 @@ where
 
     fn poll_close(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Output, Self::Error>> {
         self.get_mut().as_mut().poll_close(cx)
     }

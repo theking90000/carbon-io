@@ -220,7 +220,7 @@ impl WriteFile<Frame> for Write {
     fn frame_capacity(&self) -> u32 {
         self.capacity
     }
-    fn poll_open(self: Pin<&mut Self>, cx: &Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         if !this.opening.ready(cx) {
             return Poll::Pending;
@@ -236,7 +236,7 @@ impl WriteFile<Frame> for Write {
     }
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
         frame: &Frame,
     ) -> Poll<Result<(), Self::Error>> {
         if !self.writing.ready(cx) {
@@ -253,7 +253,7 @@ impl WriteFile<Frame> for Write {
     }
     fn poll_close(
         self: Pin<&mut Self>,
-        cx: &Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Output, Self::Error>> {
         if !self.finalizing.ready(cx) {
             return Poll::Pending;
@@ -329,19 +329,19 @@ impl PartialFrame for Partial {
 pub type Writer<'a> = carbon_io::WriteScheduler<'a, Allocator, Write>;
 pub fn write_value(writer: &mut Writer<'_>, value: usize) {
     let (_, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
-    let Poll::Ready(Ok(status)) = Pin::new(writer).poll_write(&cx, &value) else {
+    let mut cx = Context::from_waker(&waker);
+    let Poll::Ready(Ok(status)) = Pin::new(writer).poll_write(&mut cx, &value) else {
         panic!("value was not accepted");
     };
     assert_eq!(status.output, Some(()));
 }
 pub fn close_writer(writer: &mut Writer<'_>) -> Vec<Vec<usize>> {
     let (counter, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(&waker);
     let mut outputs = Vec::new();
     for _ in 0..100_000 {
         let before = counter.0.load(Ordering::Relaxed);
-        match Pin::new(&mut *writer).poll_close(&cx) {
+        match Pin::new(&mut *writer).poll_close(&mut cx) {
             Poll::Ready(Ok(0)) => return outputs,
             Poll::Ready(Ok(count)) => {
                 for _ in 0..count {

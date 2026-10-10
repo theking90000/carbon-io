@@ -259,9 +259,9 @@ fn two_replay_writers_do_not_deadlock_with_partial_local_grants() {
         write_value(&mut writer1, value);
     }
     let (wakes, waker) = context_waker();
-    let cx = Context::from_waker(&waker);
-    assert!(Pin::new(&mut writer1).poll_close(&cx).is_pending());
-    assert!(Pin::new(&mut writer2).poll_write(&cx, &0).is_pending());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut writer1).poll_close(&mut cx).is_pending());
+    assert!(Pin::new(&mut writer2).poll_write(&mut cx, &0).is_pending());
     assert_eq!(writer2.retained_frames(), 0);
     let before = wakes.0.load(Ordering::Relaxed);
     first.finalizing.open();
