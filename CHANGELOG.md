@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- Breaking API change: replace borrowed read-file streams with explicit admission through `file_ready()` and `enqueue_file()`, followed by `close_files()`; add `ReadEvent` and interest-filtered polling.
+- Breaking API change: replace the write input stream with a borrowed `FrameAllocator` and incremental `PartialFrame` filling through `AsyncFilesWrite::poll_write()`.
+- Breaking API change: replace separate write-open, writer, and finalization types with one reusable `WriteFile` implementing `poll_open()`, `poll_write()`, and `poll_close()`.
+- Maintain write destinations in FIFO order with `push_file()` and `pop_swap()`; flush partial input and drain completed files through `poll_close()` and `pop_file()`.
+- Add `BytesFrameAllocator`, `WriteStatus`, and `WriteError`; migrate examples, tests, benchmarks, and documentation to the new APIs.
+
 ## 0.3.2
 
 - Breaking API change: borrow `Unpin` input and file streams via mutable references, the shared frame budget, and mutable scheduler configuration. Constructors and `FramePermit` now carry a borrow lifetime.

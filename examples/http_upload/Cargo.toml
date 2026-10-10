@@ -8,7 +8,7 @@ publish = false
 [workspace]
 
 [dependencies]
-carbon-io = { version = "0.3.2", path = "../.." }
+carbon-io = { version = "0.4.0", path = "../.." }
 bytes = "1"
 futures = "0.3.32"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
