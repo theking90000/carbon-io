@@ -49,7 +49,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-carbon-io = "0.4.0"
+carbon-io = "0.4.1"
 futures = "0.3" # StreamExt, select! and the executor used in the examples.
 ```
 

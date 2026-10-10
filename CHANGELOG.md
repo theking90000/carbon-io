@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Accept mutable task contexts in `WriteFile` and `AsyncFilesWrite` polling methods so backends can poll futures directly.
+
 ## 0.4.0
 
 - Breaking API change: replace borrowed read-file streams with explicit admission through `file_ready()` and `enqueue_file()`, followed by `close_files()`; add `ReadEvent` and interest-filtered polling.
