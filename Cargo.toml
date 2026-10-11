@@ -31,6 +31,10 @@ futures = "0.3.32"
 name = "scheduler"
 harness = false
 
+[[bench]]
+name = "read_frames"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
