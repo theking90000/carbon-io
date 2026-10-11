@@ -20,7 +20,7 @@ writes across files, limits buffering, and delivers results in order.
 Polling drives I/O. CARBON starts no background tasks.
 
 Schedulers borrow a shared `&FrameBudget` and a mutable `&mut SchedulerConfig`.
-Reads admit files after `file_ready().await`. Writes also borrow a frame allocator;
+Reads admit files directly with `push_file()`. Writes also borrow a frame allocator;
 `poll_write()` fills its partial frame and reports completed files to replace.
 The producer retains its sources and drives input and output in the same task.
 Dropping a scheduler cancels its operations and releases its budget.
@@ -38,7 +38,8 @@ Test conditions: a 588 MB source file, split into 10 MiB segments of 160 frames
 at 64 KiB each, with an artificial 500 ms delay per file open. The two runs
 allowed 10 or 50 active files, covering 100 or 500 MiB of data ahead, with the
 same 4,000-frame buffering budget, equivalent to 250 MiB. The charts' “buffer”
-labels refer to that file window, not measured memory usage.
+labels refer to that file window, not measured memory usage. These historical
+measurements predate the direct frame-polling read API.
 
 ![Measured throughput compared with sequential I/O](.github/throughput-summary.png)
 ![A larger file window hides the simulated opening latency](.github/latency-hiding.png)
@@ -58,116 +59,91 @@ The Tokio snippets below require Tokio.
 
 ## Reading files
 
-Implement `ReadFile<T>` for your file descriptors. Each descriptor declares its
-frame count and opens a stream that yields exactly that many successful frames,
-followed by EOF.
+`ReadFile<T>` opens and reads on the same object. Each file declares an exact,
+nonzero frame count. `poll_read(cx, &mut T)` returns `Some(())` for a complete
+frame and `None` for EOF. The backend owns its preparation state and offsets;
+CARBON treats each buffer as opaque. It stops reading at the declared count,
+without polling for EOF. An earlier `None` is a contract error; extra frames
+are never polled.
 
-```text
-            poll_file_ready(cx)
-                      │ Ready(Ok(()))
-                enqueue_file(F)
-                      │
-                      ▼
-            ┌──────────────────┐
-            │  ReadScheduler   │ ── next().await ──► Frame (T)
-            │     (Stream)     │
-            └──────────────────┘
-```
+Supply a buffer factory, the shared budget, and mutable configuration to
+`ReadScheduler::new`. Pass `&mut factory` to borrow the factory. `push_file`
+accepts a descriptor immediately or returns `(PushError, file)`. A full window
+preserves the scheduler; retain the returned descriptor and retry after polling.
+`close_files()` ends admission and allows EOF after all accepted files drain.
 
-Admission follows the Sink pattern: poll readiness, then transfer ownership of
-the file with `enqueue_file(F)`. On `Pending`, the producer keeps the file and waits
-for a wakeup. `close_files()` ends admission; accepted files still drain in order.
-`ReadScheduler` implements `Stream`; `next().await` yields a frame or an error,
-and returns `None` after all accepted files have drained.
+`ReadScheduler::poll_read(cx, &mut output)` exchanges the next complete frame
+with the supplied reusable buffer. Heap-backed payloads such as `Vec<u8>` are
+not copied. Each successful result transfers that frame to the caller, outside
+CARBON's budget.
 
 ```rust
-use std::{collections::VecDeque, convert::Infallible, error::Error, future::{Ready, ready}, ops::Range};
-use futures::{executor::block_on, stream};
-use carbon_io::{FrameBudget, ReadEvent, ReadFile, ReadScheduler, SchedulerConfig};
+use std::{convert::Infallible, error::Error, future::poll_fn, pin::Pin, task::{Context, Poll}};
+use futures::executor::block_on;
+use carbon_io::{FrameBudget, ReadFile, ReadScheduler, SchedulerConfig};
 
-struct File(Range<u32>);
-
+struct File { count: u32, next: u32 }
 impl ReadFile<u32> for File {
     type Error = Infallible;
-    type Reader = stream::Iter<std::vec::IntoIter<Result<u32, Infallible>>>;
-    type Open = Ready<Result<Self::Reader, Self::Error>>;
-
-    fn frame_count(&self) -> u32 { self.0.end - self.0.start }
-    fn open(&self) -> Self::Open {
-        ready(Ok(stream::iter(self.0.clone().map(Ok).collect::<Vec<_>>())))
+    fn frame_count(&self) -> u32 { self.count }
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, frame: &mut u32)
+        -> Poll<Result<Option<()>, Infallible>>
+    {
+        let this = self.get_mut();
+        if this.next == this.count { return Poll::Ready(Ok(None)); }
+        *frame = this.next;
+        this.next = this.next.saturating_add(1);
+        Poll::Ready(Ok(Some(())))
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
-        let budget = FrameBudget::new(64);
+        let budget = FrameBudget::new(16);
         let mut config = SchedulerConfig::default();
-        let mut reader = ReadScheduler::new(&budget, &mut config);
-        let mut files = VecDeque::from([File(0..3), File(3..5)]);
-        let mut values = Vec::new();
-
-        while let Some(event) = reader.next_event().await? {
-            match event {
-                ReadEvent::FileReady => {
-                    while !files.is_empty() && reader.accept_file() {
-                        reader.enqueue_file(files.pop_front().unwrap())?;
-                    }
-                    if files.is_empty() {
-                        reader.close_files()?;
-                    }
-                }
-                ReadEvent::Frame(frame) => values.push(frame),
-            }
+        let mut make_frame = || 0;
+        let mut reader = ReadScheduler::new(&mut make_frame, &budget, &mut config)?;
+        reader.push_file(File { count: 3, next: 0 }).map_err(|(error, _)| error)?;
+        reader.close_files();
+        let mut frame = 0;
+        while poll_fn(|cx| reader.poll_read(cx, &mut frame)).await?.is_some() {
+            println!("{frame}");
         }
-        assert_eq!(values, [0, 1, 2, 3, 4]);
         Ok(())
     })
 }
 ```
 
-`next_event()` handles file readiness and frame output with one mutable borrow.
-Files stay in the caller's queue until admission is ready. One `FileReady` event
-can admit several files: `accept_file()` reserves a place and returns `true`,
-then `enqueue_file()` transfers ownership. The loop stops on backpressure;
-`next_event()` drives I/O until another event is available. The same operation is
-available as `poll(cx)` when implementing a custom future.
+An empty input remains `Pending` while admission is open. It registers no waker
+and requests no budget. `push_file()`, `close_files()`, and `set_window()` do not
+wake a task: explicitly poll again after changing the scheduler. A producer
+waiting for external descriptors must arrange its own wakeup. A combined producer
+and consumer must retry a retained descriptor after a poll frees admission, then
+repoll or schedule another poll after that successful push.
 
-### Keep reading while the consumer waits
+Opening ahead and buffering remain separate. With a 100-frame first file,
+`open_ahead_frames = 120`, and `target_frames = 10`, the second file may open
+immediately. Its first frame becomes authorized after 91 frames have been
+consumed. Within the authorized window, different files may finish out of order;
+CARBON returns complete frames in file order.
 
-When handling `ReadEvent::Frame(frame)`, poll file readiness alongside the TCP
-send. Once the file queue is empty, close admission and switch to `progress()`:
+Both `poll_read()` and `poll_progress()` advance I/O. To continue preparing frames
+while a consumer waits, poll `progress()` alongside that wait:
 
 ```ignore
-let sending = write_tcp(frame);
-tokio::pin!(sending);
-loop {
+while poll_fn(|cx| reader.poll_read(cx, &mut frame)).await?.is_some() {
     tokio::select! {
-        result = &mut sending => {
-            result?;
-            break;
-        }
-        ready = async {
-            if files.is_empty() {
-                reader.close_files()?;
-                reader.progress().await;
-            }
-            reader.file_ready().await
-        } => {
-            ready?;
-            while !files.is_empty() && reader.accept_file() {
-                reader.enqueue_file(files.pop_front().unwrap())?;
-            }
-            if files.is_empty() {
-                reader.close_files()?;
-            }
-        }
+        result = send_frame(&frame) => result?,
+        _ = reader.progress() => return Err("progress unexpectedly completed".into()),
     }
 }
 ```
 
-`file_ready()` drives I/O without consuming frames. `progress()` does the same
-after admission closes and never completes. The pinned send survives each loop
-turn, so a successful admission does not cancel a partially completed TCP write.
+`progress()` never completes and consumes no output. Once the authorized window
+is full, no further data is prepared. No background task is created.
 
 ## Writing files
 
@@ -273,7 +249,7 @@ are reported by scheduler operations.
 ## Retries, errors, and cancellation
 
 `max_retries` defaults to zero and counts additional attempts per file. Reads
-retry opening failures only. A reader error, early EOF, or extra frame is fatal.
+retry opening failures only. A reader error or early EOF is fatal.
 Writes can retry opening, writing, or finalizing, with one shared retry count
 across those stages.
 
@@ -292,43 +268,47 @@ A fatal error releases scheduler resources immediately. Reads emit the error
 once, then return EOF. Writes return the error from the current poll and reject
 later operations with `InputClosed`.
 
-Dropping a pending `next()` or a `progress()` future preserves the scheduler's
+Dropping a pending read or a `progress()` future preserves the scheduler's
 state. Dropping the scheduler abandons its operations and releases its resources.
 It does not undo writes. Backends must clean up abandoned attempts.
 
-## Integrating a backend or custom stream
+## Integrating a backend
 
-`ReadScheduler` implements `Stream`. Its entry points are:
+`ReadScheduler` uses direct polling and does not implement `Stream`.
 
 | Entry point | Behavior |
 | --- | --- |
-| `next().await` / `poll_next(cx)` | Remove the next ordered output, advancing I/O if needed |
-| `next_event().await` / `poll(cx)` | Return input readiness or the next ordered output with one mutable borrow |
-| `next_event_with_interest(interest).await` / `poll_with_interest(cx, interest)` | Return only requested event kinds, errors or EOF |
-| `file_ready().await` | Reserve one input admission without consuming output |
-| `accept_file()` | Reserve one admission synchronously, returning a bool without taking an item or polling backend I/O |
-| `enqueue_file(file)` | Transfer ownership into a reserved admission |
-| `progress()` | Keep advancing I/O without consuming output; never completes |
-| `poll_progress(cx)` | Advance at most 256 work items from a custom future or stream |
+| `push_file(file)` | Admit immediately or return the descriptor without polling or waking |
+| `close_files()` | End admission; explicitly poll again |
+| `poll_read(cx, &mut frame)` | Advance I/O and exchange the next complete ordered frame |
+| `poll_progress(cx)` | Advance I/O without consuming output; defer errors to `poll_read` |
+| `progress()` | Never-completing future for progress during another wait |
 
-Backends must follow these rules:
+Backends register the supplied waker before returning `Pending`. They receive
+that context directly, with no slot wakers or ready queue. Each pending operation
+is polled at most once per scheduler call. Work is limited to
+`max(256, active_files)` backend polls, so even a configured window larger than
+256 can register every file before waiting. Further runnable work schedules
+another poll; pending-only work does not self-wake.
 
-- Register the supplied waker before returning `Pending`.
-- For reads, make every `open()` an independent attempt that can be abandoned by dropping it.
-- For writes, reopen the same file object after an error and cancel its previous attempt.
-- A pending `poll_write` receives the same logical frame on its next poll, but
-  its address may change. Do not retain the borrowed `&T` after returning.
-- Finalize only after all assigned writes succeed.
+A pending read receives the same logical buffer with its contents preserved.
+Its address may change. The backend must not retain its reference, and must
+initialize recycled buffers when starting a new frame. CARBON has no partial-read
+frame interface. A pending buffer still occupies one reserved frame slot.
 
-Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Read opening futures and
-readers may be `!Unpin`. Write files must be `Unpin` or supplied through a pinned
-pointer. Partial frames and borrowed write input need neither `Clone` nor `Unpin`.
-The crate contains no unsafe code.
+After the declared final frame is handed to the caller, the file leaves the
+active window and the returned buffer is available for reuse. No EOF buffer or
+additional backend poll is needed. Idle recycled buffers retain their allocated
+storage; the budget measures authorized operations and output, not cached bytes.
 
-Rejected admissions return contract errors; rejected write calls preserve accepted work.
-`FramePermit::poll_grow` returns `Poll<Result<(), ContractError>>`; an invalid
-growth request returns `InvalidBudgetRequest` and preserves existing grants or
-waits.
+Files must be `Unpin` or supplied as `Pin<Box<F>>` or `Pin<&mut F>`. Frames need
+neither `Clone`, `Send`, nor `Unpin`. Reads retry opening errors only. After an
+opening error, the next `poll_open` starts a fresh attempt. Write backends also
+restart after write or close errors, for replay from the first frame.
+
+The crate contains no unsafe code and has no runtime dependencies.
+`FramePermit::poll_grow` rejects invalid requests while preserving existing grants
+and waits. Shared-budget synchronization remains unchanged.
 
 ## Examples and performance
 

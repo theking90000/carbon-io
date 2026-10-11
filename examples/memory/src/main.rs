@@ -1,56 +1,54 @@
 //! Keep buffering during consumer backpressure, without a background task.
 use carbon_io::{
-    AsyncFilesWrite, FrameAllocator, FrameBudget, PartialFrame, ReadEvent, ReadFile, ReadScheduler,
+    AsyncFilesWrite, FrameAllocator, FrameBudget, PartialFrame, ReadFile, ReadScheduler,
     SchedulerConfig, WriteFile, WriteScheduler,
 };
-use futures::{FutureExt, Stream, executor::block_on};
+use futures::{FutureExt, executor::block_on};
 use std::{
-    collections::VecDeque,
     convert::Infallible,
-    future::{Ready, poll_fn, ready},
+    error::Error,
+    io,
+    future::poll_fn,
     pin::Pin,
     task::{Context, Poll},
 };
 
-struct Source(std::ops::Range<u32>);
-struct Reader {
+struct Source {
     values: std::ops::Range<u32>,
+    count: u32,
     waiting: bool,
 }
-impl Stream for Reader {
-    type Item = Result<u32, Infallible>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl Source {
+    fn new(values: std::ops::Range<u32>) -> Self {
+        Self { count: values.end.saturating_sub(values.start), values, waiting: true }
+    }
+}
+impl ReadFile<u32> for Source {
+    type Error = Infallible;
+    fn frame_count(&self) -> u32 { self.count }
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &mut u32) -> Poll<Result<Option<()>, Infallible>> {
         let this = self.get_mut();
-        // Simulate an asynchronous read: Pending once before each result.
         if this.waiting {
             this.waiting = false;
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
         this.waiting = true;
-        Poll::Ready(this.values.next().map(Ok))
-    }
-}
-impl ReadFile<u32> for Source {
-    type Error = Infallible;
-    type Open = Ready<Result<Reader, Infallible>>;
-    type Reader = Reader;
-    fn frame_count(&self) -> u32 {
-        self.0.end - self.0.start
-    }
-    fn open(&self) -> Self::Open {
-        ready(Ok(Reader {
-            values: self.0.clone(),
-            waiting: true,
-        }))
+        match this.values.next() {
+            Some(value) => { *frame = value; Poll::Ready(Ok(Some(()))) },
+            None => Poll::Ready(Ok(None)),
+        }
     }
 }
 struct Allocator;
-struct Partial(Option<u32>);
+struct Partial { value: u32, complete: bool }
 impl FrameAllocator for Allocator {
     type Partial = Partial;
     fn allocate(&mut self) -> Partial {
-        Partial(None)
+        Partial { value: 0, complete: false }
     }
 }
 impl PartialFrame for Partial {
@@ -59,17 +57,18 @@ impl PartialFrame for Partial {
     type Frame = u32;
     type Error = Infallible;
     fn poll_fill(&mut self, _: &Context<'_>, input: &u32) -> Poll<Result<(), Infallible>> {
-        self.0 = Some(*input);
+        self.value = *input;
+        self.complete = true;
         Poll::Ready(Ok(()))
     }
     fn is_complete(&self) -> bool {
-        self.0.is_some()
+        self.complete
     }
     fn is_empty(&self) -> bool {
-        self.0.is_none()
+        !self.complete
     }
     fn finish(self) -> u32 {
-        self.0.unwrap()
+        self.value
     }
 }
 struct Destination {
@@ -87,12 +86,12 @@ impl Destination {
     }
 }
 impl WriteFile<u32> for Destination {
-    type Error = Infallible;
+    type Error = io::Error;
     type Output = u32;
     fn frame_capacity(&self) -> u32 {
         self.capacity
     }
-    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+    fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.get_mut().sum = 0;
         Poll::Ready(Ok(()))
     }
@@ -100,7 +99,7 @@ impl WriteFile<u32> for Destination {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         frame: &u32,
-    ) -> Poll<Result<(), Infallible>> {
+    ) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         if this.waiting {
             this.waiting = false;
@@ -108,10 +107,10 @@ impl WriteFile<u32> for Destination {
             return Poll::Pending;
         }
         this.waiting = true;
-        this.sum += frame;
+        this.sum = this.sum.checked_add(*frame).ok_or_else(|| io::Error::other("sum overflow"))?;
         Poll::Ready(Ok(()))
     }
-    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Infallible>> {
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<u32, Self::Error>> {
         Poll::Ready(Ok(self.sum))
     }
 }
@@ -131,48 +130,37 @@ async fn consume<T>(value: T) -> T {
     value
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     block_on(async {
         let budget = FrameBudget::new(512);
         let mut scheduler_config_1 = SchedulerConfig::default();
-        let mut reader = ReadScheduler::new(&budget, &mut scheduler_config_1);
-        let mut files = VecDeque::from([Source(0..3), Source(3..6)]);
+        let mut reader = ReadScheduler::new(|| 0, &budget, &mut scheduler_config_1)?;
+        reader.push_file(Source::new(0..3)).map_err(|(error, _)| error)?;
+        reader.push_file(Source::new(3..6)).map_err(|(error, _)| error)?;
+        reader.close_files();
+        let mut frame = 0;
         let mut frames = Vec::new();
-        while let Some(event) = reader.next_event().await.unwrap() {
-            match event {
-                ReadEvent::FileReady => {
-                    while !files.is_empty() && reader.accept_file() {
-                        reader.enqueue_file(files.pop_front().unwrap()).unwrap();
-                    }
-                    if files.is_empty() {
-                        reader.close_files().unwrap();
-                    }
-                }
-                ReadEvent::Frame(frame) => {
-                    // Awaiting consume() alone would suspend prefetching.
-                    let value = futures::select_biased! {
-                        _ = reader.progress().fuse() => unreachable!("progress never completes"),
-                        value = consume(frame).fuse() => value,
-                    };
-                    frames.push(value);
-                }
-            }
+        while poll_fn(|cx| reader.poll_read(cx, &mut frame)).await?.is_some() {
+            let value = futures::select_biased! {
+                _ = reader.progress().fuse() => return Err(io::Error::other("progress unexpectedly completed").into()),
+                value = consume(frame).fuse() => value,
+            };
+            frames.push(value);
         }
         assert_eq!(frames, [0, 1, 2, 3, 4, 5]);
         let mut config = SchedulerConfig::default().with_max_retries(2);
         config.window.max_active_files = 2;
         let mut allocator = Allocator;
-        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config).unwrap();
-        writer.push_file(Destination::new(2)).unwrap();
-        writer.push_file(Destination::new(4)).unwrap();
+        let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut config)?;
+        writer.push_file(Destination::new(2))?;
+        writer.push_file(Destination::new(4))?;
         let mut sums = Vec::new();
         for frame in frames {
             loop {
                 let status = poll_fn(|cx| Pin::new(&mut writer).poll_write(cx, &frame))
-                    .await
-                    .unwrap();
+                    .await?;
                 for _ in 0..status.completed_files {
-                    let (_, sum) = writer.pop_swap(Destination::new(4)).unwrap();
+                    let (_, sum) = writer.pop_swap(Destination::new(4))?;
                     sums.push(consume(sum).await);
                 }
                 if status.output.is_some() {
@@ -182,17 +170,17 @@ fn main() {
         }
         loop {
             let completed = poll_fn(|cx| Pin::new(&mut writer).poll_close(cx))
-                .await
-                .unwrap();
+                .await?;
             if completed == 0 {
                 break;
             }
             for _ in 0..completed {
-                let (_, sum) = writer.pop_file().unwrap().unwrap();
+                let (_, sum) = writer.pop_file()?.ok_or_else(|| io::Error::other("missing close result"))?;
                 sums.push(consume(sum).await);
             }
         }
         assert_eq!(sums, [1, 14]);
         println!("Finalized file sums: {sums:?}");
-    });
+        Ok(())
+    })
 }

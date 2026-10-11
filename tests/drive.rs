@@ -2,7 +2,7 @@
 mod support;
 
 use carbon_io::{FrameBudget, ReadScheduler, SchedulerError};
-use futures::{FutureExt, StreamExt, stream, stream::FusedStream};
+use futures::{FutureExt, StreamExt, stream};
 use std::{
     future::{Future, poll_fn},
     pin::Pin,
@@ -131,13 +131,9 @@ fn progress_yields_after_bounded_work_and_can_resume_from_budget_wake() {
     assert!(held.poll_grow(&mut cx, 1024, 1024).is_ready());
     let file = Read::new(0..1024);
     let mut scheduler_config_9 = config(1024, 1024, 1, 0);
-    let mut reader = ReadScheduler::new(&budget, &mut scheduler_config_9);
-    assert_eq!(
-        Pin::new(&mut reader).poll_file_ready(&mut cx),
-        Poll::Ready(Ok(()))
-    );
-    Pin::new(&mut reader).enqueue_file(file.clone()).unwrap();
-    Pin::new(&mut reader).close_files().unwrap();
+    let mut reader = ReadScheduler::new(|| 0, &budget, &mut scheduler_config_9).unwrap();
+    assert!(reader.push_file(file.clone()).is_ok());
+    reader.close_files();
     reader.poll_progress(&mut cx);
     assert_eq!(file.reading.polls(), 0);
     let before = wakes.0.load(Ordering::Relaxed);
@@ -147,35 +143,19 @@ fn progress_yields_after_bounded_work_and_can_resume_from_budget_wake() {
     reader.poll_progress(&mut cx);
     assert!(file.reading.polls() > 0 && file.reading.polls() <= 256);
     assert!(wakes.0.load(Ordering::Relaxed) > before);
-    assert_eq!(collect(reader).len(), 1024);
+    assert_eq!(collect_read(&mut reader).len(), 1024);
 }
 
 #[test]
-fn read_progress_handles_initial_errors_and_empty_streams() {
-    for capacity in [0, 1] {
-        let budget = FrameBudget::new(capacity);
-        let mut files = stream::empty::<Read>();
-        let mut cfg = config(1, 1, 1, 0);
-        let mut reader = ReadDriver::<usize, _>::new(&mut files, &budget, &mut cfg);
-        let (wakes, waker) = context_waker();
-        let mut cx = Context::from_waker(&waker);
-        reader.poll_progress(&mut cx);
-        let before = wakes.0.load(Ordering::Relaxed);
-        for _ in 0..2 {
-            reader.poll_progress(&mut cx);
-        }
-        assert_eq!(wakes.0.load(Ordering::Relaxed), before);
-        if capacity == 0 {
-            assert_eq!(
-                poll(&mut reader),
-                Poll::Ready(Some(Err(SchedulerError::Contract(
-                    carbon_io::ContractError::ZeroBudget
-                ))))
-            );
-        }
-        assert!(reader.is_terminated());
-        assert_eq!(poll(&mut reader), Poll::Ready(None));
-    }
+fn read_progress_handles_closed_empty_input_without_waking() {
+    let budget = FrameBudget::new(1);
+    let mut cfg = config(1, 1, 1, 0);
+    let mut reader = ReadScheduler::<usize, Read, _>::new(|| 0, &budget, &mut cfg).unwrap();
+    let (wakes, waker) = context_waker();
+    reader.close_files();
+    reader.poll_progress(&mut Context::from_waker(&waker));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    assert_eq!(poll_read(&mut reader), Poll::Ready(None));
 }
 
 #[test]

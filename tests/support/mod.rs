@@ -7,7 +7,6 @@ use pin_project_lite::pin_project;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
-    future::Future,
     marker::PhantomPinned,
     pin::Pin,
     rc::Rc,
@@ -97,7 +96,6 @@ impl Gate {
         self.0.polls.get()
     }
 }
-#[derive(Clone)]
 pub struct Read {
     pub count: u32,
     pub values: Vec<Result<usize, &'static str>>,
@@ -106,6 +104,8 @@ pub struct Read {
     pub opens: Rc<Cell<usize>>,
     pub open_failures: Rc<Cell<usize>>,
     pub drops: Rc<Cell<usize>>,
+    reader: Option<Pin<Box<Reader>>>,
+    opening_started: bool,
 }
 impl Read {
     pub fn new(values: impl IntoIterator<Item = usize>) -> Self {
@@ -118,29 +118,29 @@ impl Read {
             opens: Rc::new(Cell::new(0)),
             open_failures: Rc::new(Cell::new(0)),
             drops: Rc::new(Cell::new(0)),
+            reader: None,
+            opening_started: false,
         }
     }
 }
-pin_project! { pub struct ReadOpen { file: Option<Read>, #[pin] _pin: PhantomPinned } }
-impl Future for ReadOpen {
-    type Output = Result<Reader, &'static str>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let file = this.file.as_ref().unwrap();
-        if !file.opening.ready(cx) {
-            return Poll::Pending;
+impl Clone for Read {
+    fn clone(&self) -> Self {
+        Self {
+            count: self.count,
+            values: self.values.clone(),
+            opening: self.opening.clone(),
+            reading: self.reading.clone(),
+            opens: self.opens.clone(),
+            open_failures: self.open_failures.clone(),
+            drops: self.drops.clone(),
+            reader: None,
+            opening_started: false,
         }
-        if file.open_failures.get() > 0 {
-            file.open_failures.set(file.open_failures.get() - 1);
-            return Poll::Ready(Err("open"));
-        }
-        let file = this.file.take().unwrap();
-        Poll::Ready(Ok(Reader {
-            values: file.values.into(),
-            gate: file.reading,
-            drops: file.drops,
-            _pin: PhantomPinned,
-        }))
+    }
+}
+impl std::fmt::Debug for Read {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Read").field("count", &self.count).finish()
     }
 }
 pin_project! { pub struct Reader { values: VecDeque<Result<usize, &'static str>>, gate: Gate, drops: Rc<Cell<usize>>, #[pin] _pin: PhantomPinned }
@@ -158,16 +158,47 @@ impl Stream for Reader {
 }
 impl ReadFile<usize> for Read {
     type Error = &'static str;
-    type Open = ReadOpen;
-    type Reader = Reader;
     fn frame_count(&self) -> u32 {
         self.count
     }
-    fn open(&self) -> Self::Open {
-        self.opens.set(self.opens.get() + 1);
-        ReadOpen {
-            file: Some(self.clone()),
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        if !this.opening_started {
+            this.opens.set(this.opens.get() + 1);
+            this.opening_started = true;
+        }
+        if !this.opening.ready(cx) {
+            return Poll::Pending;
+        }
+        if this.open_failures.get() > 0 {
+            this.open_failures.set(this.open_failures.get() - 1);
+            this.opening_started = false;
+            return Poll::Ready(Err("open"));
+        }
+        this.reader = Some(Box::pin(Reader {
+            values: this.values.clone().into(),
+            gate: this.reading.clone(),
+            drops: this.drops.clone(),
             _pin: PhantomPinned,
+        }));
+        Poll::Ready(Ok(()))
+    }
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        frame: &mut usize,
+    ) -> Poll<Result<Option<()>, Self::Error>> {
+        let Some(reader) = self.get_mut().reader.as_mut() else {
+            return Poll::Ready(Err("not open"));
+        };
+        match reader.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(value))) => {
+                *frame = value;
+                Poll::Ready(Ok(Some(())))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
+            Poll::Ready(None) => Poll::Ready(Ok(None)),
         }
     }
 }
@@ -374,61 +405,33 @@ impl<S: Stream> Stream for PinnedStream<S> {
     }
 }
 
-struct SourceWake {
-    ready: std::sync::atomic::AtomicBool,
-    parent: std::sync::Mutex<Option<Waker>>,
-}
-impl SourceWake {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            ready: std::sync::atomic::AtomicBool::new(true),
-            parent: std::sync::Mutex::new(None),
-        })
-    }
-    fn register(&self, cx: &Context<'_>) {
-        let mut parent = self.parent.lock().unwrap();
-        if parent.as_ref().is_none_or(|old| !old.will_wake(cx.waker())) {
-            *parent = Some(cx.waker().clone());
-        }
-    }
-}
-impl Wake for SourceWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-        let parent = self.parent.lock().unwrap().clone();
-        if let Some(waker) = parent {
-            waker.wake();
-        }
-    }
-}
-
-/// External descriptor producer for the read regression fixtures.
+/// Test-only adapter for caller-owned descriptor streams and complete-frame output.
 pub struct ReadDriver<'a, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
-    scheduler: carbon_io::ReadScheduler<'a, T, S::Item>,
+    scheduler: carbon_io::ReadScheduler<'a, T, S::Item, fn() -> T>,
     files: &'a mut S,
-    source_wake: Arc<SourceWake>,
+    pending: Option<S::Item>,
     closed: bool,
-    stopped: bool,
+    output: T,
     error: Option<carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>>,
 }
 impl<T, S> Unpin for ReadDriver<'_, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
 }
 
 impl<'a, T, S> ReadDriver<'a, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
     pub fn new(
         files: &'a mut S,
@@ -436,58 +439,59 @@ where
         config: &'a mut SchedulerConfig,
     ) -> Self {
         Self {
-            scheduler: carbon_io::ReadScheduler::new(budget, config),
+            scheduler: carbon_io::ReadScheduler::new(T::default as fn() -> T, budget, config)
+                .unwrap(),
             files,
-            source_wake: SourceWake::new(),
+            pending: None,
             closed: false,
-            stopped: false,
+            output: T::default(),
             error: None,
         }
     }
-    fn feed(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Result<(), carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>> {
-        self.source_wake.register(cx);
-        for turn in 0..64 {
-            if self.closed || !self.source_wake.ready.load(Ordering::Acquire) {
+    fn feed(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut changed = false;
+        for _ in 0..64 {
+            if self.closed {
                 break;
             }
-            if Pin::new(&mut self.scheduler)
-                .poll_file_ready(cx)?
-                .is_pending()
-            {
-                break;
-            }
-            self.source_wake.ready.store(false, Ordering::Release);
-            let waker = Waker::from(self.source_wake.clone());
-            match Pin::new(&mut *self.files).poll_next(&mut Context::from_waker(&waker)) {
-                Poll::Pending => break,
-                Poll::Ready(None) => {
-                    Pin::new(&mut self.scheduler).close_files()?;
+            let file = match self.pending.take() {
+                Some(file) => file,
+                None => match Pin::new(&mut *self.files).poll_next(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(None) => {
+                        self.closed = true;
+                        self.scheduler.close_files();
+                        changed = true;
+                        break;
+                    }
+                    Poll::Ready(Some(file)) => file,
+                },
+            };
+            match self.scheduler.push_file(file) {
+                Ok(()) => changed = true,
+                Err((carbon_io::PushError::Full, file)) => {
+                    self.pending = Some(file);
+                    break;
+                }
+                Err((carbon_io::PushError::Contract(error), _)) => {
+                    self.error = Some(error.into());
                     self.closed = true;
                     break;
                 }
-                Poll::Ready(Some(file)) => {
-                    Pin::new(&mut self.scheduler).enqueue_file(file)?;
-                    self.source_wake.ready.store(true, Ordering::Release);
+                Err((carbon_io::PushError::Closed, _)) => {
+                    self.closed = true;
+                    break;
                 }
             }
-            if turn == 63 {
-                cx.waker().wake_by_ref();
-            }
         }
-        Ok(())
+        changed
     }
     pub fn poll_progress(&mut self, cx: &mut Context<'_>) {
+        self.feed(cx);
         self.scheduler.poll_progress(cx);
-        if !self.stopped {
-            if let Err(error) = self.feed(cx) {
-                self.error = Some(error);
-                self.stopped = true;
-            }
+        if self.feed(cx) {
+            cx.waker().wake_by_ref();
         }
-        self.scheduler.poll_progress(cx);
     }
     pub async fn progress(&mut self) {
         std::future::poll_fn(|cx| {
@@ -499,18 +503,20 @@ where
 }
 impl<'a, T, S> std::ops::Deref for ReadDriver<'a, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
-    type Target = carbon_io::ReadScheduler<'a, T, S::Item>;
+    type Target = carbon_io::ReadScheduler<'a, T, S::Item, fn() -> T>;
     fn deref(&self) -> &Self::Target {
         &self.scheduler
     }
 }
 impl<T, S> std::ops::DerefMut for ReadDriver<'_, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.scheduler
@@ -518,40 +524,90 @@ where
 }
 impl<T, S> Stream for ReadDriver<'_, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
     type Item = Result<T, carbon_io::SchedulerError<<S::Item as ReadFile<T>>::Error>>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        this.poll_progress(cx);
+        this.feed(cx);
         if let Some(error) = this.error.take() {
             return Poll::Ready(Some(Err(error)));
         }
-        Pin::new(&mut this.scheduler).poll_next(cx)
+        match this.scheduler.poll_read(cx, &mut this.output) {
+            Poll::Ready(Ok(Some(()))) => Poll::Ready(Some(Ok(std::mem::take(&mut this.output)))),
+            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+            Poll::Pending => {
+                if this.feed(cx) {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+        }
     }
 }
 impl<T, S> futures::stream::FusedStream for ReadDriver<'_, T, S>
 where
+    T: Default,
     S: Stream + Unpin,
-    S::Item: ReadFile<T>,
+    S::Item: ReadFile<T> + Unpin,
 {
     fn is_terminated(&self) -> bool {
         self.error.is_none() && self.scheduler.is_terminated()
     }
 }
 
-pub fn admit_read_file<T, F: ReadFile<T>>(
-    scheduler: &mut carbon_io::ReadScheduler<'_, T, F>,
-    file: F,
-) where
-    F::Error: std::fmt::Debug,
+pub fn admit_read_file<T, F, A>(scheduler: &mut carbon_io::ReadScheduler<'_, T, F, A>, file: F)
+where
+    F: ReadFile<T> + Unpin,
+    A: FnMut() -> T,
+{
+    assert!(scheduler.push_file(file).is_ok());
+}
+
+pub fn poll_read<T, F, A>(
+    scheduler: &mut carbon_io::ReadScheduler<'_, T, F, A>,
+) -> Poll<Option<Result<T, carbon_io::SchedulerError<F::Error>>>>
+where
+    T: Default,
+    F: ReadFile<T> + Unpin,
+    A: FnMut() -> T,
 {
     let (_, waker) = context_waker();
+    let mut output = T::default();
+    match scheduler.poll_read(&mut Context::from_waker(&waker), &mut output) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(Some(()))) => Poll::Ready(Some(Ok(output))),
+        Poll::Ready(Ok(None)) => Poll::Ready(None),
+        Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+    }
+}
+
+pub fn collect_read<T, F, A>(
+    scheduler: &mut carbon_io::ReadScheduler<'_, T, F, A>,
+) -> Vec<Result<T, carbon_io::SchedulerError<F::Error>>>
+where
+    T: Default,
+    F: ReadFile<T> + Unpin,
+    A: FnMut() -> T,
+{
+    let (counter, waker) = context_waker();
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(
-        Pin::new(&mut *scheduler).poll_file_ready(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
-    Pin::new(scheduler).enqueue_file(file).unwrap();
+    let mut output = T::default();
+    let mut values = Vec::new();
+    for _ in 0..100_000 {
+        let before = counter.0.load(Ordering::Relaxed);
+        match scheduler.poll_read(&mut cx, &mut output) {
+            Poll::Ready(Ok(Some(()))) => values.push(Ok(std::mem::take(&mut output))),
+            Poll::Ready(Err(error)) => values.push(Err(error)),
+            Poll::Ready(Ok(None)) => return values,
+            Poll::Pending => assert!(
+                counter.0.load(Ordering::Relaxed) > before,
+                "stalled without wakeup"
+            ),
+        }
+    }
+    panic!("reader failed to finish");
 }

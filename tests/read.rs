@@ -93,7 +93,7 @@ fn read_allows_multiple_readers_inside_window() {
         &mut scheduler_config_5,
     );
     assert!(poll(&mut s).is_pending());
-    assert_eq!(b.reading.polls(), 4);
+    assert_eq!(b.reading.polls(), 3);
     a.reading.open();
     assert_eq!(collect(s), (0..6).map(Ok).collect::<Vec<_>>());
 }
@@ -128,10 +128,10 @@ fn read_rejects_early_eof() {
     assert_eq!(output.last(), Some(&Err(E::Contract(C::UnexpectedEof))));
 }
 #[test]
-fn read_rejects_extra_frames() {
+fn read_stops_at_declared_frame_count() {
     let mut f = Read::new([1, 2]);
     f.count = 1;
-    let mut scheduler_files_8 = stream::iter([f]);
+    let mut scheduler_files_8 = stream::iter([f.clone()]);
     let scheduler_budget_8 = FrameBudget::new(1);
     let mut scheduler_config_8 = config(1, 1, 1, 0);
     let output = collect(ReadDriver::new(
@@ -139,7 +139,8 @@ fn read_rejects_extra_frames() {
         &scheduler_budget_8,
         &mut scheduler_config_8,
     ));
-    assert_eq!(output.last(), Some(&Err(E::Contract(C::TooManyFrames))));
+    assert_eq!(output, [Ok(1)]);
+    assert_eq!(f.reading.polls(), 1);
 }
 #[test]
 fn read_propagates_reader_error() {
@@ -217,26 +218,27 @@ fn accepts_unpin_free_inputs_and_backends() {
 }
 #[test]
 fn rejects_zero_counts_and_configuration() {
-    for (f, budget, cfg, error) in [
-        (Read::new([]), 1, config(1, 1, 1, 0), C::ZeroFrameCount),
-        (Read::new([1]), 0, config(1, 1, 1, 0), C::ZeroBudget),
-        (Read::new([1]), 1, config(0, 1, 1, 0), C::InvalidWindow),
-    ] {
-        let mut scheduler_files_14 = stream::iter([f]);
-        let scheduler_budget_14 = FrameBudget::new(budget);
-        let mut scheduler_config_14 = cfg;
-        assert_eq!(
-            collect(ReadDriver::new(
-                &mut scheduler_files_14,
-                &scheduler_budget_14,
-                &mut scheduler_config_14,
-            )),
-            [Err(E::Contract(error))]
-        );
-    }
+    let budget = FrameBudget::new(0);
+    let mut cfg = config(1, 1, 1, 0);
+    assert!(matches!(
+        carbon_io::ReadScheduler::<usize, Read, _>::new(|| 0, &budget, &mut cfg),
+        Err(C::ZeroBudget)
+    ));
+    let budget = FrameBudget::new(1);
+    let mut cfg = config(0, 1, 1, 0);
+    assert!(matches!(
+        carbon_io::ReadScheduler::<usize, Read, _>::new(|| 0, &budget, &mut cfg),
+        Err(C::InvalidWindow)
+    ));
+    let mut cfg = config(1, 1, 1, 0);
+    let mut reader = carbon_io::ReadScheduler::new(|| 0, &budget, &mut cfg).unwrap();
+    assert!(matches!(
+        reader.push_file(Read::new([])),
+        Err((carbon_io::PushError::Contract(C::ZeroFrameCount), _))
+    ));
 }
 #[test]
-fn pending_eof_blocks_following_file_until_contract_is_verified() {
+fn declared_count_advances_to_following_file() {
     let f = Read::new([0]);
     let gate = f.reading.clone();
     let mut scheduler_files_15 = stream::iter([f, Read::new([1])]);
@@ -247,10 +249,10 @@ fn pending_eof_blocks_following_file_until_contract_is_verified() {
         &scheduler_budget_15,
         &mut scheduler_config_15,
     );
-    // The general ordered-output test also covers EOF waiting at every boundary.
     assert_eq!(poll(&mut s), Poll::Ready(Some(Ok(0))));
-    gate.open();
+    gate.close();
     assert_eq!(collect(s), [Ok(1)]);
+    assert_eq!(gate.polls(), 1);
 }
 #[test]
 fn empty_file_stream_is_fused() {
@@ -282,10 +284,10 @@ fn changing_window_preserves_buffered_future_frames() {
     assert!(poll(&mut s).is_pending());
     assert_eq!(
         front.reading.polls(),
-        1,
-        "growing a quota must not repoll a pending reader"
+        2,
+        "direct polling revisits pending files once per call"
     );
-    assert_eq!(future.reading.polls(), 5);
+    assert_eq!(future.reading.polls(), 4);
     s.set_window(config(1, 100, 1, 0).window).unwrap();
     assert_eq!(
         s.granted_frames(),

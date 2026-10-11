@@ -19,8 +19,6 @@ pub enum ContractError {
     ZeroFrameCapacity,
     /// A reader ended before its declared count.
     UnexpectedEof,
-    /// A reader yielded a frame after its declared count.
-    TooManyFrames,
     /// Input frames outlive the destination stream.
     MissingWriteFile,
     /// A replayable file cannot fit in the entire shared budget.
@@ -47,7 +45,6 @@ impl fmt::Display for ContractError {
             Self::ZeroFrameCount => "read frame count must be nonzero",
             Self::ZeroFrameCapacity => "write frame capacity must be nonzero",
             Self::UnexpectedEof => "reader ended before its declared frame count",
-            Self::TooManyFrames => "reader exceeded its declared frame count",
             Self::MissingWriteFile => "no destination for the next input frame",
             Self::FrameCapacityExceedsBudget => "replayable file exceeds the global frame budget",
             Self::ZeroBudget => "frame budget must be nonzero",

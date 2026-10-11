@@ -1,7 +1,6 @@
-//! Waker routing, bounded work, backpressure, and non-starvation tests.
+//! Direct wakers, bounded polling, backpressure, and write cancellation.
 mod support;
-use carbon_io::FrameBudget;
-use futures::{Stream, stream};
+use carbon_io::{FrameBudget, ReadFile, ReadScheduler};
 use std::{
     pin::Pin,
     sync::atomic::Ordering,
@@ -10,139 +9,107 @@ use std::{
 use support::*;
 
 #[test]
-fn no_busy_loop_when_all_sources_pending() {
-    let a = Read::new(0..2);
-    a.opening.close();
-    let b = Read::new(2..4);
-    b.opening.close();
-    let mut scheduler_files_1 = stream::iter([a.clone(), b.clone()]);
-    let scheduler_budget_1 = FrameBudget::new(4);
-    let mut scheduler_config_1 = config(4, 100, 10, 0);
-    let mut s = ReadDriver::new(
-        &mut scheduler_files_1,
-        &scheduler_budget_1,
-        &mut scheduler_config_1,
-    );
-    let (counter, w) = context_waker();
-    let mut cx = Context::from_waker(&w);
-    assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
-    let before = counter.0.load(Ordering::Relaxed);
-    for _ in 0..10 {
-        assert!(Pin::new(&mut s).poll_next(&mut cx).is_pending());
-    }
-    assert_eq!(counter.0.load(Ordering::Relaxed), before);
-    assert_eq!(a.opening.polls(), 1);
-    assert_eq!(b.opening.polls(), 1);
-}
-#[test]
-fn only_woken_slot_is_polled_among_ten_thousand_pending_opens() {
-    let files: Vec<_> = (0..10_000)
+fn pending_files_are_polled_once_per_call_without_self_waking() {
+    let budget = FrameBudget::new(4);
+    let mut cfg = config(4, 100, 25, 0);
+    let mut reader = ReadScheduler::new(|| 0, &budget, &mut cfg).unwrap();
+    let files: Vec<_> = (0..25)
         .map(|i| {
             let f = Read::new([i]);
             f.opening.close();
             f
         })
         .collect();
-    let mut scheduler_files_2 = stream::iter(files.clone());
-    let scheduler_budget_2 = FrameBudget::new(32);
-    let mut scheduler_config_2 = config(32, 20_000, 10_000, 0);
-    let mut s = ReadDriver::new(
-        &mut scheduler_files_2,
-        &scheduler_budget_2,
-        &mut scheduler_config_2,
-    );
-    for _ in 0..200 {
-        assert!(poll(&mut s).is_pending());
+    for file in &files {
+        assert!(reader.push_file(file.clone()).is_ok());
     }
-    assert!(files.iter().all(|f| f.opening.polls() == 1));
-    files[42].opening.open();
-    assert!(poll(&mut s).is_pending());
-    for (i, f) in files.iter().enumerate() {
-        assert_eq!(f.opening.polls(), if i == 42 { 2 } else { 1 }, "slot {i}");
-    }
+    let (wakes, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+    reader.poll_progress(&mut cx);
+    assert!(files.iter().all(|file| file.opening.polls() == 1));
+    let before = wakes.0.load(Ordering::Relaxed);
+    reader.poll_progress(&mut cx);
+    assert!(files.iter().all(|file| file.opening.polls() == 2));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), before);
+    files[0].opening.open();
+    assert!(wakes.0.load(Ordering::Relaxed) > before);
+    assert_eq!(poll_read(&mut reader), Poll::Ready(Some(Ok(0))));
 }
+
 #[test]
-fn ready_source_does_not_starve_other_sources() {
-    let a = Read::new(0..10_000);
-    let b = Read::new(10_000..10_002);
-    let mut scheduler_files_3 = stream::iter([a, b.clone()]);
-    let scheduler_budget_3 = FrameBudget::new(10_002);
-    let mut scheduler_config_3 = config(10_002, 20_000, 2, 0);
-    let mut s = ReadDriver::new(
-        &mut scheduler_files_3,
-        &scheduler_budget_3,
-        &mut scheduler_config_3,
-    );
-    assert!(poll(&mut s).is_ready());
-    assert_eq!(b.reading.polls(), 3);
+fn pending_backend_waker_is_replaced_by_the_next_call() {
+    let budget = FrameBudget::new(1);
+    let mut cfg = config(1, 2, 1, 0);
+    let file = Read::new([0]);
+    file.reading.close();
+    let mut reader = ReadScheduler::new(|| 0, &budget, &mut cfg).unwrap();
+    assert!(reader.push_file(file.clone()).is_ok());
+    let (old, old_waker) = context_waker();
+    reader.poll_progress(&mut Context::from_waker(&old_waker));
+    let (new, new_waker) = context_waker();
+    reader.poll_progress(&mut Context::from_waker(&new_waker));
+    let before = old.0.load(Ordering::Relaxed);
+    file.reading.open();
+    assert_eq!(old.0.load(Ordering::Relaxed), before);
+    assert!(new.0.load(Ordering::Relaxed) > 0);
 }
+
 #[test]
-fn blocked_consumer_does_not_prevent_allowed_readers_from_filling_window() {
-    let a = Read::new(0..4);
-    a.reading.close();
-    let b = Read::new(4..8);
-    let mut scheduler_files_6 = stream::iter([a, b.clone()]);
-    let scheduler_budget_6 = FrameBudget::new(8);
-    let mut scheduler_config_6 = config(8, 100, 2, 0);
-    let mut s = ReadDriver::new(
-        &mut scheduler_files_6,
-        &scheduler_budget_6,
-        &mut scheduler_config_6,
-    );
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(b.reading.polls(), 5);
-}
-#[test]
-fn eof_probe_waits_for_its_own_waker() {
-    // A source can block specifically after its last data frame.
-    struct File(Gate);
-    struct Reader {
+fn declared_count_does_not_poll_eof_or_block_following_output() {
+    struct File {
         emitted: bool,
         gate: Gate,
     }
-    impl Stream for Reader {
-        type Item = Result<usize, ()>;
-        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            let s = self.get_mut();
-            if !s.emitted {
-                s.emitted = true;
-                Poll::Ready(Some(Ok(0)))
-            } else if s.gate.ready(cx) {
-                Poll::Ready(None)
+    impl ReadFile<usize> for File {
+        type Error = ();
+        fn frame_count(&self) -> u32 {
+            1
+        }
+        fn poll_open(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            frame: &mut usize,
+        ) -> Poll<Result<Option<()>, ()>> {
+            let this = self.get_mut();
+            if !this.emitted {
+                this.emitted = true;
+                *frame = 0;
+                return Poll::Ready(Ok(Some(())));
+            }
+            if this.gate.ready(cx) {
+                Poll::Ready(Ok(None))
             } else {
                 Poll::Pending
             }
         }
     }
-    impl carbon_io::ReadFile<usize> for File {
-        type Error = ();
-        type Open = std::future::Ready<Result<Reader, ()>>;
-        type Reader = Reader;
-        fn frame_count(&self) -> u32 {
-            1
-        }
-        fn open(&self) -> Self::Open {
-            std::future::ready(Ok(Reader {
-                emitted: false,
-                gate: self.0.clone(),
-            }))
-        }
-    }
     let gate = Gate::new(false);
-    let mut scheduler_files_8 =
-        std::pin::pin!(stream::iter([File(gate.clone()), File(Gate::new(true))]));
-    let scheduler_budget_8 = FrameBudget::new(2);
-    let mut scheduler_config_8 = config(2, 10, 2, 0);
-    let mut s = ReadDriver::new(
-        &mut scheduler_files_8,
-        &scheduler_budget_8,
-        &mut scheduler_config_8,
+    let budget = FrameBudget::new(2);
+    let mut cfg = config(2, 10, 2, 0);
+    let mut reader = ReadScheduler::new(|| 0, &budget, &mut cfg).unwrap();
+    assert!(
+        reader
+            .push_file(File {
+                emitted: false,
+                gate: gate.clone()
+            })
+            .is_ok()
     );
-    assert_eq!(poll(&mut s), Poll::Ready(Some(Ok(0))));
-    assert!(poll(&mut s).is_pending());
-    assert_eq!(gate.polls(), 1);
-    gate.open();
-    assert_eq!(collect(s), [Ok(0)]);
+    assert!(
+        reader
+            .push_file(File {
+                emitted: false,
+                gate: Gate::new(true)
+            })
+            .is_ok()
+    );
+    reader.close_files();
+    assert_eq!(poll_read(&mut reader), Poll::Ready(Some(Ok(0))));
+    assert_eq!(collect_read(&mut reader), [Ok(0)]);
+    assert_eq!(gate.polls(), 0);
 }
 
 #[test]
@@ -201,4 +168,26 @@ fn cancelled_write_wait_preserves_attempt_and_replaces_backend_waker() {
     write_value(&mut writer, 1);
     assert_eq!(file.opens.get(), 1);
     assert_eq!(close_writer(&mut writer), [vec![0, 1]]);
+}
+
+#[test]
+fn configured_window_above_256_can_register_all_pending_files_without_busy_loop() {
+    let budget = FrameBudget::new(1);
+    let mut cfg = config(1, 400, 300, 0);
+    let mut reader = ReadScheduler::new(|| 0, &budget, &mut cfg).unwrap();
+    let files: Vec<_> = (0..300)
+        .map(|i| {
+            let file = Read::new([i]);
+            file.opening.close();
+            file
+        })
+        .collect();
+    for file in &files {
+        assert!(reader.push_file(file.clone()).is_ok());
+    }
+    let (wakes, waker) = context_waker();
+    let mut cx = Context::from_waker(&waker);
+    reader.poll_progress(&mut cx);
+    assert!(files.iter().all(|file| file.opening.polls() == 1));
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
 }

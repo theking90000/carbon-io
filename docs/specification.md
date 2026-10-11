@@ -1,5 +1,14 @@
 # Cahier des charges — CARBON I/O
 
+> Contrat actuel de lecture : `ReadFile` utilise `poll_open` et
+> `poll_read(cx, &mut Frame)` sur le même objet. `ReadScheduler` utilise une
+> admission directe avec restitution du fichier refusé, une sortie par échange
+> de trames complètes et le polling direct sans `ReadyQueue`. Une entrée vide
+> ouverte retourne `Pending` sans waker ; `push_file` ne réveille pas et doit être
+> suivi d'un nouveau poll. `open_ahead_frames`, `target_frames` et
+> `max_active_files` conservent leurs rôles distincts. Le [guide](guide.md)
+> décrit ce contrat ; les sections ci-dessous conservent les étapes historiques.
+
 ## 1. Objectif
 
 `carbon-io` est une bibliothèque Rust de scheduling asynchrone de flux segmentés.

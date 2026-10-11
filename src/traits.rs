@@ -1,45 +1,63 @@
-use futures_core::Stream;
 use std::{
-    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
-/// An opaque, repeatably openable sequence of exactly `frame_count()` frames.
+/// A sequential source that opens and reads on the same object.
 ///
-/// # Examples
+/// `frame_count()` is exact, nonzero and stable. Creation starts only on the
+/// first `poll_open`. After an opening error, the next `poll_open` starts a fresh
+/// attempt; repeated pending polls continue that attempt.
 ///
-/// ```
-/// use std::{convert::Infallible, future::{ready, Ready}, ops::Range};
-/// use futures::stream;
-/// use carbon_io::ReadFile;
+/// `poll_read` returns `Some(())` only for a complete frame, and `None` for EOF.
+/// CARBON stops reading after `frame_count()` complete frames, without polling
+/// for EOF. An earlier `None` is a contract error; extra frames are never polled.
+/// The backend owns its offsets and preparation state. After `Pending`, it
+/// receives the same logical buffer with its contents preserved, but its address
+/// may change. No buffer reference may be retained between polls. A new read may
+/// receive a recycled buffer: overwrite or reset its previous contents as needed.
+/// Every `Pending` operation must register the supplied waker. Dropping the file
+/// abandons its operations. Reading errors are terminal in [`crate::ReadScheduler`].
 ///
-/// struct MemFile(Range<u32>);
-///
-/// impl ReadFile<u32> for MemFile {
-///     type Error = Infallible;
-///     type Reader = stream::Iter<std::vec::IntoIter<Result<u32, Infallible>>>;
-///     type Open = Ready<Result<Self::Reader, Self::Error>>;
-///
-///     fn frame_count(&self) -> u32 {
-///         self.0.end - self.0.start
-///     }
-///     fn open(&self) -> Self::Open {
-///         ready(Ok(stream::iter(self.0.clone().map(Ok).collect::<Vec<_>>())))
-///     }
-/// }
-/// ```
+/// Directly stored files must be `Unpin`; `Pin<Box<F>>` and `Pin<&mut F>` forward
+/// this trait for pinned files. Frames need neither `Clone` nor `Unpin`.
 pub trait ReadFile<T> {
     /// Backend failure.
     type Error;
-    /// Asynchronous open operation. May be `!Unpin`.
-    type Open: Future<Output = Result<Self::Reader, Self::Error>>;
-    /// Ordered frames followed by EOF. May be `!Unpin`.
-    type Reader: Stream<Item = Result<T, Self::Error>>;
-    /// Exact, nonzero number of frames.
+    /// Exact, nonzero number of complete frames.
     fn frame_count(&self) -> u32;
-    /// Open the complete logical file, without offsets or ranges.
-    fn open(&self) -> Self::Open;
+    /// Open the first attempt, or start a new attempt after an opening error.
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    /// Fill one complete frame, continue its preparation, or report EOF.
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        frame: &mut T,
+    ) -> Poll<Result<Option<()>, Self::Error>>;
+}
+
+impl<T, P> ReadFile<T> for Pin<P>
+where
+    P: std::ops::DerefMut + Unpin,
+    P::Target: ReadFile<T>,
+{
+    type Error = <P::Target as ReadFile<T>>::Error;
+
+    fn frame_count(&self) -> u32 {
+        self.as_ref().get_ref().frame_count()
+    }
+
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.get_mut().as_mut().poll_open(cx)
+    }
+
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        frame: &mut T,
+    ) -> Poll<Result<Option<()>, Self::Error>> {
+        self.get_mut().as_mut().poll_read(cx, frame)
+    }
 }
 
 /// A destination that opens, accepts frames, and closes on the same object.

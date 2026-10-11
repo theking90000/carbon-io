@@ -1,12 +1,10 @@
 //! TCP upload -> CARBON -> real files -> CARBON -> TCP download.
 //! Run with `cargo run --manifest-path examples/tcp_to_file/Cargo.toml`; instructions are printed on startup.
 use carbon_io::{
-    FrameBudget, FrameWriter, Interest, ReadEvent, ReadFile, ReadScheduler, SchedulerConfig,
-    Window, WriteEvent, WriteFile, WriteScheduler,
+    AsyncFilesWrite, BytesFrameAllocator, FrameBudget, PushError, ReadFile, ReadScheduler,
+    SchedulerConfig, Window, WriteFile, WriteScheduler,
 };
-use futures::{Stream, StreamExt, stream};
 use std::{
-    cell::{Cell, RefCell},
     future::Future,
     io,
     path::{Path, PathBuf},
@@ -16,7 +14,7 @@ use std::{
 };
 use tokio::{
     fs::{self, File},
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     time::{Sleep, sleep},
 };
@@ -30,67 +28,69 @@ type Frame = Vec<u8>;
 struct Segment {
     path: PathBuf,
     frames: u32,
+    opening: Option<Pin<Box<dyn Future<Output = io::Result<File>>>>>,
+    file: Option<File>,
+    offset: usize,
+    finalize_delay: Option<Pin<Box<Sleep>>>,
 }
 
-struct Writer {
-    file: File,
-    offset: usize,
-    path: PathBuf,
-    finalize_delay: Option<Pin<Box<Sleep>>>,
+impl Segment {
+    fn new(path: PathBuf, frames: u32) -> Self {
+        Self { path, frames, opening: None, file: None, offset: 0, finalize_delay: None }
+    }
+    fn poll_open_file(&mut self, cx: &mut Context<'_>, writing: bool) -> Poll<io::Result<()>> {
+        if self.opening.is_none() {
+            self.file = None;
+            self.offset = 0;
+            self.finalize_delay = None;
+            let path = self.path.clone();
+            self.opening = Some(Box::pin(async move {
+                let delay = if writing { Duration::from_secs(1) } else { Duration::from_millis(500) };
+                sleep(delay).await;
+                if writing { File::create(path).await } else { File::open(path).await }
+            }));
+        }
+        let Some(opening) = self.opening.as_mut() else {
+            return Poll::Ready(Err(io::Error::other("missing open operation")));
+        };
+        match opening.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.opening = None;
+                match result {
+                    Ok(file) => { self.file = Some(file); Poll::Ready(Ok(())) },
+                    Err(error) => Poll::Ready(Err(error)),
+                }
+            }
+        }
+    }
 }
 
 impl WriteFile<Frame> for Segment {
     type Error = io::Error;
     type Output = PathBuf;
-    type Writer = Writer;
-    type Open = Pin<Box<dyn Future<Output = io::Result<Writer>>>>;
-
-    fn frame_capacity(&self) -> u32 {
-        self.frames
+    fn frame_capacity(&self) -> u32 { self.frames }
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_open_file(cx, true)
     }
-
-    fn open(&self) -> Self::Open {
-        let path = self.path.clone();
-        Box::pin(async move {
-            // CARBON calls this only once a frame is assigned to the segment.
-            sleep(Duration::from_secs(1)).await;
-            Ok(Writer {
-                file: File::create(&path).await?,
-                offset: 0,
-                path,
-                finalize_delay: None,
-            })
-        })
-    }
-}
-
-impl FrameWriter<Frame> for Writer {
-    type Error = io::Error;
-    type Output = PathBuf;
-
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        frame: &Frame,
-    ) -> Poll<io::Result<()>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &Frame) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let Some(file) = this.file.as_mut() else { return Poll::Ready(Err(io::Error::other("file is not open"))); };
         while this.offset < frame.len() {
-            let written = ready!(Pin::new(&mut this.file).poll_write(cx, &frame[this.offset..]))?;
-            if written == 0 {
-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-            this.offset += written;
+            let Some(bytes) = frame.get(this.offset..) else { return Poll::Ready(Err(io::Error::other("invalid write offset"))); };
+            let written = ready!(Pin::new(&mut *file).poll_write(cx, bytes))?;
+            if written == 0 { return Poll::Ready(Err(io::ErrorKind::WriteZero.into())); }
+            let Some(offset) = this.offset.checked_add(written) else { return Poll::Ready(Err(io::Error::other("write offset overflow"))); };
+            this.offset = offset;
         }
         this.offset = 0;
         Poll::Ready(Ok(()))
     }
-
-    fn poll_finalize(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<PathBuf>> {
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<PathBuf>> {
         let this = self.get_mut();
-        ready!(Pin::new(&mut this.file).poll_flush(cx))?;
-        let delay = this
-            .finalize_delay
-            .get_or_insert_with(|| Box::pin(sleep(Duration::from_secs(2))));
+        let Some(file) = this.file.as_mut() else { return Poll::Ready(Err(io::Error::other("file is not open"))); };
+        ready!(Pin::new(file).poll_flush(cx))?;
+        let delay = this.finalize_delay.get_or_insert_with(|| Box::pin(sleep(Duration::from_secs(2))));
         ready!(delay.as_mut().poll(cx));
         Poll::Ready(Ok(this.path.clone()))
     }
@@ -98,29 +98,27 @@ impl FrameWriter<Frame> for Writer {
 
 impl ReadFile<Frame> for Segment {
     type Error = io::Error;
-    type Reader = Pin<Box<dyn Stream<Item = io::Result<Frame>>>>;
-    type Open = Pin<Box<dyn Future<Output = io::Result<Self::Reader>>>>;
-
-    fn frame_count(&self) -> u32 {
-        self.frames
+    fn frame_count(&self) -> u32 { self.frames }
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_open_file(cx, false)
     }
-
-    fn open(&self) -> Self::Open {
-        let path = self.path.clone();
-        let frames = self.frames;
-        Box::pin(async move {
-            sleep(Duration::from_millis(500)).await;
-            let file = File::open(path).await?;
-            let reader = stream::try_unfold((file, frames), |(mut file, left)| async move {
-                if left == 0 {
-                    return Ok(None);
-                }
-                let mut frame = vec![0; BLOCK];
-                file.read_exact(&mut frame).await?;
-                Ok(Some((frame, (file, left - 1))))
-            });
-            Ok(Box::pin(reader) as Self::Reader)
-        })
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, frame: &mut Frame) -> Poll<io::Result<Option<()>>> {
+        let this = self.get_mut();
+        let Some(file) = this.file.as_mut() else { return Poll::Ready(Err(io::Error::other("file is not open"))); };
+        if this.offset == 0 && frame.len() != BLOCK { frame.resize(BLOCK, 0); }
+        while this.offset < BLOCK {
+            let Some(bytes) = frame.get_mut(this.offset..) else { return Poll::Ready(Err(io::Error::other("invalid read offset"))); };
+            let mut buffer = ReadBuf::new(bytes);
+            ready!(Pin::new(&mut *file).poll_read(cx, &mut buffer))?;
+            let read = buffer.filled().len();
+            if read == 0 {
+                return Poll::Ready(if this.offset == 0 { Ok(None) } else { Err(io::ErrorKind::UnexpectedEof.into()) });
+            }
+            let Some(offset) = this.offset.checked_add(read) else { return Poll::Ready(Err(io::Error::other("read offset overflow"))); };
+            this.offset = offset;
+        }
+        this.offset = 0;
+        Poll::Ready(Ok(Some(())))
     }
 }
 
@@ -134,86 +132,71 @@ fn config() -> SchedulerConfig {
     SchedulerConfig::new(window, 0)
 }
 
-async fn upload(socket: TcpStream, directory: &Path) -> io::Result<u64> {
-    // ponytail: one transfer at a time; replace the previous upload in this owned directory.
+fn next_segment(directory: &Path, next: &mut u64) -> io::Result<Segment> {
+    let path = directory.join(format!("{next:020}.bin"));
+    *next = next.checked_add(1).ok_or_else(|| io::Error::other("segment number overflow"))?;
+    Ok(Segment::new(path, FRAMES_PER_FILE))
+}
+
+async fn write_bytes(
+    writer: &mut WriteScheduler<'_, BytesFrameAllocator, Segment>,
+    mut bytes: &[u8],
+    directory: &Path,
+    next_file: &mut u64,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let status = std::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write(cx, bytes))
+            .await.map_err(io::Error::other)?;
+        for _ in 0..status.completed_files {
+            let (_, path) = writer.pop_swap(next_segment(directory, next_file)?).map_err(io::Error::other)?;
+            println!("Written {}", path.display());
+        }
+        if let Some(consumed) = status.output {
+            bytes = bytes.get(consumed..).ok_or_else(|| io::Error::other("invalid input consumption"))?;
+        }
+    }
+    Ok(())
+}
+
+async fn upload(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
+    // ponytail: one transfer at a time in this owned directory.
     fs::remove_dir_all(directory).await?;
     fs::create_dir(directory).await?;
-    let total = Cell::new(0u64);
-    let failure = RefCell::new(None);
-    let input = stream::unfold(socket, |mut socket| {
-        let (total, failure) = (&total, &failure);
-        async move {
-            let mut frame = vec![0; BLOCK];
-            let mut filled = 0;
-            while filled < BLOCK {
-                match socket.read(&mut frame[filled..]).await {
-                    Ok(0) => break,
-                    Ok(n) => filled += n,
-                    Err(error) => {
-                        *failure.borrow_mut() = Some(error);
-                        return None;
-                    }
-                }
-            }
-            if filled == 0 {
-                return None;
-            }
-            total.set(total.get() + filled as u64);
-            Some((frame, socket))
-        }
-    });
-    let mut input = std::pin::pin!(input);
-    let scheduler_budget_1 = FrameBudget::new(PIPELINE_FRAMES);
-    let mut scheduler_config_1 = config();
-    let mut writer = WriteScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
-    let mut next_file = 0u64;
-    let mut next_frame = None;
-    let mut input_closed = false;
+    let budget = FrameBudget::new(PIPELINE_FRAMES);
+    let mut cfg = config();
+    let mut allocator = BytesFrameAllocator::new(BLOCK).map_err(io::Error::other)?;
+    let mut writer = WriteScheduler::new(&mut allocator, &budget, &mut cfg).map_err(io::Error::other)?;
+    let mut next_file = 0;
+    while writer.accept_file() {
+        writer.push_file(next_segment(directory, &mut next_file)?).map_err(io::Error::other)?;
+    }
+    let mut input = vec![0; BLOCK];
+    let mut total = 0u64;
     loop {
-        // Keep driving file I/O while TCP has no frame ready to inject.
-        let interest = if next_frame.is_some() {
-            Interest::ALL
-        } else {
-            Interest::FILES | Interest::RESULTS
-        };
-        tokio::select! {
-            frame = input.next(), if next_frame.is_none() && !input_closed => {
-                next_frame = frame;
-                if next_frame.is_none() {
-                    input_closed = true;
-                    writer.close_frames().map_err(io::Error::other)?;
-                    writer.close_files().map_err(io::Error::other)?;
-                }
-            }
-            event = writer.next_event_with_interest(interest) => {
-                match event.map_err(io::Error::other)? {
-                    Some(WriteEvent::FileReady) => {
-                        while writer.accept_file() {
-                            writer.enqueue_file(Segment {
-                                path: directory.join(format!("{next_file:020}.bin")),
-                                frames: FRAMES_PER_FILE,
-                            }).map_err(io::Error::other)?;
-                            next_file += 1;
-                        }
-                    }
-                    Some(WriteEvent::FrameReady) => {
-                        if let Some(frame) = next_frame.take() {
-                            writer.enqueue_frame(frame).map_err(io::Error::other)?;
-                        }
-                    }
-                    Some(WriteEvent::File(path)) => println!("Written {}", path.display()),
-                    None => break,
-                }
-            }
+        let read = socket.read(&mut input).await?;
+        if read == 0 { break; }
+        total = total.checked_add(read as u64).ok_or_else(|| io::Error::other("input size overflow"))?;
+        let bytes = input.get(..read).ok_or_else(|| io::Error::other("invalid socket read length"))?;
+        write_bytes(&mut writer, bytes, directory, &mut next_file).await?;
+    }
+    // The on-disk format uses full blocks; stream.meta records the actual size.
+    let remainder = (total % BLOCK as u64) as usize;
+    if remainder != 0 {
+        write_bytes(&mut writer, &vec![0; BLOCK.saturating_sub(remainder)], directory, &mut next_file).await?;
+    }
+    loop {
+        let completed = std::future::poll_fn(|cx| Pin::new(&mut writer).poll_close(cx))
+            .await.map_err(io::Error::other)?;
+        if completed == 0 { break; }
+        for _ in 0..completed {
+            let (_, path) = writer.pop_file().map_err(io::Error::other)?
+                .ok_or_else(|| io::Error::other("missing close result"))?;
+            println!("Written {}", path.display());
         }
     }
     drop(writer);
-    if let Some(error) = failure.borrow_mut().take() {
-        return Err(error);
-    }
-    // Published only after every segment has been flushed and TCP reached EOF.
-    fs::write(directory.join("stream.meta"), format!("{}\n", total.get())).await?;
-    Ok(total.get())
+    fs::write(directory.join("stream.meta"), format!("{total}\n")).await?;
+    Ok(total)
 }
 
 async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
@@ -237,10 +220,7 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
                 ));
             }
             stored += size;
-            files.push(Segment {
-                path,
-                frames: (size / BLOCK as u64) as u32,
-            });
+            files.push(Segment::new(path, (size / BLOCK as u64) as u32));
         }
     }
     if stored / BLOCK as u64 != total.div_ceil(BLOCK as u64) {
@@ -253,29 +233,47 @@ async fn download(mut socket: TcpStream, directory: &Path) -> io::Result<u64> {
     let mut files = files.into_iter().peekable();
     let scheduler_budget_2 = FrameBudget::new(PIPELINE_FRAMES);
     let mut scheduler_config_2 = config();
-    let mut reader = ReadScheduler::new(&scheduler_budget_2, &mut scheduler_config_2);
+    let mut reader = ReadScheduler::new(|| Vec::with_capacity(BLOCK), &scheduler_budget_2, &mut scheduler_config_2)
+        .map_err(io::Error::other)?;
+    let mut waiting = None;
+    let mut closed = false;
     let mut remaining = total;
-    while let Some(event) = reader.next_event().await.map_err(io::Error::other)? {
-        match event {
-            ReadEvent::FileReady => {
-                while files.peek().is_some() && reader.accept_file() {
-                    reader
-                        .enqueue_file(files.next().unwrap())
-                        .map_err(io::Error::other)?;
-                }
-                if files.peek().is_none() {
-                    reader.close_files().map_err(io::Error::other)?;
-                }
-            }
-            ReadEvent::Frame(frame) => {
-                let length = remaining.min(BLOCK as u64) as usize;
-                tokio::select! {
-                    result = socket.write_all(&frame[..length]) => result?,
-                    _ = reader.progress() => unreachable!("progress never completes"),
-                }
-                remaining -= length as u64;
+    let mut frame = Vec::with_capacity(BLOCK);
+    while std::future::poll_fn(|cx| {
+        while !closed {
+            let file = match waiting.take().or_else(|| files.next()) {
+                Some(file) => file,
+                None => { closed = true; reader.close_files(); break; }
+            };
+            match reader.push_file(file) {
+                Ok(()) => {},
+                Err((PushError::Full, file)) => { waiting = Some(file); break; },
+                Err((error, _)) => return Poll::Ready(Err(io::Error::other(error))),
             }
         }
+        match reader.poll_read(cx, &mut frame) {
+            Poll::Ready(result) => Poll::Ready(result.map_err(io::Error::other)),
+            Poll::Pending => {
+                // A read may have freed admission. Push and explicitly
+                // schedule the next poll; CARBON's push does not wake itself.
+                if let Some(file) = waiting.take() {
+                    match reader.push_file(file) {
+                        Ok(()) => cx.waker().wake_by_ref(),
+                        Err((PushError::Full, file)) => waiting = Some(file),
+                        Err((error, _)) => return Poll::Ready(Err(io::Error::other(error))),
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }).await?.is_some() {
+        let length = remaining.min(BLOCK as u64) as usize;
+        let bytes = frame.get(..length).ok_or_else(|| io::Error::other("short output frame"))?;
+        tokio::select! {
+            result = socket.write_all(bytes) => result?,
+            _ = reader.progress() => return Err(io::Error::other("progress unexpectedly completed")),
+        }
+        remaining = remaining.saturating_sub(length as u64);
     }
     socket.shutdown().await?;
     Ok(total)

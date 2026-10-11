@@ -1,269 +1,132 @@
 # Scheduling and backend guide
 
-See the [README](../README.md) for installation and runnable examples.
+See the [README](../README.md) for runnable examples.
 
-## Frames and backends
+## Complete frames and sequential files
 
-CARBON treats each file as an ordered sequence of frames. A frame is one value
-of your chosen Rust type, such as a chunk of bytes or a record. You provide the
-async backend that opens, reads, and writes files. Those files may live on disk,
-on a remote service, or in memory.
+A frame is an opaque value `T`. Each `ReadFile<T>` opens and reads on the same
+object. Its stable, nonzero `frame_count()` announces exactly how many complete
+frames precede EOF. There is one sequential read operation per file, while
+operations on different files can be in flight concurrently.
 
-CARBON stands for Concurrent Async Reordering Buffered Ordered Nonblocking I/O:
+`ReadFile::poll_read(cx, &mut frame)` returns `Pending`, a complete frame with
+`Some(())`, EOF with `None`, or a backend error. The backend keeps its own offsets
+and preparation state. It never keeps a reference to the borrowed buffer.
+After `Pending`, CARBON presents the same logical buffer and preserves its
+contents; its address may change. On a new frame, the backend receives a recycled
+buffer and overwrites or resets it. CARBON has no partial-frame read abstraction.
 
-- Multiple files can have operations in flight at once.
-- Async I/O runs within your application's execution flow, without background
-  tasks, threads, or channels.
-- Operations may complete out of order. CARBON retains early results until
-  their predecessors can be emitted.
-- Bounded buffering limits how far work can advance ahead of the consumer.
-- Consumers receive outputs in their logical order.
-- Pending I/O does not block the calling task or other ready operations.
+Direct files must be `Unpin`. `Pin<Box<F>>` and `Pin<&mut F>` forward `ReadFile`
+for pinned backends. Frames need neither `Clone` nor `Unpin`.
 
-The crate uses Rust edition 2024 and depends on `futures-core` and
-`pin-project-lite`. It works with any compatible async runtime. The README's
-in-memory backends return ready results; a backend may also return pending I/O.
+## Admission and explicit polling
 
-## Reading files
+Construct `ReadScheduler` with a buffer factory, shared `&FrameBudget`, and
+mutable `&mut SchedulerConfig`. A factory passed as `&mut factory` remains
+caller-owned. It is invoked only after budget authorization and only when no
+recycled buffer is available.
 
-`ReadScheduler` accepts owned file descriptors through `poll_file_ready` and
-`enqueue_file`. A readiness reservation remains valid until the descriptor is
-supplied, even if the window changes in between. `close_files` ends admission;
-already accepted files continue producing frames until the output reaches EOF.
-Each descriptor declares its frame count and opens a stream that yields exactly
-that many successful frames, followed by EOF.
+`push_file(file)` returns immediately. On refusal it returns `(PushError, file)`;
+`Full` means retry later, `Closed` means admission has ended, and `Contract`
+reports an invalid descriptor. Refused admissions do not terminate accepted
+work or consume deferred backend errors. No readiness reservation exists.
 
-The producer keeps its source and feeds descriptors from the calling task while
-also consuming output. No input stream is retained by the scheduler. Descriptors
-and frames need neither `Clone` nor `Unpin`.
+`close_files()` is idempotent. Accepted files continue until every declared frame
+has been consumed. While admission remains open,
+an empty scheduler returns `Pending`, registers no waker, and requests no budget.
 
-Files may open and produce frames concurrently. A later file can fill its part
-of the buffer while an earlier file waits for I/O. CARBON emits frames in file
-order and preserves the order of frames within each file.
+Mutations do not wake the caller. After `push_file`, `close_files`, or `set_window`,
+explicitly call `poll_read` or `poll_progress` again. An external descriptor
+producer supplies its own wakeups. A combined producer/consumer retries a held
+file after a read has freed admission, then explicitly repolls after a
+successful push. Waiting only on that empty read would not wake the producer.
 
-```text
-Input files
-   |
-   v
-ReadScheduler<T>
-   File 1: I/O pending
-   File 2: read complete, frames buffered
-   File 3: opened ahead
-   |
-   v
-Output Stream<T>: file 1, then file 2, then file 3
-```
+## Ordered buffering and anticipatory opening
 
-Opening ahead and buffering ahead have separate limits. A file can be opened
-before there is capacity to read its frames.
+The window has three controls:
 
-## Writing files
-
-`WriteScheduler` borrows an `Unpin` stream of frames and an `Unpin` stream of destinations. It fills
-destinations in order, up to their declared frame capacities, and emits one
-finalization result per file in destination order.
-
-CARBON calls a destination's `open()` only after assigning its first frame.
-Writing can start without waiting for the file to fill. Other writers can
-advance while an earlier file finalizes.
-
-```text
-Input frames
-   |
-   v
-WriteScheduler<T>
-   File 1: finalizing
-   File 2: writing
-   File 3: unopened, waiting for its first frame
-   |
-   v
-Output results: file 1, then file 2, then file 3
-```
-
-The last file may be partially filled. An empty input opens no file. You can
-generate destination descriptors lazily without knowing the total input length.
-Keep descriptors lightweight and defer resource creation to `open()`. CARBON
-drops unused descriptors unopened.
-
-Completed results remain limited by the discovery horizon until consumed. The
-scheduler does not keep opening destinations indefinitely while the consumer
-is blocked.
-
-## Progress while the consumer waits
-
-Consuming a scheduler's stream drives I/O. If the consumer awaits other work
-between calls to `next()`, it stops polling the scheduler. Spare buffer capacity
-does not start work by itself. A backend wakeup wakes the task, which still
-needs to poll the scheduler.
-
-Poll `progress()` alongside the consumer's async work to keep I/O advancing:
-
-```ignore
-while let Some(frame) = reader.next().await {
-    tokio::select! {
-        result = write_tcp(frame?) => result?,
-        _ = reader.progress() => unreachable!("progress never completes"),
-    }
-}
-```
-
-Without `progress()`, the scheduler pauses during the send. With it, later files
-can advance and upcoming frames can be buffered while TCP applies backpressure.
-Once the window is full and no other work is runnable, the scheduler waits for
-a wakeup.
-
-`progress()` consumes no output and never completes, so it cannot win the
-`select!` and cancel the send. Dropping it when the send finishes preserves
-buffered frames and pending I/O. The same pattern keeps subsequent files
-writing and finalizing while the consumer processes a write result.
-
-Put the `select!` in the task that awaits the consumer. A custom stream that is
-no longer polled cannot keep buffering. Synchronous blocking work also blocks
-progress in the same task.
-
-## Windows and shared budgets
-
-`SchedulerConfig` holds a `Window` and a retry count. The window controls how
-far the scheduler may work ahead of the consumer:
-
-| Window field | Default | Controls |
+| Field | Default | Meaning |
 | --- | ---: | --- |
-| `target_frames` | 256 | Desired local frame capacity |
-| `open_ahead_frames` | 1024 | How far ahead, in frames, files may be discovered |
-| `max_active_files` | 16 | Maximum active files, including unopened write destinations |
+| `target_frames` | 256 | Desired contiguous buffering window |
+| `open_ahead_frames` | 1024 | Descriptor admission and anticipatory opening horizon |
+| `max_active_files` | 16 | Maximum admitted files, including opening and draining files |
 
-The discovery horizon is at least `target_frames`. A file can be discovered if
-its beginning lies inside that horizon, even if its end extends beyond it.
-For reads, a window of eight frames over files of six and five frames authorizes
-all six frames of the first file and the first two of the second.
+The admission horizon is at least `target_frames`. A descriptor can enter if
+its first frame lies inside that horizon, even if the file extends beyond it.
+Admitting starts no I/O. Subsequent polling can open the file before its frames
+receive buffering capacity.
 
-Discovery may open readers ahead of time. For writes, it only prepares
-descriptors. `open_ahead_frames` never triggers opening a destination without
-an assigned frame.
+Budget authorization follows global frame order. For files A and B of 100 frames
+each, `open_ahead_frames = 120` permits opening B immediately. With
+`target_frames = 10`, B cannot read until 91 frames of A have been consumed.
+There is no distribution of capacity for fairness between files. Files inside
+the authorized window can complete frames out of order; output remains ordered.
 
-Clone a `FrameBudget` to share capacity across schedulers. It counts
-scheduler-owned frames and reservations, not bytes, backend buffers, frames
-already handed to the consumer, or completed write results.
+The shared `FrameBudget` counts reservations, pending buffers, and complete buffered
+frames. It does not count bytes, backend
+storage, idle recycled allocations, or frames already handed to the consumer.
+Its FIFO, batched grants and synchronization are unchanged. When reading and
+writing with one shared budget, leave capacity for both schedulers to progress.
 
-Grants are reserved in blocks. Waiting requests are served in FIFO order and
-are not preempted. A large request can delay smaller requests behind it.
+Shrinking a window preserves authorized operations and buffers. Allocation
+capacity of recycled buffers is retained. `granted_frames()` reads the local
+grant without synchronizing with the shared budget.
 
-When a writer pulls from a reader sharing the same budget, leave enough capacity
-for both to progress. If the reader holds all capacity while the writer waits
-for a reservation, the pipeline can deadlock. The budget cannot infer these
-dependencies or reclaim retained data.
+## Output, EOF, and errors
 
-Use `set_window(window)` to change either scheduler's window. Shrinking preserves
-already authorized frames and opened files, then takes effect as work drains.
-Keep polling to advance under the new limits. `granted_frames()` reports the
-local capacity grant; writers also expose `retained_frames()`. Reusable buffers
-do not shrink their allocated storage when the window shrinks.
+`ReadScheduler::poll_read(cx, &mut output)` advances I/O and swaps the next
+complete frame with the caller's reusable buffer. Heap-backed payload bytes
+are not copied, and the frame requires no `Clone` implementation.
+`Pending`, EOF, and errors leave the output unchanged. The delivered frame
+belongs to the caller and is outside the shared budget. An `AsyncRead` adapter
+would need to copy into its caller's byte slice and account for its current
+frame until fully consumed; no such adapter is provided by this API.
 
-Frame counts, destination capacities, the global budget, `target_frames`, and
-`max_active_files` must be nonzero. The scheduler reports invalid configurations
-and file contracts through its output stream.
+CARBON trusts the declared `frame_count()` and stops polling the file after that
+many complete frames. An earlier `None` is `UnexpectedEof`; extra frames are
+never polled. After delivering the declared last frame, CARBON removes the file
+from the active window and recycles the returned buffer. The next file can
+advance without an EOF probe or a dedicated EOF buffer.
 
-## Retries, errors, and cancellation
+Opening errors retry up to `max_retries`. The next `poll_open` must reset the
+failed opening attempt. Reading errors and premature EOF are terminal.
+Terminal failure drops I/O and buffers and returns the budget immediately.
+`poll_read` reports the error once and subsequently returns EOF. If
+`poll_progress` discovers the error, it retains it for the next `poll_read`.
 
-`max_retries` defaults to zero and counts additional attempts per file. Reads
-retry opening failures only. A reader error, early EOF, or extra frame is fatal.
-Writes can retry opening, writing, or finalizing, with one shared retry count
-across those stages.
+Dropping a waiting future leaves the scheduler intact. Dropping the scheduler
+abandons its operations and returns its budget. Backends own cancellation and
+cleanup of their operations.
 
-Without write retries, each successful `poll_write` releases its frame, so a
-file may exceed the global frame budget. With retries enabled, the scheduler
-reserves capacity for the whole file before accepting its first frame and
-retains every frame until successful finalization. The file must fit the global
-budget, though its reservation may exceed `target_frames`.
+## Progress and wakeups
 
-A write retry drops the failed attempt, reopens the file, and replays from the
-first retained frame. Successfully finalized files release their frames even
-if their results are waiting behind an earlier file. There is no global
-rollback if that earlier file subsequently fails.
+`poll_read` and `poll_progress` use one engine. `poll_progress` consumes no output;
+`progress()` wraps it in a future that never completes, including at EOF or on
+error. Poll it alongside the consumer's wait with `select!` to prepare more data
+while the consumer is busy. Without either kind of polling, nothing advances.
 
-A fatal error releases scheduler resources immediately. `next()` emits the
-error once, then returns EOF. If `progress()` discovers the error, it saves it
-for the next `next()` and stays pending. It also stays pending at EOF. Awaiting
-`progress()` alone will never finish.
+Files and budget waits use the caller's context directly. There are no per-file
+wakers, wake queues, or additional mutexes. Pending operations are revisited on
+the next scheduler call, at most once per operation in each call. A rotating
+cursor gives each admitted file an opportunity to advance. Work is limited to
+`max(256, active_files)` backend polls, allowing one complete pass even with a
+configured window larger than 256. If runnable work remains at the limit,
+CARBON requests another poll. A pending-only pass does not self-wake.
 
-Both schedulers implement `FusedStream`. `is_terminated()` remains false while
-an error is waiting to be emitted.
+## Writing
 
-Dropping a pending `next()` or `progress()` future preserves the scheduler's
-state. Both schedulers borrow `Unpin` streams via `&mut`, a shared
-`&FrameBudget`, and a mutable `&mut SchedulerConfig`. Carbon uses `Pin::new`
-only while polling streams. For a `!Unpin` stream, create a wrapper with
-`std::pin::pin!` or `Box::pin` and borrow that wrapper. `set_window()` updates the borrowed
-configuration. Retry policy stays fixed while the configuration is borrowed.
+`WriteScheduler` borrows its frame allocator, shared budget, and configuration.
+`PartialFrame` assembles borrowed input, and `WriteFile` opens, writes and closes
+on the same object. Fill the destination FIFO with `push_file`, replace completed
+heads with `pop_swap`, then end input with `poll_close` and drain results through
+`pop_file`. Destinations open only after their first frame is assigned.
 
-The streams remain alive at EOF and on error. Dropping the scheduler releases
-its borrows and preserves unconsumed input frames and descriptors. Descriptors
-already yielded to the scheduler, its buffered frames, and its backend attempts
-are still owned by the scheduler.
+Without retries, accepted frames can be released individually. With retries,
+a whole destination must fit the shared budget and its frames stay available
+for replay until close succeeds. Closing flushes a nonempty partial frame and
+drops unused destinations without opening them.
 
-During writing, `input_mut()` returns `&mut I` and wakes the scheduler for
-another input poll. Finish this temporary borrow before polling again. An input
-that can receive more frames must return `Pending` and register a waker while
-waiting; `None` ends the input permanently. Access remains possible after EOF
-or failure, but changing the input cannot restart a completed scheduler.
-
-Dropping the scheduler itself abandons its operations, drops its frames
-and backends, and returns its budget permits. This does not undo writes already
-performed. Backends must clean up abandoned attempts, including writes
-interrupted before finalization.
-
-## Backend and custom stream integration
-
-Both schedulers implement `Stream`. Their input streams yield file descriptors
-and, for writes, frames directly. Backend errors come from opening, reading,
-writing, or finalizing.
-
-| Entry point | Behavior |
-| --- | --- |
-| `next().await` / `poll_next(cx)` | Remove the next ordered output, advancing I/O if needed |
-| `progress()` | Keep advancing I/O without consuming output; never completes |
-| `poll_progress(cx)` | Advance at most 256 work items from a custom future or stream |
-
-`poll_progress(cx)` registers the caller for wakeups and requests another poll
-if runnable work remains after its work limit. Otherwise it waits for a backend
-or budget notification. The caller must arrange to poll it again. `progress()`
-wraps that operation in a future for use with `select!`.
-
-Each operation exclusively borrows the scheduler. Retrieve an output first,
-then call `progress()` while processing it. `next()` and `progress()` cannot run
-concurrently on the same instance.
-
-Backends must follow these rules:
-
-- Register the supplied waker before returning `Pending`.
-- Make every `open()` an independent attempt that can be abandoned by dropping it.
-- A pending `poll_write` receives the same logical frame on its next poll, but
-  its address may change. Do not retain the borrowed `&T` after returning.
-- Finalize only after all assigned writes succeed.
-
-Frames need neither `Clone`, `Arc`, `Send`, nor `Unpin`. Input streams, opening
-futures, readers, and writers may also be `!Unpin`. The crate contains no unsafe
-code.
-
-## Implementation and performance
-
-The schedulers route wakeups to individual slots rather than scanning dormant
-operations. Read frames occupy one ring buffer. Write buffers, pinned I/O slots,
-and per-slot wakers are reused. Storage allocates as it grows. Buffered read
-output retains its fast path, and advancing I/O uses the existing ready queue
-and shared-budget synchronization.
-
-Polling `progress()` adds CPU work even though it adds no buffer or task. The
-[benchmark report](benchmarks.md) records throughput, backend polls, allocations,
-and the overhead of using `select!` during simulated backpressure. These
-in-memory measurements do not establish a throughput gain for real network or
-disk I/O.
-
-The [memory example](../examples/memory/src/main.rs) puts both schedulers together using
-`futures::select_biased!`. It simulates async reads, writes, and consumer waits
-without a network or timer.
-
-Tests cover ordering, capacity limits, retries, pinned backends, cancellation,
-progress under backpressure, and wake routing over 10,000 pending files. See
-the [original specification](specification.md) for the French CDC and its V1
-amendments.
+The [memory example](../examples/memory/src/main.rs) shows frame polling and
+progress during consumer waits. The [benchmark report](benchmarks.md) contains
+historical measurements; they do not measure this new read implementation.
+The [specification](specification.md) retains the original design history.

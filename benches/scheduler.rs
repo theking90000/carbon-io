@@ -8,7 +8,7 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 use std::{
     alloc::System,
     cell::Cell,
-    future::{Future, ready},
+    future::ready,
     hint::black_box,
     pin::Pin,
     rc::Rc,
@@ -19,12 +19,13 @@ use std::{
 #[global_allocator]
 static ALLOCATOR: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
-#[derive(Clone)]
 struct ReadSource {
     start: u64,
     count: u32,
     pending: bool,
     polls: Rc<Cell<usize>>,
+    opening_wait: bool,
+    reader: Option<Reader>,
 }
 struct Reader {
     next: u64,
@@ -33,62 +34,49 @@ struct Reader {
     waiting: bool,
     polls: Rc<Cell<usize>>,
 }
-struct Opening {
-    source: Option<ReadSource>,
-    waiting: bool,
-}
-impl Future for Opening {
-    type Output = Result<Reader, ()>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let source = this.source.as_ref().unwrap();
-        source.polls.set(source.polls.get() + 1);
-        if this.waiting {
-            this.waiting = false;
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        let source = this.source.take().unwrap();
-        Poll::Ready(Ok(Reader {
-            next: source.start,
-            end: source.start + u64::from(source.count),
-            pending: source.pending,
-            waiting: source.pending,
-            polls: source.polls,
-        }))
-    }
-}
 impl ReadFile<u64> for ReadSource {
     type Error = ();
-    type Open = Opening;
-    type Reader = Reader;
     fn frame_count(&self) -> u32 {
         self.count
     }
-    fn open(&self) -> Self::Open {
-        Opening {
-            source: Some(self.clone()),
-            waiting: self.pending,
-        }
-    }
-}
-impl Stream for Reader {
-    type Item = Result<u64, ()>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_open(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         let this = self.get_mut();
         this.polls.set(this.polls.get() + 1);
-        if this.waiting {
-            this.waiting = false;
+        if this.opening_wait && this.pending {
+            this.opening_wait = false;
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        if this.next == this.end {
-            return Poll::Ready(None);
+        this.reader = Some(Reader {
+            next: this.start,
+            end: this.start.saturating_add(u64::from(this.count)),
+            pending: this.pending,
+            waiting: this.pending,
+            polls: this.polls.clone(),
+        });
+        Poll::Ready(Ok(()))
+    }
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        frame: &mut u64,
+    ) -> Poll<Result<Option<()>, ()>> {
+        let Some(reader) = self.get_mut().reader.as_mut() else {
+            return Poll::Ready(Err(()));
+        };
+        reader.polls.set(reader.polls.get() + 1);
+        if reader.waiting {
+            reader.waiting = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
-        let value = this.next;
-        this.next += 1;
-        this.waiting = this.pending;
-        Poll::Ready(Some(Ok(value)))
+        if reader.next == reader.end {
+            return Poll::Ready(Ok(None));
+        }
+        *frame = reader.next;
+        reader.next = reader.next.saturating_add(1);
+        reader.waiting = reader.pending;
+        Poll::Ready(Ok(Some(())))
     }
 }
 struct Destination {
@@ -223,33 +211,44 @@ fn read_case(name: &str, n: usize, size: u32, active: usize, pending: bool) {
             count: size,
             pending,
             polls: polls.clone(),
+            opening_wait: true,
+            reader: None,
         });
-        let scheduler_budget_1 = FrameBudget::new(target);
-        let mut scheduler_config_1 = config(target, active, 0);
-        let mut reader = ReadScheduler::new(&scheduler_budget_1, &mut scheduler_config_1);
+        let budget = FrameBudget::new(target);
+        let mut cfg = config(target, active, 0);
+        let mut reader = ReadScheduler::new(|| 0, &budget, &mut cfg).unwrap();
+        let mut waiting = None;
         let mut closed = false;
-        consume(stream::poll_fn(|cx| {
+        let mut output = 0;
+        let mut sum = 0;
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
             while !closed {
-                match Pin::new(&mut reader).poll_file_ready(cx) {
-                    Poll::Pending => break,
-                    Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
-                    Poll::Ready(Ok(())) => match files.next() {
-                        Some(file) => {
-                            if let Err(error) = Pin::new(&mut reader).enqueue_file(file) {
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                        }
-                        None => {
-                            closed = true;
-                            if let Err(error) = Pin::new(&mut reader).close_files() {
-                                return Poll::Ready(Some(Err(error)));
-                            }
-                        }
-                    },
+                let file = match waiting.take().or_else(|| files.next()) {
+                    Some(file) => file,
+                    None => {
+                        closed = true;
+                        reader.close_files();
+                        break;
+                    }
+                };
+                match reader.push_file(file) {
+                    Ok(()) => {}
+                    Err((carbon_io::PushError::Full, file)) => {
+                        waiting = Some(file);
+                        break;
+                    }
+                    Err((error, _)) => panic!("{error}"),
                 }
             }
-            Pin::new(&mut reader).poll_next(cx)
-        }))
+            match reader.poll_read(&mut cx, &mut output) {
+                Poll::Ready(Ok(Some(()))) => sum += black_box(output),
+                Poll::Ready(Ok(None)) => return sum,
+                Poll::Ready(Err(error)) => panic!("{error:?}"),
+                Poll::Pending => {}
+            }
+        }
     })
 }
 // The caller owns input production, FIFO replacement, and close-result consumption.
@@ -344,6 +343,8 @@ fn shared_case(n: usize) {
             count: n as u32,
             pending: false,
             polls: polls.clone(),
+            opening_wait: true,
+            reader: None,
         });
         let mut configs = [config(1024, 1, 0); 4];
         let waker = noop_waker();
@@ -351,13 +352,9 @@ fn shared_case(n: usize) {
         let mut schedulers: Vec<_> = files
             .zip(&mut configs)
             .map(|(file, config)| {
-                let mut reader = ReadScheduler::new(&budget, config);
-                assert!(matches!(
-                    Pin::new(&mut reader).poll_file_ready(&mut cx),
-                    Poll::Ready(Ok(()))
-                ));
-                Pin::new(&mut reader).enqueue_file(file).unwrap();
-                Pin::new(&mut reader).close_files().unwrap();
+                let mut reader = ReadScheduler::new(|| 0, &budget, config).unwrap();
+                assert!(reader.push_file(file).is_ok());
+                reader.close_files();
                 reader
             })
             .collect();
@@ -366,9 +363,11 @@ fn shared_case(n: usize) {
         while finished.iter().any(|done| !*done) {
             for (i, s) in schedulers.iter_mut().enumerate() {
                 if !finished[i] {
-                    match Pin::new(s).poll_next(&mut cx) {
-                        Poll::Ready(Some(value)) => sum += black_box(value.unwrap()),
-                        Poll::Ready(None) => finished[i] = true,
+                    let mut output = 0;
+                    match s.poll_read(&mut cx, &mut output) {
+                        Poll::Ready(Ok(Some(()))) => sum += black_box(output),
+                        Poll::Ready(Ok(None)) => finished[i] = true,
+                        Poll::Ready(Err(error)) => panic!("{error:?}"),
                         Poll::Pending => {}
                     }
                 }
@@ -401,18 +400,23 @@ fn read_consumer_case(name: &str, count: u32, drive: bool) {
                 count,
                 pending: true,
                 polls,
+                opening_wait: true,
+                reader: None,
             };
             let scheduler_budget_3 = FrameBudget::new(64);
             let mut scheduler_config_3 = config(64, 1, 0);
-            let mut reader = ReadScheduler::new(&scheduler_budget_3, &mut scheduler_config_3);
-            std::future::poll_fn(|cx| Pin::new(&mut reader).poll_file_ready(cx))
-                .await
-                .unwrap();
-            Pin::new(&mut reader).enqueue_file(file).unwrap();
-            Pin::new(&mut reader).close_files().unwrap();
+            let mut reader =
+                ReadScheduler::new(|| 0, &scheduler_budget_3, &mut scheduler_config_3).unwrap();
+            assert!(reader.push_file(file).is_ok());
+            reader.close_files();
             let mut sum = 0;
-            while let Some(frame) = reader.next().await {
-                sum += black_box(frame.unwrap());
+            let mut frame = 0;
+            while std::future::poll_fn(|cx| reader.poll_read(cx, &mut frame))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                sum += black_box(frame);
                 if drive {
                     futures::select_biased! {
                         _ = reader.progress().fuse() => unreachable!(),
@@ -503,6 +507,7 @@ fn main() {
     );
     read_case("read_one_large_file", 1, 100_000 * scale as u32, 1, false);
     read_case("read_many_small_files", 10_000 * scale, 4, 64, false);
+    read_case("read_active_25", 100 * scale, 1024, 25, false);
     read_case("read_multiple_active", 100 * scale, 1024, 32, false);
     read_case("read_backpressure", 50 * scale, 256, 16, true);
     read_case("read_many_openings", 10_000 * scale, 1, 10_000, true);
