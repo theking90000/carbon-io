@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "carbon-io"
-version = "0.4.1"
+version = "0.5.0"
 
 [[package]]
 name = "cc"

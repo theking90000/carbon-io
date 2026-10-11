@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+- Breaking API change: use direct `push_file()` admission and complete-frame `ReadScheduler::poll_read(cx, &mut frame)` output, replacing read events and readiness reservations.
+- Breaking API change: let each `ReadFile` open and read on the same object through `poll_open()` and `poll_read()`, without separate opening futures or readers.
+- Allocate read buffers in global frame order, preserve pending buffers, and exchange reusable output buffers without copying heap-backed payloads.
+- Infer file completion from the declared `frame_count()`; report premature EOF and never poll beyond that count.
+- Drive reading through `poll_read()` or `poll_progress()` using the caller's waker directly; remove the internal ready queue and runtime dependencies.
+- Require explicit polling after admission or configuration changes; empty open input remains pending without registering a waker.
+- Add a benchmark for 320-frame files with reusable 64 KiB buffers.
+
 ## 0.4.1
 
 - Accept mutable task contexts in `WriteFile` and `AsyncFilesWrite` polling methods so backends can poll futures directly.
